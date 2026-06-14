@@ -125,7 +125,9 @@
     if (rect.width >= 42 && rect.width <= 460) score += 18;
     if (rect.height >= 18 && rect.height <= 120) score += 18;
     if (rect.width < 18 || rect.height < 12) score -= 45;
-    if (areaRatio > 0.2) score -= 80;
+    const heightRatio = rect.height / (window.innerHeight || 720);
+    const widthRatio  = rect.width  / (window.innerWidth  || 1280);
+    if (areaRatio > 0.18 || heightRatio > 0.35 || widthRatio > 0.55) score -= 80;
     else if (areaRatio > 0.08) score -= 30;
 
     const cursor = window.getComputedStyle?.(node)?.cursor || '';
@@ -175,9 +177,19 @@
   function getHighlightRectForNode(node, clickX, clickY) {
     const vpW = window.innerWidth || 1280;
     const vpH = window.innerHeight || 720;
-    // Max acceptable rect area = 25% of viewport; rects larger than this are likely
-    // ancestor containers rather than the actual click target.
-    const maxArea = vpW * vpH * 0.25;
+
+    // A rect is "too large" if it looks like a container rather than the actual
+    // UI element the user clicked. Checks (same thresholds as App.jsx):
+    //   - area  > 18% of viewport
+    //   - height > 35% of viewport  (catches full-height sidebars / panels)
+    //   - width  > 55% of viewport  (catches full-width rows / banners)
+    function isTooLarge(rect) {
+      if (!rect) return true;
+      const areaRatio   = (rect.width * rect.height) / (vpW * vpH);
+      const widthRatio  = rect.width  / vpW;
+      const heightRatio = rect.height / vpH;
+      return areaRatio > 0.18 || heightRatio > 0.35 || widthRatio > 0.55;
+    }
 
     let current = node && node.nodeType === 1 ? node : null;
     let bestRect = null;
@@ -186,8 +198,7 @@
     while (current && depth < 5) {
       const rect = current.getBoundingClientRect?.();
       if (rect && rect.width >= 14 && rect.height >= 14) {
-        const area = rect.width * rect.height;
-        if (area <= maxArea) {
+        if (!isTooLarge(rect)) {
           bestRect = {
             left: Number(rect.left.toFixed(2)),
             top: Number(rect.top.toFixed(2)),
@@ -196,7 +207,7 @@
           };
           break; // first acceptable rect wins
         }
-        // rect is too large — if we haven't found anything yet, keep it as last-resort
+        // rect is oversized — keep as last-resort only
         if (!bestRect) {
           bestRect = {
             left: Number(rect.left.toFixed(2)),
@@ -210,20 +221,17 @@
       depth += 1;
     }
 
-    // If the best rect we found is still oversized, synthesize a tighter box
+    // If even the best candidate is still oversized, synthesize a tighter box
     // centered on the actual click point instead.
-    if (bestRect) {
-      const area = bestRect.width * bestRect.height;
-      if (area > maxArea && Number.isFinite(clickX) && Number.isFinite(clickY)) {
-        const synthW = Math.min(Math.max(vpW * 0.12, 96), 260);
-        const synthH = Math.min(Math.max(vpH * 0.07, 44), 120);
-        return {
-          left: Number((clickX - synthW / 2).toFixed(2)),
-          top: Number((clickY - synthH / 2).toFixed(2)),
-          width: Number(synthW.toFixed(2)),
-          height: Number(synthH.toFixed(2))
-        };
-      }
+    if (bestRect && isTooLarge(bestRect) && Number.isFinite(clickX) && Number.isFinite(clickY)) {
+      const synthW = Math.min(Math.max(vpW * 0.12, 96), 260);
+      const synthH = Math.min(Math.max(vpH * 0.07, 44), 120);
+      return {
+        left: Number((clickX - synthW / 2).toFixed(2)),
+        top: Number((clickY - synthH / 2).toFixed(2)),
+        width: Number(synthW.toFixed(2)),
+        height: Number(synthH.toFixed(2))
+      };
     }
 
     return bestRect;
@@ -418,6 +426,31 @@
     lastClickLoggedY = Number(event?.clientY);
   }
 
+  /**
+   * Walk up through nested same-origin frames and accumulate the iframe offsets so
+   * that click coordinates are expressed relative to the top-level viewport.
+   * Stops at cross-origin boundaries (getBoundingClientRect will throw / frameElement
+   * will be null).
+   */
+  function getTopFrameOffset() {
+    let offsetX = 0;
+    let offsetY = 0;
+    let cur = window;
+    while (cur !== cur.top) {
+      try {
+        const el = cur.frameElement;
+        if (!el) break;
+        const r = el.getBoundingClientRect();
+        offsetX += r.left;
+        offsetY += r.top;
+        cur = cur.parent;
+      } catch (_) {
+        break;
+      }
+    }
+    return { offsetX, offsetY };
+  }
+
   function pointerLikeClickHandler(event) {
     if (event?.button !== undefined && event.button !== 0) return;
     if (!Number.isFinite(Number(event?.clientX)) || !Number.isFinite(Number(event?.clientY))) return;
@@ -426,15 +459,32 @@
     finalizeHover('click');
     if (typeof chrome !== 'undefined' && chrome.storage?.local) {
       const targetNode = pickClickTargetNode(event);
-      const targetRect = getHighlightRectForNode(targetNode, event.clientX, event.clientY);
+      const frameRect = getHighlightRectForNode(targetNode, event.clientX, event.clientY);
+
+      // Adjust coordinates from iframe-local → top-frame-relative so the highlight
+      // box aligns with the actual position in the captured screenshot.
+      const { offsetX, offsetY } = getTopFrameOffset();
+      let topViewportW = window.innerWidth;
+      let topViewportH = window.innerHeight;
+      try { topViewportW = window.top.innerWidth; topViewportH = window.top.innerHeight; } catch (_) {}
+
+      const adjustedX = event.clientX + offsetX;
+      const adjustedY = event.clientY + offsetY;
+      const targetRect = frameRect ? {
+        left: frameRect.left + offsetX,
+        top: frameRect.top + offsetY,
+        width: frameRect.width,
+        height: frameRect.height
+      } : null;
+
       const clickEvent = {
         id: `clk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         sessionId: rippleSessionId || '',
         epochMs: Date.now(),
-        x: event.clientX,
-        y: event.clientY,
-        viewportW: window.innerWidth,
-        viewportH: window.innerHeight,
+        x: adjustedX,
+        y: adjustedY,
+        viewportW: topViewportW,
+        viewportH: topViewportH,
         targetText: pickClickLabel(event),
         href: window.location.href,
         targetRect,

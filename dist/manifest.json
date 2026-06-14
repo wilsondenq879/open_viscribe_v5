@@ -18,5 +18,13 @@
   },
   "host_permissions": [
     "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*", "file:///*"],
+      "js": ["click-ripple-content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
   ]
 }

@@ -7,6 +7,7 @@ import {
     Undo2, Redo2, Minus, Plus, Bug
 } from 'lucide-react';
 import SettingsModal from './components/modals/SettingsModal';
+import ArticleScreenshotReview from './components/ArticleScreenshotReview';
 import useAiTaskState from './hooks/useAiTaskState';
 import {
     AI_TASK_CANCELLED_MESSAGE,
@@ -170,7 +171,7 @@ function normalizeAiSummaryList(items) {
     return items.map(formatAiSummaryItem).filter(Boolean);
 }
 
-const ARTICLE_CLICK_CANDIDATE_OFFSETS = [-1.0, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0];
+const ARTICLE_CLICK_CANDIDATE_OFFSETS = [-2.0, -1.6, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0];
 
 function formatArticleCandidateOffsetLabel(offsetSeconds = 0) {
     const safeOffset = Number.isFinite(Number(offsetSeconds)) ? Number(offsetSeconds) : 0;
@@ -216,6 +217,48 @@ function buildFallbackClickTargetRect(clickEvent) {
     };
 }
 
+// Compute the click target rect as 0-1 fractions of the viewport (for interactive overlay).
+function computeHighlightRectPct(clickEvent) {
+    if (!clickEvent) return null;
+    const vw = Number(clickEvent.viewportW);
+    const vh = Number(clickEvent.viewportH);
+    if (!vw || !vh) return null;
+    let sourceRect = normalizeClickTargetRect(clickEvent);
+    if (sourceRect) {
+        const areaRatio   = (sourceRect.width * sourceRect.height) / (vw * vh);
+        const widthRatio  = sourceRect.width  / vw;
+        const heightRatio = sourceRect.height / vh;
+        // Reject rects that are large containers rather than the actual UI element:
+        // area > 18%, or height > 35% of viewport (catches full-height sidebars),
+        // or width > 55% of viewport (catches full-width banners).
+        if (areaRatio > 0.18 || heightRatio > 0.35 || widthRatio > 0.55) sourceRect = null;
+    }
+    sourceRect = sourceRect || buildFallbackClickTargetRect(clickEvent);
+    if (!sourceRect) return null;
+    const xPct = Math.max(0, Math.min(0.97, sourceRect.left / vw));
+    const yPct = Math.max(0, Math.min(0.97, sourceRect.top / vh));
+    return {
+        xPct,
+        yPct,
+        wPct: Math.max(0.01, Math.min(1 - xPct, sourceRect.width / vw)),
+        hPct: Math.max(0.01, Math.min(1 - yPct, sourceRect.height / vh)),
+    };
+}
+
+// Wrap a raw frame + optional pre-rendered highlight frame into a candidate object
+// expected by ArticleScreenshotReview and the post-review highlight application step.
+function makeCandidateWrapper(rawFrame, previewFrame, highlightRectPct) {
+    const f = rawFrame || previewFrame;
+    return {
+        rawFrame: rawFrame || previewFrame,
+        previewFrame: previewFrame || rawFrame,
+        highlightRectPct: highlightRectPct || null,
+        frameId: f?.frameId,
+        relativeTime: f?.relativeTime,
+        isLikelyLoading: f?.isLikelyLoading,
+    };
+}
+
 function normalizeArticleCaptureMapping(captureMapping, canvasWidth, canvasHeight) {
     const sourceX = Number(captureMapping?.sourceX);
     const sourceY = Number(captureMapping?.sourceY);
@@ -253,14 +296,16 @@ function getArticleHighlightRectForCanvas(clickEvent, canvasWidth, canvasHeight,
     if (viewportW <= 0 || viewportH <= 0 || canvasWidth <= 0 || canvasHeight <= 0) return null;
 
     let sourceRect = normalizeClickTargetRect(clickEvent);
-    // If the recorded targetRect covers more than 25% of the viewport area it's likely
-    // a container ancestor rather than the real click target — replace it with a
-    // synthesized box centered on the actual click point.
+    // Reject targetRect if it looks like a container rather than the actual UI element.
+    // Checks: area > 18%, height > 35% of viewport (catches full-height sidebars/panels),
+    // or width > 55% of viewport (catches full-width banners/rows).
     if (sourceRect) {
-      const rectAreaRatio = (sourceRect.width * sourceRect.height) / (viewportW * viewportH);
-      if (rectAreaRatio > 0.25) {
-        sourceRect = null; // will fall through to buildFallbackClickTargetRect
-      }
+        const rectAreaRatio   = (sourceRect.width  * sourceRect.height) / (viewportW * viewportH);
+        const rectWidthRatio  = sourceRect.width  / viewportW;
+        const rectHeightRatio = sourceRect.height / viewportH;
+        if (rectAreaRatio > 0.18 || rectHeightRatio > 0.35 || rectWidthRatio > 0.55) {
+            sourceRect = null; // fall through to buildFallbackClickTargetRect
+        }
     }
     sourceRect = sourceRect || buildFallbackClickTargetRect(clickEvent);
     if (!sourceRect) return null;
@@ -420,14 +465,30 @@ function createHighlightedImageData(base64, clickEvent, options = {}) {
     const quality = Number.isFinite(Number(options.quality)) ? Number(options.quality) : 0.85;
     const captureMapping = options.captureMapping || null;
     const viewportOffsetY = Number.isFinite(Number(options.viewportOffsetY)) ? Number(options.viewportOffsetY) : 0;
+    // When provided, draw the box directly from percentage coords (0-1 fractions of image dims),
+    // bypassing captureMapping / viewportOffsetY / size-filter — matches ReviewPanel overlay exactly.
+    const directRectPct = options.directRectPct || null;
 
     return new Promise((resolve) => {
         const image = new Image();
         image.onload = () => {
             const width = fallbackWidth || image.naturalWidth || image.width || 0;
             const height = fallbackHeight || image.naturalHeight || image.height || 0;
-            const highlightRect = getArticleHighlightRectForCanvas(clickEvent, width, height, captureMapping, viewportOffsetY);
-            if (!highlightRect || !width || !height) {
+            if (!width || !height) { resolve(base64); return; }
+
+            let highlightRect;
+            if (directRectPct) {
+                const padding = Math.max(4, Math.round(Math.min(width, height) * 0.005));
+                const strokeWidth = Math.max(3, Math.round(Math.min(width, height) * 0.004));
+                const rx = Math.max(0, directRectPct.xPct * width - padding);
+                const ry = Math.max(0, directRectPct.yPct * height - padding);
+                const rw = Math.min(width - rx, directRectPct.wPct * width + padding * 2);
+                const rh = Math.min(height - ry, directRectPct.hPct * height + padding * 2);
+                highlightRect = { x: rx, y: ry, width: rw, height: rh, strokeWidth };
+            } else {
+                highlightRect = getArticleHighlightRectForCanvas(clickEvent, width, height, captureMapping, viewportOffsetY);
+            }
+            if (!highlightRect) {
                 resolve(base64);
                 return;
             }
@@ -450,16 +511,43 @@ function createHighlightedImageData(base64, clickEvent, options = {}) {
     });
 }
 
-async function createHighlightedArticleFrame(frame, clickEvent, nextFrameId, viewportOffsetY = 0) {
+// adjustedRectPct: when provided (user confirmed in ReviewPanel), draw the box directly from
+// percentage coords — bypasses captureMapping / viewportOffsetY / size-filter so the baked
+// image exactly matches what the ReviewPanel overlay showed.
+async function createHighlightedArticleFrame(frame, clickEvent, nextFrameId, viewportOffsetY = 0, adjustedRectPct = null) {
     const captureMapping = frame?.captureMapping || null;
-    const hdRect = getArticleHighlightRectForCanvas(clickEvent, 1920, 1080, captureMapping, viewportOffsetY);
-    if (!hdRect) return null;
+
+    // Resolve actual frame pixel dimensions from the stored image data so the
+    // coordinate mapping never assumes a hardcoded 1920×1080 resolution.
+    const getImageDims = (b64) => new Promise((resolve) => {
+        if (!b64) return resolve({ w: 0, h: 0 });
+        const img = new Image();
+        img.onload = () => resolve({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height });
+        img.onerror = () => resolve({ w: 0, h: 0 });
+        img.src = `data:image/jpeg;base64,${b64}`;
+    });
+    const hdSrc = frame?.hdData || '';
+    const aiSrc = frame?.aiData || '';
+    const [hdDims, aiDims] = await Promise.all([getImageDims(hdSrc), getImageDims(aiSrc)]);
+    const hdW = hdDims.w || 1920;
+    const hdH = hdDims.h || 1080;
+    const aiW = aiDims.w || 1280;
+    const aiH = aiDims.h || 720;
+
+    // Only run the auto-detection path (which can return null) when no user-confirmed rect is provided.
+    if (!adjustedRectPct) {
+        const hdRect = getArticleHighlightRectForCanvas(clickEvent, hdW, hdH, captureMapping, viewportOffsetY);
+        if (!hdRect) {
+            console.warn('[HighlightDebug] hdRect=null → no highlight. clickEvent=', JSON.stringify({ id: clickEvent?.id, x: clickEvent?.x, y: clickEvent?.y, viewportW: clickEvent?.viewportW, viewportH: clickEvent?.viewportH, targetRect: clickEvent?.targetRect }), 'captureMapping=', captureMapping);
+            return null;
+        }
+    }
 
     const [hdData, aiData] = await Promise.all([
-        createHighlightedImageData(frame?.hdData || '', clickEvent, { width: 1920, height: 1080, quality: 0.85, captureMapping, viewportOffsetY }),
-        frame?.aiData
-            ? createHighlightedImageData(frame.aiData, clickEvent, { width: 1280, height: 720, quality: 0.72, captureMapping, viewportOffsetY })
-            : Promise.resolve(frame?.aiData || '')
+        createHighlightedImageData(hdSrc, clickEvent, { width: hdW, height: hdH, quality: 0.85, captureMapping, viewportOffsetY, directRectPct: adjustedRectPct }),
+        aiSrc
+            ? createHighlightedImageData(aiSrc, clickEvent, { width: aiW, height: aiH, quality: 0.72, captureMapping, viewportOffsetY, directRectPct: adjustedRectPct })
+            : Promise.resolve(aiSrc)
     ]);
 
     return {
@@ -1336,6 +1424,7 @@ export default function App() {
                 : false
     );
     const [showHelp, setShowHelp] = useState(false);
+    const [pendingScreenshotReview, setPendingScreenshotReview] = useState(null);
     const [lmStudioModelCatalog, setLmStudioModelCatalog] = useState(() => createModelCatalogState('尚未讀取 LM Studio 已安裝模型。'));
     const [ollamaModelCatalog, setOllamaModelCatalog] = useState(() => createModelCatalogState('尚未讀取 Ollama 已安裝模型。'));
     const azureVisionEndpoint = (settings.azureVisionEndpoint || settings.azureEndpoint || '').trim();
@@ -1450,12 +1539,16 @@ export default function App() {
     }, []);
 
     const loadGlobalClickLog = useCallback(async () => {
-        if (Array.isArray(projectStateRef.current?.clickEventLog) && projectStateRef.current.clickEventLog.length > 0) {
-            return projectStateRef.current.clickEventLog;
-        }
+        // Merge projectState events (saved at recording-end) + any newer events in chrome.storage.
+        // This handles the case where a new recording cleared chrome.storage but the old events
+        // are still in the project state (and vice-versa).
+        const projectEvents = Array.isArray(projectStateRef.current?.clickEventLog)
+            ? projectStateRef.current.clickEventLog
+            : [];
+        let storageEvents = [];
         try {
             if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-                return await new Promise((resolve) => {
+                storageEvents = await new Promise((resolve) => {
                     chrome.storage.local.get({ clickEventLog: [] }, (res) => {
                         resolve(Array.isArray(res.clickEventLog) ? res.clickEventLog : []);
                     });
@@ -1464,7 +1557,15 @@ export default function App() {
         } catch (err) {
             console.warn('load click log failed', err);
         }
-        return [];
+        if (projectEvents.length === 0) return storageEvents;
+        if (storageEvents.length === 0) return projectEvents;
+        // Merge and deduplicate by id
+        const seen = new Set(projectEvents.map(e => e?.id).filter(Boolean));
+        const merged = [...projectEvents];
+        for (const e of storageEvents) {
+            if (e?.id && !seen.has(e.id)) { merged.push(e); seen.add(e.id); }
+        }
+        return merged;
     }, []);
     const clearGlobalDebugLog = useCallback(async () => {
         try {
@@ -2276,11 +2377,14 @@ export default function App() {
         const includeAudio = !!options.includeAudio;
         const includeWebcam = !!options.includeWebcam;
         const needsPageDebugRecording = activeSkillId === 'ui-debug' || activeSkillId === 'ux-research';
-        const needsClickSession = settings.clickRippleEnabled && (activeSkillId === 'tutorial' || activeSkillId === 'composite-tutorial');
+        const needsClickSession = settings.clickRippleEnabled; // track clicks for any skill when ripple is enabled
         try {
             const newSessionId = `rec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
             recordingSessionIdRef.current = newSessionId;
             if (needsClickSession) {
+                // Re-inject the content script across all tabs so it is guaranteed to be
+                // running (and has the latest rippleEnabled=true) when recording begins.
+                await sendBackgroundMessage({ type: 'set-click-ripple-enabled', enabled: true });
                 await setGlobalClickSession(newSessionId);
                 await clearGlobalClickLog();
             } else {
@@ -6671,15 +6775,19 @@ ${orderedFramesText}
                     if (subtitleProvider === 'azure') {
                         if (!azureVisionEndpoint || !settings.azureDeployment) throw new Error("請至設定填寫完整的 Azure Vision Endpoint 與 Vision 部署名稱。");
 
+                        // Interleave [Time: Xs] text labels before each image so Azure
+                        // uses the actual video timestamp instead of guessing from UI content
+                        // (e.g. router dashboard showing uptime "48 min" causing wrong startAt).
+                        const azureImageContent = capturedFrames.flatMap(f => [
+                            { type: "text", text: `[Time: ${f.relativeTime.toFixed(2)}s]` },
+                            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${f.aiData}` } }
+                        ]);
                         const messages = [
                             {
                                 role: "user",
                                 content: [
                                     { type: "text", text: promptText },
-                                    ...capturedFrames.map(f => ({
-                                        type: "image_url",
-                                        image_url: { url: `data:image/jpeg;base64,${f.aiData}` }
-                                    }))
+                                    ...azureImageContent
                                 ]
                             }
                         ];
@@ -7522,6 +7630,20 @@ ${orderedFramesText}
                     ? "目前沒有可用截圖，請先執行 AI 場景分析建立綜合教學截圖。"
                     : "目前沒有可用截圖，且無法從時間軸重建步驟截圖。"
         );
+        // ── Storage probe (temporary) ──────────────────────────────────────────
+        if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+            chrome.storage.local.get(
+                { clickRippleEnabled: null, clickRippleSessionId: null, clickEventLog: [] },
+                (raw) => {
+                    console.warn('[ClickStorageProbe] clickRippleEnabled=', raw.clickRippleEnabled,
+                        'sessionId=', raw.clickRippleSessionId,
+                        'rawStorageEventCount=', Array.isArray(raw.clickEventLog) ? raw.clickEventLog.length : 'NOT_ARRAY');
+                }
+            );
+        }
+        console.warn('[ClickStorageProbe] projectState.clickEventLog length=',
+            Array.isArray(projectStateRef.current?.clickEventLog) ? projectStateRef.current.clickEventLog.length : 'none');
+        // ──────────────────────────────────────────────────────────────────────
         const articleClickEvents = await loadGlobalClickLog();
         const articleClickEventById = new Map(
             (Array.isArray(articleClickEvents) ? articleClickEvents : [])
@@ -7538,7 +7660,7 @@ ${orderedFramesText}
         // Time-based fallback: find nearest click event when subtitle.clickId is empty.
         // Convert click epochMs → timeline seconds using the same rangeStart + timeline offset
         // logic used during subtitle generation.
-        const _articleRangeStart = Number(projectState.recordingRange?.startEpochMs || 0);
+        const _articleRangeStart = Number(projectState.recordingRange?.startEpochMs || recordStartTimeRef.current || 0);
         const _articleSessionId = projectState.recordingSessionId || '';
         const _articleAllClips = projectState.tracks.flat().filter(c => c?.type === 'video');
         const _articleSessionClips = _articleSessionId
@@ -7547,17 +7669,31 @@ ${orderedFramesText}
         const _articleTimelineOffset = _articleSessionClips.length > 0
             ? Math.min(..._articleSessionClips.map(c => Number(c?.startAt || 0)).filter(Number.isFinite))
             : 0;
-        const _sortedArticleClicksByTime = _articleRangeStart > 0
-            ? (Array.isArray(articleClickEvents) ? articleClickEvents : [])
+        console.log('[HighlightDebug] rangeStart=', _articleRangeStart, 'sessionId=', _articleSessionId, 'totalClickEvents=', articleClickEvents.length, 'clickMapSize=', articleClickEventById.size, 'timelineOffset=', _articleTimelineOffset);
+        const _buildSortedClicks = (events, sessionIdFilter) => {
+            if (_articleRangeStart <= 0) return [];
+            return events
                 .filter(ev => typeof ev?.epochMs === 'number' && String(ev?.id || '').trim()
-                    && (!_articleSessionId || (ev?.sessionId || '') === _articleSessionId))
+                    && (!sessionIdFilter || (ev?.sessionId || '') === sessionIdFilter))
                 .map(ev => ({
                     id: String(ev.id).trim(),
                     timeS: (ev.epochMs - _articleRangeStart) / 1000 + _articleTimelineOffset
                 }))
                 .filter(ev => ev.timeS >= -1)
-                .sort((a, b) => a.timeS - b.timeS)
-            : [];
+                .sort((a, b) => a.timeS - b.timeS);
+        };
+        // Try strict session-ID match first; if no results, fall back to time-range-only match.
+        let _sortedArticleClicksByTime = _buildSortedClicks(
+            Array.isArray(articleClickEvents) ? articleClickEvents : [],
+            _articleSessionId
+        );
+        if (_sortedArticleClicksByTime.length === 0 && _articleSessionId) {
+            _sortedArticleClicksByTime = _buildSortedClicks(
+                Array.isArray(articleClickEvents) ? articleClickEvents : [],
+                '' // no session filter — rely on time range only
+            );
+        }
+        console.log('[HighlightDebug] sortedClicksByTime count=', _sortedArticleClicksByTime.length, _sortedArticleClicksByTime.slice(0, 3).map(e => `${e.id.slice(0,16)}@${e.timeS.toFixed(2)}s`));
         const findNearestArticleClickId = (targetTimeS, maxGapS = 3) => {
             if (!_sortedArticleClicksByTime.length) return '';
             let best = null;
@@ -7636,11 +7772,17 @@ ${orderedFramesText}
             const normalizedClickId = String(clickId || '').trim();
             if (!frame) return frame;
             ensureArticleFrameInPool(frame);
-            if (!includeArticleClickHighlight || !normalizedClickId) return frame;
+            if (!includeArticleClickHighlight || !normalizedClickId) {
+                console.log('[HighlightDebug] skip: includeHighlight=', includeArticleClickHighlight, 'clickId=', normalizedClickId);
+                return frame;
+            }
             if (frame?.articleHighlightForClickId === normalizedClickId) return frame;
 
             const clickEvent = articleClickEventById.get(normalizedClickId);
-            if (!clickEvent) return frame;
+            if (!clickEvent) {
+                console.warn('[HighlightDebug] clickEvent not found for clickId=', normalizedClickId, '— map size=', articleClickEventById.size);
+                return frame;
+            }
 
             const sourceFrameId = Number(frame?.sourceFrameId || frame?.frameId || 0);
             const cacheKey = `${sourceFrameId}:${normalizedClickId}`;
@@ -7679,6 +7821,9 @@ ${orderedFramesText}
                 candidateFrames: []
             };
 
+            // Compute once per bundle (same click event for all candidates in this step)
+            const highlightRectPct = computeHighlightRectPct(clickEvent);
+
             for (let candidateIndex = 0; candidateIndex < candidateFrames.length; candidateIndex++) {
                 const candidateFrame = candidateFrames[candidateIndex];
                 const highlightedCandidateFrame = await ensureArticleFrameHighlight(candidateFrame, normalizedClickId);
@@ -7690,6 +7835,8 @@ ${orderedFramesText}
                 const isSelected = !!bestSourceFrameId && sourceFrameId === bestSourceFrameId;
                 candidateBundle.candidateFrames.push({
                     frame: highlightedCandidateFrame || candidateFrame,
+                    rawFrame: candidateFrame,       // original, no highlight baked in
+                    highlightRectPct,               // 0-1 fractions for interactive overlay
                     captureTime: Number(captureTime.toFixed(2)),
                     offsetSeconds,
                     sourceFrameId,
@@ -8056,7 +8203,16 @@ ${JSON.stringify(compositeArticleInput)}
                 return;
             }
 
-            const subtitles = [...highlightSubtitles].sort((a, b) => a.startAt - b.startAt);
+            const allSubtitlesSorted = [...highlightSubtitles].sort((a, b) => a.startAt - b.startAt);
+            // For tutorial skill: only keep subtitles that coincide with a click event.
+            // Non-action narration subtitles have no corresponding click and should be skipped.
+            const isTutorialOnlyMode = activeSkillId === 'tutorial';
+            const subtitles = isTutorialOnlyMode
+                ? allSubtitlesSorted.filter(sub => {
+                    const id = sub.clickId || findNearestArticleClickId(Number(sub.startAt || 0));
+                    return !!id;
+                })
+                : allSubtitlesSorted;
             const subtitlePayload = subtitles.map((s, idx) => ({
                 index: idx + 1,
                 startAt: Number((s.startAt || 0).toFixed(2)),
@@ -8126,15 +8282,32 @@ ${JSON.stringify(compositeArticleInput)}
                 ? manualArticleTopic
                 : (extractArticleTopic(briefWithoutLinks) || extractArticleTopic(subtitlePayload.map(s => s.text).join('\n')));
             const safeArticleTopic = isUsableArticleTopic(articleTopic) ? articleTopic : '';
-            const whatIsHeading = safeArticleTopic
-                ? (settings.language === 'zh-TW' ? `${safeArticleTopic}是什麼？` : `What is ${safeArticleTopic}?`)
+            // topicCore strips leading and trailing action words so headings read naturally.
+            // Examples:
+            //   "如何設定AiMesh的LED排程" → "AiMesh的LED排程"
+            //   "Adaptive QoE設定"       → "Adaptive QoE"
+            //   "How to set up Wi-Fi 7"  → "Wi-Fi 7"
+            const topicCore = safeArticleTopic
+                // Strip leading action phrases (Chinese): 如何設定/怎麼設定/如何/設定/安裝/…
+                .replace(/^(?:如何(?:進行|操作|設定|設置|安裝|配置|使用|開啟|調整|完成)?|怎麼(?:設定|設置|安裝|配置|使用)?|設定|設置|安裝|配置|使用|開啟|開始)\s*/i, '')
+                // Strip leading action phrases (English): How to set up / configure / install / use
+                .replace(/^how\s+to\s+(?:set\s+up\s+|configure\s+|install\s+|use\s+|enable\s+)?/i, '')
+                // Strip trailing config/action words
+                .replace(/\s*(設定|設置|安裝|配置|系統|功能|操作|教學|介紹|使用|管理)\s*$/i, '')
+                .trim() || safeArticleTopic;
+            const whatIsHeading = topicCore
+                ? (settings.language === 'zh-TW' ? `${topicCore}是什麼？` : `What is ${topicCore}?`)
                 : (settings.language === 'zh-TW' ? '這是什麼？' : 'What is it?');
-            const benefitsHeading = safeArticleTopic
-                ? (settings.language === 'zh-TW' ? `${safeArticleTopic}的優點？` : `What are the benefits of ${safeArticleTopic}?`)
+            const benefitsHeading = topicCore
+                ? (settings.language === 'zh-TW' ? `${topicCore}的優點？` : `What are the benefits of ${topicCore}?`)
                 : (settings.language === 'zh-TW' ? '為何你需要它？核心優勢' : 'Why you need it? Benefits');
-            const defaultTitle = settings.language === 'zh-TW'
-                ? (isColumnTopicMode ? '今日專欄' : '產品介紹與設定指南')
-                : (isColumnTopicMode ? 'Column Notebook' : 'Product Overview and Setup Guide');
+            // defaultTitle falls back to the topic name if available, so the article isn't
+            // titled "產品介紹與設定指南" when we know the actual subject.
+            const defaultTitle = safeArticleTopic
+                ? safeArticleTopic
+                : (settings.language === 'zh-TW'
+                    ? (isColumnTopicMode ? '今日專欄' : '產品介紹與設定指南')
+                    : (isColumnTopicMode ? 'Column Notebook' : 'Product Overview and Setup Guide'));
             const perspectiveInstruction = isColumnTopicMode
                 ? (settings.language === 'zh-TW'
                     ? '寫作視角：請固定使用第一人稱深入專欄口吻，像作者親自觀察、親自比較、親自推敲，不要寫成教學，也不要寫成品牌官方公告。'
@@ -8521,8 +8694,11 @@ ${JSON.stringify(subtitlePayload)}
                     });
                 });
 
-                const usedFrameIds = new Set();
+                // ── Pass 1: collect candidate screenshots for all steps ──────────
+                articleProgress(4, 6, '蒐集候選截圖', '正在為每個步驟擷取候選截圖，供審核選擇...');
+                const stepReviewData = [];
                 for (let idx = 0; idx < subtitles.length; idx++) {
+                    taskSignal.throwIfAborted();
                     const sub = subtitles[idx];
                     const subIndex = idx + 1;
                     const aiStep = aiStepMap.get(subIndex);
@@ -8530,22 +8706,157 @@ ${JSON.stringify(subtitlePayload)}
                     const stepName = aiStep?.stepName || defaultName || `${settings.language === 'zh-TW' ? '步驟' : 'Step'} ${subIndex}`;
                     const description = aiStep?.description || defaultName;
                     const stepTime = Number(sub.startAt || 0);
-                    markdownDoc += `### ${settings.language === 'zh-TW' ? '步驟' : 'Step'} ${subIndex}: ${stepName}\n${description}\n`;
                     const effectiveClickId = sub.clickId || (includeArticleClickHighlight ? findNearestArticleClickId(stepTime) : '');
-                    const clickCandidateBundle = await resolveArticleClickFrameCandidates(stepTime, effectiveClickId);
+                    const candidateBundle = await resolveArticleClickFrameCandidates(stepTime, effectiveClickId);
+                    // Normalize to CandidateWrapper objects: { rawFrame, previewFrame, highlightRectPct, frameId, ... }
+                    let candidates = candidateBundle?.candidateFrames?.length
+                        ? candidateBundle.candidateFrames
+                            .map(cf => makeCandidateWrapper(cf.rawFrame, cf.frame, cf.highlightRectPct))
+                            .filter(c => c.rawFrame || c.previewFrame)
+                        : (candidateBundle?.selectedFrame
+                            ? [makeCandidateWrapper(
+                                candidateBundle.selectedFrame,
+                                candidateBundle.selectedFrame,
+                                computeHighlightRectPct(articleClickEventById.get(effectiveClickId))
+                              )]
+                            : []);
+                    // No click-based candidates → capture multiple time-based candidates so the
+                    // user still gets a meaningful set of frames to choose from.
+                    if (candidates.length === 0) {
+                        const candidateTimes = buildArticleClickCandidateTimes(stepTime, totalDuration || 0);
+                        const timeFrames = await captureFramesFromTimelineTargets(candidateTimes, {
+                            settledDelaySeconds: 0,
+                            includeClickRipple: false
+                        });
+                        // De-duplicate by sourceFrameId so near-identical frames don't pad the list.
+                        const seenIds = new Set();
+                        for (const f of timeFrames) {
+                            const fid = Number(f?.sourceFrameId || f?.frameId || 0);
+                            if (fid && seenIds.has(fid)) continue;
+                            if (fid) seenIds.add(fid);
+                            if (f) candidates.push(makeCandidateWrapper(f, f, null));
+                        }
+                    }
+                    // Final single-frame fallback if video seek also produced nothing.
+                    if (candidates.length === 0) {
+                        const fallbackFrame = pickBestScreenshotFrame(activeFrames, stepTime, new Set(), effectiveClickId);
+                        if (fallbackFrame) candidates.push(makeCandidateWrapper(fallbackFrame, fallbackFrame, null));
+                    }
+                    const selectedFrame = candidateBundle?.selectedFrame;
+                    // selectedFrame is the highlighted frame; its sourceFrameId = raw frame's frameId
+                    // which is what wrapper.frameId stores.
+                    const selectedRawId = selectedFrame?.sourceFrameId || selectedFrame?.frameId;
+                    const selectedIdx = selectedRawId
+                        ? Math.max(0, candidates.findIndex(c => c?.frameId === selectedRawId))
+                        : (() => {
+                            let bestI = 0;
+                            let bestDiff = Infinity;
+                            candidates.forEach((c, i) => {
+                                const diff = Math.abs(Number(c?.relativeTime || 0) - stepTime);
+                                if (diff < bestDiff) { bestDiff = diff; bestI = i; }
+                            });
+                            return bestI;
+                        })();
+                    stepReviewData.push({
+                        subIndex, stepName, description, stepTime, effectiveClickId,
+                        candidates, selectedIdx, sub, candidateBundle
+                    });
+                }
+
+                // ── Screenshot review: pause and let the user pick ────────────────
+                articleProgress(5, 6, '等待截圖審核', '請在截圖審核介面選擇每個步驟的截圖，完成後按「確認並生成文章」。');
+                let userSelectedFrames;
+                try {
+                    userSelectedFrames = await Promise.race([
+                        new Promise((resolve, reject) => {
+                            setPendingScreenshotReview({
+                                steps: stepReviewData,
+                                onConfirm: resolve,
+                                onCancel: () => reject(new Error(AI_TASK_CANCELLED_MESSAGE))
+                            });
+                        }),
+                        new Promise((_, reject) => {
+                            taskSignal.addEventListener('abort', () =>
+                                reject(new Error(AI_TASK_CANCELLED_MESSAGE))
+                            );
+                        })
+                    ]);
+                } finally {
+                    setPendingScreenshotReview(null);
+                }
+
+                // ── Apply adjusted highlights from user's review ─────────────────
+                // userSelectedFrames is now { rawFrame, adjustedRectPct }[] from review confirm.
+                // Apply the user-corrected rect to bake the final red box into each frame.
+                // IMPORTANT: process sequentially (not Promise.all) to avoid a race condition
+                // where multiple concurrent tasks read the same nextArticleFrameId before any
+                // of them increments it, producing duplicate frameIds (and therefore duplicate
+                // filenames) for different steps.
+                const finalFrames = [];
+                for (let fIdx = 0; fIdx < (userSelectedFrames || []).length; fIdx++) {
+                    const sel = userSelectedFrames[fIdx];
+                    if (!sel?.rawFrame) { finalFrames.push(null); continue; }
+                    const { rawFrame, adjustedRectPct } = sel;
+                    if (!adjustedRectPct) { finalFrames.push(rawFrame); continue; } // no click event
+                    const step = stepReviewData[fIdx];
+                    const origClickEvent = step?.effectiveClickId
+                        ? articleClickEventById.get(step.effectiveClickId)
+                        : null;
+                    const vw = Number(origClickEvent?.viewportW) || 1920;
+                    const vh = Number(origClickEvent?.viewportH) || 1080;
+                    // Build a synthetic click event that uses the user-adjusted rect
+                    const syntheticEvent = {
+                        ...(origClickEvent || {}),
+                        id: origClickEvent?.id || step?.effectiveClickId || `adj_${fIdx}`,
+                        x: (adjustedRectPct.xPct + adjustedRectPct.wPct / 2) * vw,
+                        y: (adjustedRectPct.yPct + adjustedRectPct.hPct / 2) * vh,
+                        targetRect: {
+                            left: adjustedRectPct.xPct * vw,
+                            top: adjustedRectPct.yPct * vh,
+                            width: adjustedRectPct.wPct * vw,
+                            height: adjustedRectPct.hPct * vh,
+                        },
+                        viewportW: vw,
+                        viewportH: vh,
+                    };
+                    const highlighted = await createHighlightedArticleFrame(
+                        rawFrame, syntheticEvent, nextArticleFrameId + 1,
+                        Number(settings.clickHighlightOffsetY) || 0,
+                        adjustedRectPct  // direct pct → bypasses captureMapping/offsetY/size-filter
+                    );
+                    if (highlighted) {
+                        nextArticleFrameId += 1;
+                        ensureArticleFrameInPool(highlighted);
+                    }
+                    finalFrames.push(highlighted || rawFrame);
+                }
+
+                // ── Pass 2: build markdown from user-confirmed selections ─────────
+                const usedFrameIds = new Set();
+                for (let idx = 0; idx < stepReviewData.length; idx++) {
+                    taskSignal.throwIfAborted();
+                    const { subIndex, stepName, description, effectiveClickId, candidateBundle } = stepReviewData[idx];
+                    markdownDoc += `### ${settings.language === 'zh-TW' ? '步驟' : 'Step'} ${subIndex}: ${stepName}\n${description}\n`;
+                    // finalFrames[idx] is already highlighted with the user-adjusted rect
+                    // (or the raw frame if the step had no click event).
+                    const chosenFrame = finalFrames?.[idx] || null;
+                    const frame = chosenFrame || pickBestScreenshotFrame(activeFrames, stepReviewData[idx].stepTime, usedFrameIds, effectiveClickId);
                     registerArticleCandidateExport({
                         stepIndex: subIndex,
                         stepTitle: stepName,
                         clickId: effectiveClickId,
-                        targetTime: stepTime,
-                        candidateBundle: clickCandidateBundle
+                        targetTime: stepReviewData[idx].stepTime,
+                        candidateBundle
                     });
-                    const clickSelectedFrame = clickCandidateBundle?.selectedFrame || null;
-                    const frame = clickSelectedFrame || pickBestScreenshotFrame(activeFrames, stepTime, usedFrameIds, effectiveClickId);
                     if (frame) {
                         usedFrameIds.add(frame.frameId);
-                        const highlightedFrame = clickSelectedFrame || await ensureArticleFrameHighlight(frame, effectiveClickId);
-                        markdownDoc += `\n![Screenshot at ${highlightedFrame.relativeTime.toFixed(2)}s](./${exportImagePrefix}_${highlightedFrame.frameId}.jpg)\n\n`;
+                        // chosenFrame already has the highlight baked in; only apply
+                        // ensureArticleFrameHighlight for the auto-fallback path.
+                        const displayFrame = chosenFrame
+                            ? frame
+                            : await ensureArticleFrameHighlight(frame, effectiveClickId);
+                        const exportFrame = displayFrame || frame;
+                        markdownDoc += `\n![Screenshot at ${Number(exportFrame.relativeTime || 0).toFixed(2)}s](./${exportImagePrefix}_${exportFrame.frameId}.jpg)\n\n`;
                     } else {
                         markdownDoc += '\n';
                     }
@@ -8555,8 +8866,8 @@ ${JSON.stringify(subtitlePayload)}
             }
 
             articleProgress(
-                5,
-                5,
+                isColumnTopicMode ? 5 : 6,
+                isColumnTopicMode ? 5 : 6,
                 '寫入文章結果',
                 isColumnTopicMode ? '專欄內容、截圖與 Mermaid 圖表已整理完成，正在寫入專案結果...' : '文章內容與步驟截圖已整理完成，正在寫入專案結果...'
             );
@@ -11249,6 +11560,39 @@ ${JSON.stringify(subtitlePayload)}
                                         <span className="text-[10px] opacity-50 text-gray-400 pointer-events-none absolute -translate-x-1/2" style={{ left: 0 }}>{i}s</span>
                                     </div>
                                 ))}
+                                {/* ── Click event markers ─────────────────────────────────────── */}
+                                {(() => {
+                                    const rangeStart = Number(projectState.recordingRange?.startEpochMs || 0);
+                                    const sessionId = projectState.recordingSessionId || '';
+                                    const events = Array.isArray(projectState.clickEventLog) ? projectState.clickEventLog : [];
+                                    if (!rangeStart || !events.length) return null;
+                                    return events
+                                        .filter(ev => ev?.epochMs && (!sessionId || (ev.sessionId || '') === sessionId))
+                                        .map((ev, i) => {
+                                            const timeS = (ev.epochMs - rangeStart) / 1000;
+                                            if (timeS < 0 || timeS > totalDuration + 5) return null;
+                                            const left = timeS * pixelsPerSecond + TIMELINE_OFFSET;
+                                            const label = ev.targetText ? ev.targetText.slice(0, 24) : `${timeS.toFixed(2)}s`;
+                                            return (
+                                                <div
+                                                    key={`clk-${i}`}
+                                                    className="absolute top-0 bottom-0 flex flex-col items-center pointer-events-auto group z-20"
+                                                    style={{ left: `${left}px`, transform: 'translateX(-50%)' }}
+                                                    title={`點擊 ${timeS.toFixed(2)}s${ev.targetText ? ` — ${ev.targetText}` : ''}`}
+                                                >
+                                                    {/* triangle marker */}
+                                                    <div className="w-0 h-0 mt-0.5 flex-none"
+                                                        style={{ borderLeft: '4px solid transparent', borderRight: '4px solid transparent', borderTop: '6px solid rgba(255,60,60,0.9)' }} />
+                                                    {/* stem */}
+                                                    <div className="w-px flex-1 bg-red-500/60" />
+                                                    {/* hover tooltip */}
+                                                    <div className="absolute top-7 left-1/2 -translate-x-1/2 hidden group-hover:flex bg-gray-900 border border-red-500/50 text-red-300 text-[10px] px-1.5 py-0.5 rounded whitespace-nowrap z-30 pointer-events-none shadow-lg">
+                                                        {label}
+                                                    </div>
+                                                </div>
+                                            );
+                                        });
+                                })()}
                                 </div>
 
                             {SUBTITLE_TRACKS.map((track, trackIndex) => (
@@ -11604,6 +11948,14 @@ ${JSON.stringify(subtitlePayload)}
                     setShowSettings(false);
                 }}
             />
+
+            {pendingScreenshotReview && (
+                <ArticleScreenshotReview
+                    steps={pendingScreenshotReview.steps}
+                    onConfirm={pendingScreenshotReview.onConfirm}
+                    onCancel={pendingScreenshotReview.onCancel}
+                />
+            )}
         </div>
     );
 }

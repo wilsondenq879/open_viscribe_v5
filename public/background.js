@@ -3,7 +3,7 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 const FEATURE_DEFAULTS = {
-  clickRippleEnabled: false,
+  clickRippleEnabled: true,
   pageDebugEnabled: false
 };
 

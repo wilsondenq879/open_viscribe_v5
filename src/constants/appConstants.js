@@ -43,7 +43,7 @@ export const DEFAULT_SETTINGS = {
     includeAudio: false,
     resolution: '1080p',
     aspectRatio: '16:9',
-    clickRippleEnabled: false,
+    clickRippleEnabled: true,
     // Vertical pixel offset to compensate when the screen recording includes browser
     // chrome above the viewport (address bar, tabs).  Set to ~130 if your recording
     // source is the whole browser window; leave at 0 for tab-only capture.
