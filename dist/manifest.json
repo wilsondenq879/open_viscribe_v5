@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "OpenViscribe",
+  "version": "2.0",
+  "description": "OpenViscribe browser extension.",
+  "permissions": [
+    "storage",
+    "scripting",
+    "tabCapture",
+    "tabs",
+    "activeTab"
+  ],
+  "action": {
+    "default_title": "OpenViscribe"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
