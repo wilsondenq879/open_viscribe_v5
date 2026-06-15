@@ -617,7 +617,11 @@ async function pickBestArticleClickCandidateFrame(frames, clickEvent) {
         });
         const clarity = Number(frame?.clarityScore || 0);
         const loadingPenalty = Number(frame?.loadingScore || 0) + (frame?.isLikelyLoading ? 0.5 : 0);
-        const score = (regionDetail * 2.4) + (clarity * 0.35) - (loadingPenalty * 0.45);
+        // Prefer frames before the click (cursor not yet on target), max bonus at -1.5s, zero at click time
+        const clickTime = Number(clickEvent?.time ?? clickEvent?.clickTime ?? 0);
+        const frameTime = Number(frame?.relativeTime ?? 0);
+        const preClickBonus = frameTime < clickTime ? Math.min(0.6, (clickTime - frameTime) * 0.3) : 0;
+        const score = (regionDetail * 2.4) + (clarity * 0.35) - (loadingPenalty * 0.45) + preClickBonus;
         if (score > bestScore) {
             bestScore = score;
             bestFrame = frame;
@@ -2513,6 +2517,7 @@ export default function App() {
             const displayMediaOptions = {
                 video: {
                     displaySurface: 'browser',
+                    cursor: 'never',
                     width: settings.resolution === '1080p' ? 1920 : 1280,
                     height: settings.resolution === '1080p' ? 1080 : 720,
                     frameRate: { ideal: RENDER_FPS, max: RENDER_FPS }
@@ -2982,7 +2987,7 @@ export default function App() {
             });
         }
 
-        projectStateRef.current.subtitles.forEach(sub => {
+        if (!options.hideSubtitles) projectStateRef.current.subtitles.forEach(sub => {
             const normalizedSub = normalizeSubtitle(sub);
             if (trackStateRef.current.subtitleHidden[normalizedSub.trackIndex]) return;
             if (time >= normalizedSub.startAt && time <= normalizedSub.endAt) {
@@ -3152,7 +3157,7 @@ export default function App() {
 
             syncPlaybackElementsForTime(captureTime, { forceHardSync: true });
             await waitForPaint();
-            drawToExportCanvas(captureTime, { includeClickRipple });
+            drawToExportCanvas(captureTime, { includeClickRipple, hideSubtitles: true });
             const captureMapping = getPrimaryFrameCaptureMapping(captureTime, hdCanvas.width, hdCanvas.height);
 
             hdCtx.clearRect(0, 0, hdCanvas.width, hdCanvas.height);
@@ -5993,7 +5998,7 @@ export default function App() {
                     await seekVideoElementForClipTime(videoEl, clipTime);
                 }));
 
-                drawToExportCanvas(targetTime);
+                drawToExportCanvas(targetTime, { hideSubtitles: true });
                 const exportCanvas = exportCanvasRef.current;
                 if (!exportCanvas) return;
 
@@ -6122,7 +6127,7 @@ export default function App() {
             const optionalFrames = [];
             let frameSeq = 0;
             const baseSampleInterval = 1.0;
-            const clickOffsets = [-0.06, 0, 0.08, 0.16, 0.24, 0.4, 0.65, 0.95];
+            const clickOffsets = [-1.5, -1.0, -0.5, -0.2, -0.06, 0, 0.08, 0.16, 0.24, 0.4, 0.65, 0.95];
             let prevImageData = null;
             const rippleFrameByClickId = new Map();
 
@@ -8128,12 +8133,12 @@ ${orderedFramesText}
                     ? (articlePerspective === 'brand'
                         ? '請使用第一人稱品牌/團隊口吻撰寫，可使用「我們」來介紹這段錄影示範的內容與目的。'
                         : articlePerspective === 'brief'
-                            ? '請以精簡概要方式撰寫：opening 只需一到兩句話總結這段錄影的核心內容，不需分段，不需列點，不需展開細節。'
+                            ? '【精簡概要模式】opening 只能寫一到兩句話，直接點出這段錄影做了什麼，不得超過兩句。overview 同樣一到兩句。result_summary 一句話收尾。全文不得展開細節或多段落。'
                             : '請使用第三人稱介紹口吻撰寫，像教學文章編輯或觀察者在描述這段錄影示範的流程與重點。')
                     : (articlePerspective === 'brand'
                         ? 'Write in first person from the brand/team perspective. You may use "we" to introduce what this recording demonstrates and why it matters.'
                         : articlePerspective === 'brief'
-                            ? 'Write a brief summary only: the opening must be one to two sentences that capture the core of this recording. No sections, no bullet points, no elaboration.'
+                            ? '[BRIEF MODE] opening: exactly one to two sentences stating what this recording demonstrates. overview: one to two sentences max. result_summary: one sentence. No paragraphs, no bullet expansion, no elaboration anywhere.'
                             : 'Write in third person, like an editor or observer describing what this recording demonstrates and why it matters.');
                 const compositeArticleInput = safeSegments.map((segment) => ({
                     index: segment.segment_index,
@@ -8454,12 +8459,12 @@ ${JSON.stringify(compositeArticleInput)}
                     ? articlePerspective === 'brand'
                         ? '寫作視角：請以品牌 / 公司官方第一人稱撰寫，適度使用「我們」、「我們的產品」、「我們提供」等說法，語氣要像官方內容團隊，但避免空泛官話。'
                         : articlePerspective === 'brief'
-                            ? '寫作視角：精簡概要模式。whatIsIt 只需一到兩句話直接說明這個功能或流程是什麼，不需展開細節。consumerBenefits 和 setupGuide 維持正常格式，但文字也盡量精簡。'
+                            ? '【精簡概要模式】所有欄位一律精簡：whatIsIt 只能一到兩句話，直接說明這個功能是什麼；每個 consumerBenefits 的 description 不超過兩句；每個 setupGuide 的 description 不超過一句；conclusion 一到兩句收尾。全文不得有長段落或展開說明。'
                             : '寫作視角：請以 KOL / 科技媒體第三人稱撰寫，語氣要像開箱評測或產品推薦文章，可以直接點出產品亮點，但不要寫成品牌官方自述。'
                     : articlePerspective === 'brand'
                         ? 'Writing perspective: write in first person from the brand/company perspective. You may use phrases like "we", "our product", and "we provide", but keep the tone concrete rather than generic marketing fluff.'
                         : articlePerspective === 'brief'
-                            ? 'Writing perspective: brief summary mode. whatIsIt must be one to two sentences that directly state what this feature or workflow is. Keep consumerBenefits and setupGuide in their normal format but keep all text concise.'
+                            ? '[BRIEF MODE] All fields must be short: whatIsIt = one to two sentences only; each consumerBenefits description = max two sentences; each setupGuide description = max one sentence; conclusion = one to two sentences. No long paragraphs or elaboration anywhere in the output.'
                             : 'Writing perspective: write in third person from a KOL / tech reviewer perspective. The tone should feel like a product review or recommendation article, not a brand speaking about itself.');
 
             const systemText = isColumnTopicMode
@@ -8467,8 +8472,8 @@ ${JSON.stringify(compositeArticleInput)}
                     ? '你是專業科技專欄編輯。你必須回傳純 JSON 物件，包含 title, dek, opening, keyThemes(字串陣列), pullQuote, sections(陣列), closing, references(陣列)。sections 每項都要有 heading, narrative, takeaway, subtitleIndices(陣列), chart(物件，可為 none/pie/bar)。使用者輸入的是寫作 brief、觀點方向、補充背景與參考資料，不可逐字貼成標題。若使用者提供網址，只有在你真的能確認內容時才可當成參考；不能確認就把它當作使用者提供的背景，不要捏造網站內容。'
                     : 'You are a professional technology columnist. Return pure JSON with title, dek, opening, keyThemes (string array), pullQuote, sections (array), closing, and references (array). Each section must include heading, narrative, takeaway, subtitleIndices, and chart (object with type none/pie/bar). The user input is a writing brief and background, not text to copy verbatim into the article title or body. If URLs are provided, only treat them as references when you can truly verify them; otherwise do not invent website details.')
                 : (settings.language === 'zh-TW'
-                    ? '你是專業科技編輯。你必須回傳純 JSON 物件，包含 title, whatIsIt, consumerBenefits(陣列，含 benefitName, description), setupGuide(陣列，含 subtitleIndex, stepName, description), conclusion。使用者在介紹欄輸入的內容是寫作 brief、補充背景、語氣要求與可參考資料，不是要你逐字複製成標題或段落。若使用者提供網址，僅在你確實能讀取並確認內容時再引用；若無法讀取，請忽略網址本身，不可捏造網站內容。若主題已明確，不要使用「一個名為...」、「一款叫做...」、「某個...功能」這類疏離、百科式開頭，請直接進入產品或功能本身。'
-                    : 'You are a professional tech editor. Return pure JSON with title, whatIsIt, consumerBenefits (array of benefitName/description), setupGuide (array of subtitleIndex/stepName/description), conclusion. The user-provided description is a writing brief, context, tone guide, and optional reference material. Do not copy it verbatim into headings or body text unless it is an actual factual product name. If the user provides URLs, only use them if you can truly access and verify them; otherwise ignore the URL itself and do not invent website details. When the topic is clear, do not start with distant phrasing like "a feature called", "a product named", or encyclopedia-style introductions. Get to the product or feature directly.');
+                    ? '你是專業科技編輯。你必須回傳純 JSON 物件，包含 title, whatIsIt, consumerBenefits(陣列，含 benefitName, description), setupGuide(陣列，含 subtitleIndex, stepName, description), conclusion。使用者在介紹欄輸入的是寫作 brief、補充背景、語氣要求與可參考資料，不是產品名稱，絕對不可把介紹欄的任何文字直接用作 title、whatIsIt 的主詞或任何章節標題。產品名稱請從影片字幕與操作內容自行判斷。若使用者提供網址，僅在你確實能讀取並確認內容時再引用；若無法讀取，請忽略網址本身，不可捏造網站內容。若主題已明確，不要使用「一個名為...」、「一款叫做...」、「某個...功能」這類疏離、百科式開頭，請直接進入產品或功能本身。'
+                    : 'You are a professional tech editor. Return pure JSON with title, whatIsIt, consumerBenefits (array of benefitName/description), setupGuide (array of subtitleIndex/stepName/description), conclusion. The user description field is a writing brief, tone guide, and reference material — it is NOT the product name. Never use any text from the description field as the title, as the subject of whatIsIt, or as any section heading. Derive the product/feature name from the video subtitles and actions shown. If URLs are provided, only reference them when you can truly verify them. When the topic is clear, avoid distant phrasing like "a feature called" or encyclopedia-style introductions.');
 
             const userText = isColumnTopicMode
                 ? `
