@@ -197,6 +197,11 @@ export const ARTICLE_PERSPECTIVE_OPTIONS = [
         value: 'kol',
         label: 'KOL 評測（第三人稱）',
         hint: '用開箱評測或科技媒體角度介紹產品，語氣更像第三方推薦。'
+    },
+    {
+        value: 'brief',
+        label: '精簡概要（一到兩句）',
+        hint: '只產生一到兩句的精簡摘要說明，適合快速概述功能或步驟。'
     }
 ];
 

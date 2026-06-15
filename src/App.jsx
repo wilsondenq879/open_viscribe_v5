@@ -245,6 +245,49 @@ function computeHighlightRectPct(clickEvent) {
     };
 }
 
+// Load the pixel dimensions of a base64 JPEG (used to map highlight coords into
+// the captured frame's true resolution instead of assuming 1920×1080).
+function loadHighlightImageDims(b64) {
+    return new Promise((resolve) => {
+        if (!b64) return resolve({ w: 0, h: 0 });
+        const img = new Image();
+        img.onload = () => resolve({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height });
+        img.onerror = () => resolve({ w: 0, h: 0 });
+        img.src = `data:image/jpeg;base64,${b64}`;
+    });
+}
+
+// Accurate interactive-overlay rect.
+// The review-panel red box must sit exactly where the box is finally baked, so this
+// reuses the SAME mapping the bake uses — getArticleHighlightRectForCanvas — which
+// corrects for capture letterboxing/scaling (captureMapping), browser-chrome height
+// above the viewport (viewportOffsetY), element padding and the size floor. It then
+// returns 0-1 fractions of the captured frame (the image the overlay is drawn over).
+// Falls back to the naive viewport-fraction estimate only if mapping can't be resolved.
+async function computeHighlightRectPctForFrame(clickEvent, frame, viewportOffsetY = 0) {
+    if (!clickEvent || !frame) return null;
+    const src = frame.hdData || frame.aiData || '';
+    const dims = await loadHighlightImageDims(src);
+    const canvasW = dims.w || 1920;
+    const canvasH = dims.h || 1080;
+    const rect = getArticleHighlightRectForCanvas(
+        clickEvent,
+        canvasW,
+        canvasH,
+        frame.captureMapping || null,
+        viewportOffsetY
+    );
+    if (!rect) return computeHighlightRectPct(clickEvent);
+    const xPct = Math.max(0, Math.min(0.999, rect.x / canvasW));
+    const yPct = Math.max(0, Math.min(0.999, rect.y / canvasH));
+    return {
+        xPct,
+        yPct,
+        wPct: Math.max(0.005, Math.min(1 - xPct, rect.width / canvasW)),
+        hPct: Math.max(0.005, Math.min(1 - yPct, rect.height / canvasH)),
+    };
+}
+
 // Wrap a raw frame + optional pre-rendered highlight frame into a candidate object
 // expected by ArticleScreenshotReview and the post-review highlight application step.
 function makeCandidateWrapper(rawFrame, previewFrame, highlightRectPct) {
@@ -1255,6 +1298,37 @@ const CLICK_RIPPLE_END_SCALE = 1.6;
 const CLICK_RIPPLE_BASE_RADIUS_PX = 27;
 const CLICK_RIPPLE_STROKE_PX = 7;
 
+/**
+ * Build clip epoch ranges from video clips + recording range start.
+ * Used to map click epochMs → correct timeline time after trim/split/delete.
+ * Returns [] if not enough data (caller falls back to legacy linear mapping).
+ */
+function buildClipEpochRanges(allVideoClips, rangeStartEpochMs, sessionId = '') {
+    const safeRangeStart = Number(rangeStartEpochMs || 0);
+    if (!safeRangeStart) return [];
+    return (Array.isArray(allVideoClips) ? allVideoClips : [])
+        .filter(clip => clip?.recordingSessionId && (!sessionId || String(clip.recordingSessionId) === sessionId))
+        .map(clip => ({
+            startAt: Number(clip.startAt || 0),
+            epochStart: safeRangeStart + Number(clip.trimStart || 0) * 1000,
+            epochEnd: safeRangeStart + Number(clip.trimEnd ?? (Number(clip.trimStart || 0) + Number(clip.duration || 0))) * 1000,
+        }))
+        .filter(r => Number.isFinite(r.epochStart) && Number.isFinite(r.epochEnd) && r.epochEnd > r.epochStart);
+}
+
+/**
+ * Map a single click epochMs to timeline time using per-clip ranges.
+ * Returns null if the click falls in a deleted/trimmed segment.
+ */
+function epochMsToTimelineTime(epochMs, clipEpochRanges, fallbackRangeStart = 0, fallbackOffset = 0) {
+    if (clipEpochRanges.length > 0) {
+        const clip = clipEpochRanges.find(r => epochMs >= r.epochStart && epochMs < r.epochEnd);
+        if (!clip) return null;
+        return Number((clip.startAt + (epochMs - clip.epochStart) / 1000).toFixed(3));
+    }
+    return Number(((epochMs - fallbackRangeStart) / 1000 + fallbackOffset).toFixed(3));
+}
+
 function buildRenderableClickPoints({
     clickEvents = [],
     rangeStartEpochMs = 0,
@@ -1267,44 +1341,83 @@ function buildRenderableClickPoints({
     const safeRangeStart = Number(rangeStartEpochMs || 0);
     const safeRangeEnd = Number(rangeEndEpochMs || 0);
     const safeVideoClips = Array.isArray(allVideoClips) ? allVideoClips : [];
-    const timelineSpanMs = Math.max(
-        0,
-        Math.round(
-            safeVideoClips.reduce((maxValue, clip) => {
-                const clipEnd = Number(clip?.startAt || 0) + Number(clip?.duration || 0);
-                return Number.isFinite(clipEnd) ? Math.max(maxValue, clipEnd) : maxValue;
-            }, 0) * 1000
-        )
-    );
-    const recordedSpanMs = safeRangeEnd > safeRangeStart ? safeRangeEnd - safeRangeStart : 0;
-    const shouldPreferRecentWindow = !activeSessionId
-        && timelineSpanMs > 0
-        && recordedSpanMs > timelineSpanMs + 15000;
-    const effectiveRangeStart = shouldPreferRecentWindow
-        ? Math.max(safeRangeStart, safeRangeEnd - timelineSpanMs - 3000)
-        : safeRangeStart;
-    const recordingSessionClips = activeSessionId
-        ? safeVideoClips.filter(clip => String(clip?.recordingSessionId || '') === activeSessionId)
+
+    // Build per-clip epoch ranges using trimStart/trimEnd relative to rangeStartEpochMs.
+    // This ensures click events are mapped to the correct timeline position even after
+    // clips have been split, trimmed, or deleted from the timeline.
+    const clipEpochRanges = safeRangeStart > 0
+        ? safeVideoClips
+            .filter(clip => clip?.recordingSessionId && (!activeSessionId || String(clip.recordingSessionId) === activeSessionId))
+            .map(clip => ({
+                startAt: Number(clip.startAt || 0),
+                epochStart: safeRangeStart + Number(clip.trimStart || 0) * 1000,
+                epochEnd: safeRangeStart + Number(clip.trimEnd ?? (Number(clip.trimStart || 0) + Number(clip.duration || 0))) * 1000,
+                sessionId: String(clip.recordingSessionId || ''),
+                _dbg: { trimStart: clip.trimStart, trimEnd: clip.trimEnd, startAt: clip.startAt, recordingSessionId: clip.recordingSessionId }
+            }))
+            .filter(r => Number.isFinite(r.epochStart) && Number.isFinite(r.epochEnd) && r.epochEnd > r.epochStart)
         : [];
-    const recordingTimelineOffset = recordingSessionClips.length > 0
-        ? Math.min(...recordingSessionClips.map(clip => Number(clip?.startAt || 0)).filter(Number.isFinite))
-        : (activeSessionId && safeVideoClips.length > 0
-            ? Math.max(...safeVideoClips.map(clip => Number(clip?.startAt || 0)).filter(Number.isFinite))
-            : 0);
+
+    console.log('[clickMap] safeRangeStart:', safeRangeStart, 'activeSessionId:', activeSessionId, 'clipEpochRanges:', JSON.stringify(clipEpochRanges), 'allVideoClips count:', safeVideoClips.length);
+
+    // Fallback: legacy linear mapping for projects that lack per-clip epoch data
+    const useLegacyMapping = clipEpochRanges.length === 0;
+    let effectiveRangeStart = safeRangeStart;
+    let recordingTimelineOffset = 0;
+    if (useLegacyMapping) {
+        const timelineSpanMs = Math.max(
+            0,
+            Math.round(
+                safeVideoClips.reduce((maxValue, clip) => {
+                    const clipEnd = Number(clip?.startAt || 0) + Number(clip?.duration || 0);
+                    return Number.isFinite(clipEnd) ? Math.max(maxValue, clipEnd) : maxValue;
+                }, 0) * 1000
+            )
+        );
+        const recordedSpanMs = safeRangeEnd > safeRangeStart ? safeRangeEnd - safeRangeStart : 0;
+        const shouldPreferRecentWindow = !activeSessionId
+            && timelineSpanMs > 0
+            && recordedSpanMs > timelineSpanMs + 15000;
+        effectiveRangeStart = shouldPreferRecentWindow
+            ? Math.max(safeRangeStart, safeRangeEnd - timelineSpanMs - 3000)
+            : safeRangeStart;
+        const recordingSessionClips = activeSessionId
+            ? safeVideoClips.filter(clip => String(clip?.recordingSessionId || '') === activeSessionId)
+            : [];
+        recordingTimelineOffset = recordingSessionClips.length > 0
+            ? Math.min(...recordingSessionClips.map(clip => Number(clip?.startAt || 0)).filter(Number.isFinite))
+            : (activeSessionId && safeVideoClips.length > 0
+                ? Math.max(...safeVideoClips.map(clip => Number(clip?.startAt || 0)).filter(Number.isFinite))
+                : 0);
+    }
 
     return clickEvents
-        .filter(ev => typeof ev?.epochMs === 'number' && ev.epochMs >= effectiveRangeStart)
-        .filter(ev => !safeRangeEnd || ev.epochMs <= safeRangeEnd)
+        .filter(ev => typeof ev?.epochMs === 'number')
         .filter(ev => !activeSessionId || String(ev?.sessionId || '') === activeSessionId)
-        .map(ev => ({
-            ...ev,
-            time: Number((((ev.epochMs - effectiveRangeStart) / 1000) + recordingTimelineOffset).toFixed(3)),
-            x: Number(ev?.x),
-            y: Number(ev?.y),
-            viewportW: Number(ev?.viewportW),
-            viewportH: Number(ev?.viewportH)
-        }))
-        .filter(ev => Number.isFinite(ev.time) && ev.time >= 0 && ev.viewportW > 0 && ev.viewportH > 0)
+        .map(ev => {
+            let time;
+            if (!useLegacyMapping) {
+                // Per-clip mapping: find the clip whose recording epoch range contains this click
+                const matchingClip = clipEpochRanges.find(
+                    r => ev.epochMs >= r.epochStart && ev.epochMs < r.epochEnd
+                );
+                if (!matchingClip) return null; // click belongs to a deleted/trimmed segment
+                time = Number((matchingClip.startAt + (ev.epochMs - matchingClip.epochStart) / 1000).toFixed(3));
+            } else {
+                if (ev.epochMs < effectiveRangeStart) return null;
+                if (safeRangeEnd && ev.epochMs > safeRangeEnd) return null;
+                time = Number((((ev.epochMs - effectiveRangeStart) / 1000) + recordingTimelineOffset).toFixed(3));
+            }
+            return {
+                ...ev,
+                time,
+                x: Number(ev?.x),
+                y: Number(ev?.y),
+                viewportW: Number(ev?.viewportW),
+                viewportH: Number(ev?.viewportH)
+            };
+        })
+        .filter(ev => ev && Number.isFinite(ev.time) && ev.time >= 0 && ev.viewportW > 0 && ev.viewportH > 0)
         .sort((a, b) => a.time - b.time);
 }
 
@@ -2230,6 +2343,7 @@ export default function App() {
     useEffect(() => { isScrubbingRef.current = isScrubbing; }, [isScrubbing]);
 
     const timelineRef = useRef(null);
+    const timelineLeftPanelRef = useRef(null);
     const timelineZoomAnchorRef = useRef(null);
     const fileInputRef = useRef(null);
     const importProjectRef = useRef(null);
@@ -4220,19 +4334,23 @@ export default function App() {
             const rangeStart = Number(projectState.recordingRange?.startEpochMs || recordStartTimeRef.current || 0);
             const rangeEnd = Number(projectState.recordingRange?.endEpochMs || recordEndTimeRef.current || 0);
             const recordingSessionId = projectState.recordingSessionId || recordingSessionIdRef.current || '';
+            const uxClipEpochRanges = buildClipEpochRanges(allVideoClips, rangeStart, recordingSessionId);
             const clickEvents = (await loadGlobalClickLog())
                 .filter(ev => typeof ev?.epochMs === 'number')
                 .filter(ev => !recordingSessionId || (ev?.sessionId || '') === recordingSessionId)
-                .filter(ev => !rangeStart || ev.epochMs >= rangeStart)
-                .filter(ev => !rangeEnd || ev.epochMs <= rangeEnd)
                 .sort((a, b) => a.epochMs - b.epochMs)
-                .map((ev, index) => ({
-                    clickId: ev.id || `click_${index + 1}`,
-                    epochMs: ev.epochMs,
-                    clickTime: Number((((ev.epochMs - rangeStart) || 0) / 1000).toFixed(2)),
-                    targetText: String(ev.targetText || '').trim(),
-                    href: String(ev.href || '').trim()
-                }));
+                .map((ev, index) => {
+                    const clickTime = epochMsToTimelineTime(ev.epochMs, uxClipEpochRanges, rangeStart);
+                    if (clickTime === null || clickTime < 0) return null;
+                    return {
+                        clickId: ev.id || `click_${index + 1}`,
+                        epochMs: ev.epochMs,
+                        clickTime: Number(clickTime.toFixed(2)),
+                        targetText: String(ev.targetText || '').trim(),
+                        href: String(ev.href || '').trim()
+                    };
+                })
+                .filter(Boolean);
 
             if (clickEvents.length === 0) {
                 updateUxResearchStatus({
@@ -4893,19 +5011,23 @@ export default function App() {
             const rangeStart = Number(projectState.recordingRange?.startEpochMs || recordStartTimeRef.current || 0);
             const rangeEnd = Number(projectState.recordingRange?.endEpochMs || recordEndTimeRef.current || 0);
             const recordingSessionId = projectState.recordingSessionId || recordingSessionIdRef.current || '';
+            const uiDebugClipEpochRanges = buildClipEpochRanges(allVideoClips, rangeStart, recordingSessionId);
             const clickEvents = (await loadGlobalClickLog())
                 .filter(ev => typeof ev?.epochMs === 'number')
                 .filter(ev => !recordingSessionId || (ev?.sessionId || '') === recordingSessionId)
-                .filter(ev => !rangeStart || ev.epochMs >= rangeStart)
-                .filter(ev => !rangeEnd || ev.epochMs <= rangeEnd)
                 .sort((a, b) => a.epochMs - b.epochMs)
-                .map((ev, index) => ({
-                    clickId: ev.id || `click_${index + 1}`,
-                    epochMs: ev.epochMs,
-                    clickTime: Number((((ev.epochMs - rangeStart) || 0) / 1000).toFixed(2)),
-                    targetText: String(ev.targetText || '').trim(),
-                    href: ev.href || ''
-                }));
+                .map((ev, index) => {
+                    const clickTime = epochMsToTimelineTime(ev.epochMs, uiDebugClipEpochRanges, rangeStart);
+                    if (clickTime === null || clickTime < 0) return null;
+                    return {
+                        clickId: ev.id || `click_${index + 1}`,
+                        epochMs: ev.epochMs,
+                        clickTime: Number(clickTime.toFixed(2)),
+                        targetText: String(ev.targetText || '').trim(),
+                        href: ev.href || ''
+                    };
+                })
+                .filter(Boolean);
 
             if (clickEvents.length === 0) {
                 updateUiDebugStatus({
@@ -5935,20 +6057,25 @@ export default function App() {
                 if (!sampled) return false;
                 return redCount >= 14;
             };
+            const subtitleClipEpochRanges = buildClipEpochRanges(allVideoClips, rangeStart, activeSessionId);
             const sortedClicks = clickEvents
-                .filter(ev => typeof ev?.epochMs === 'number' && ev.epochMs >= effectiveRangeStart && ev.epochMs <= rangeEnd)
+                .filter(ev => typeof ev?.epochMs === 'number')
                 .filter(ev => !activeSessionId || (ev?.sessionId || '') === activeSessionId)
-                .map(ev => ({
-                    ...ev,
-                    clickId: ev.id || `clk_${ev.epochMs}`,
-                    time: Number((((ev.epochMs - effectiveRangeStart) / 1000) + recordingTimelineOffset).toFixed(2)),
-                    label: cleanClickLabel(ev?.targetText || ''),
-                    x: Number(ev?.x),
-                    y: Number(ev?.y),
-                    viewportW: Number(ev?.viewportW),
-                    viewportH: Number(ev?.viewportH)
-                }))
-                .filter(ev => Number.isFinite(ev.time) && ev.time >= 0)
+                .map(ev => {
+                    const time = epochMsToTimelineTime(ev.epochMs, subtitleClipEpochRanges, effectiveRangeStart, recordingTimelineOffset);
+                    if (time === null || !Number.isFinite(time) || time < 0) return null;
+                    return {
+                        ...ev,
+                        clickId: ev.id || `clk_${ev.epochMs}`,
+                        time: Number(time.toFixed(2)),
+                        label: cleanClickLabel(ev?.targetText || ''),
+                        x: Number(ev?.x),
+                        y: Number(ev?.y),
+                        viewportW: Number(ev?.viewportW),
+                        viewportH: Number(ev?.viewportH)
+                    };
+                })
+                .filter(Boolean)
                 .sort((a, b) => a.time - b.time);
             const clickPoints = [];
             for (const ev of sortedClicks) {
@@ -7821,12 +7948,19 @@ ${orderedFramesText}
                 candidateFrames: []
             };
 
-            // Compute once per bundle (same click event for all candidates in this step)
-            const highlightRectPct = computeHighlightRectPct(clickEvent);
+            // Browser-chrome height above the viewport in the recording (same value the bake uses).
+            const highlightViewportOffsetY = Number(settings.clickHighlightOffsetY) || 0;
 
             for (let candidateIndex = 0; candidateIndex < candidateFrames.length; candidateIndex++) {
                 const candidateFrame = candidateFrames[candidateIndex];
                 const highlightedCandidateFrame = await ensureArticleFrameHighlight(candidateFrame, normalizedClickId);
+                // Per-candidate so the overlay rect matches each frame's own resolution / capture mapping,
+                // and lands exactly where the highlight is finally baked.
+                const highlightRectPct = await computeHighlightRectPctForFrame(
+                    clickEvent,
+                    candidateFrame,
+                    highlightViewportOffsetY
+                );
                 const sourceFrameId = Number(candidateFrame?.sourceFrameId || candidateFrame?.frameId || 0);
                 const captureTime = Number.isFinite(Number(candidateTimes[candidateIndex]))
                     ? Number(candidateTimes[candidateIndex])
@@ -7869,7 +8003,7 @@ ${orderedFramesText}
             if (isCompositeTutorial) {
                 const doc = compositeReport?.doc && typeof compositeReport.doc === 'object' ? compositeReport.doc : {};
                 const usedFrameIds = new Set();
-                const articlePerspective = projectState.articlePerspective === 'brand' ? 'brand' : 'kol';
+                const articlePerspective = projectState.articlePerspective || 'brief';
                 const baseSegments = compositeSegments.map((segment, index) => ({
                     ...segment,
                     segment_index: Number.isFinite(Number(segment?.segment_index)) ? Number(segment.segment_index) : index + 1,
@@ -7993,10 +8127,14 @@ ${orderedFramesText}
                 const perspectiveInstruction = settings.language === 'zh-TW'
                     ? (articlePerspective === 'brand'
                         ? '請使用第一人稱品牌/團隊口吻撰寫，可使用「我們」來介紹這段錄影示範的內容與目的。'
-                        : '請使用第三人稱介紹口吻撰寫，像教學文章編輯或觀察者在描述這段錄影示範的流程與重點。')
+                        : articlePerspective === 'brief'
+                            ? '請以精簡概要方式撰寫：opening 只需一到兩句話總結這段錄影的核心內容，不需分段，不需列點，不需展開細節。'
+                            : '請使用第三人稱介紹口吻撰寫，像教學文章編輯或觀察者在描述這段錄影示範的流程與重點。')
                     : (articlePerspective === 'brand'
                         ? 'Write in first person from the brand/team perspective. You may use "we" to introduce what this recording demonstrates and why it matters.'
-                        : 'Write in third person, like an editor or observer describing what this recording demonstrates and why it matters.');
+                        : articlePerspective === 'brief'
+                            ? 'Write a brief summary only: the opening must be one to two sentences that capture the core of this recording. No sections, no bullet points, no elaboration.'
+                            : 'Write in third person, like an editor or observer describing what this recording demonstrates and why it matters.');
                 const compositeArticleInput = safeSegments.map((segment) => ({
                     index: segment.segment_index,
                     startAt: Number(segment.time_start || 0),
@@ -8222,7 +8360,7 @@ ${JSON.stringify(compositeArticleInput)}
 
             const promptLanguage = settings.language === 'zh-TW' ? 'Traditional Chinese (繁體中文)' : 'English';
             const userDesc = (projectState.tutorialDescription || '').trim();
-            const articlePerspective = projectState.articlePerspective === 'brand' ? 'brand' : 'kol';
+            const articlePerspective = projectState.articlePerspective || 'brief';
             const referenceLinks = Array.from(new Set((userDesc.match(/https?:\/\/[^\s)]+/g) || []).map(v => v.trim())));
             const briefWithoutLinks = userDesc
                 .replace(/https?:\/\/[^\s)]+/g, ' ')
@@ -8315,10 +8453,14 @@ ${JSON.stringify(compositeArticleInput)}
                 : (settings.language === 'zh-TW'
                     ? articlePerspective === 'brand'
                         ? '寫作視角：請以品牌 / 公司官方第一人稱撰寫，適度使用「我們」、「我們的產品」、「我們提供」等說法，語氣要像官方內容團隊，但避免空泛官話。'
-                        : '寫作視角：請以 KOL / 科技媒體第三人稱撰寫，語氣要像開箱評測或產品推薦文章，可以直接點出產品亮點，但不要寫成品牌官方自述。'
+                        : articlePerspective === 'brief'
+                            ? '寫作視角：精簡概要模式。whatIsIt 只需一到兩句話直接說明這個功能或流程是什麼，不需展開細節。consumerBenefits 和 setupGuide 維持正常格式，但文字也盡量精簡。'
+                            : '寫作視角：請以 KOL / 科技媒體第三人稱撰寫，語氣要像開箱評測或產品推薦文章，可以直接點出產品亮點，但不要寫成品牌官方自述。'
                     : articlePerspective === 'brand'
                         ? 'Writing perspective: write in first person from the brand/company perspective. You may use phrases like "we", "our product", and "we provide", but keep the tone concrete rather than generic marketing fluff.'
-                        : 'Writing perspective: write in third person from a KOL / tech reviewer perspective. The tone should feel like a product review or recommendation article, not a brand speaking about itself.');
+                        : articlePerspective === 'brief'
+                            ? 'Writing perspective: brief summary mode. whatIsIt must be one to two sentences that directly state what this feature or workflow is. Keep consumerBenefits and setupGuide in their normal format but keep all text concise.'
+                            : 'Writing perspective: write in third person from a KOL / tech reviewer perspective. The tone should feel like a product review or recommendation article, not a brand speaking about itself.');
 
             const systemText = isColumnTopicMode
                 ? (settings.language === 'zh-TW'
@@ -10318,7 +10460,7 @@ ${JSON.stringify(subtitlePayload)}
                                         <div className="mt-3">
                                             <label className="block text-xs text-gray-400 mb-2">寫作視角</label>
                                             <select
-                                                value={projectState.articlePerspective || 'kol'}
+                                                value={projectState.articlePerspective || 'brief'}
                                                 onChange={(e) => setProjectState(prev => ({ ...prev, articlePerspective: e.target.value }))}
                                                 className="w-full bg-gray-900 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
                                             >
@@ -11398,6 +11540,8 @@ ${JSON.stringify(subtitlePayload)}
                             時間軸軌道
                         </div>
 
+                        <div ref={timelineLeftPanelRef} className="flex-1 overflow-hidden flex flex-col">
+
                         {SUBTITLE_TRACKS.map((track, trackIndex) => (
                             <div
                                 key={track.key}
@@ -11493,6 +11637,8 @@ ${JSON.stringify(subtitlePayload)}
                                 {trackState.bgmMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
                             </button>
                         </div>
+
+                        </div>{/* end timelineLeftPanelRef wrapper */}
                     </div>
 
                     <div className="flex-1 min-w-0 relative bg-gray-900 track-bg">
@@ -11537,6 +11683,11 @@ ${JSON.stringify(subtitlePayload)}
                             ref={timelineRef}
                             onMouseDown={handleTimelineMouseDown}
                             onWheel={handleTimelineWheel}
+                            onScroll={(e) => {
+                                if (timelineLeftPanelRef.current) {
+                                    timelineLeftPanelRef.current.scrollTop = e.currentTarget.scrollTop;
+                                }
+                            }}
                         >
 
                             {selectionBox && (
@@ -11566,10 +11717,27 @@ ${JSON.stringify(subtitlePayload)}
                                     const sessionId = projectState.recordingSessionId || '';
                                     const events = Array.isArray(projectState.clickEventLog) ? projectState.clickEventLog : [];
                                     if (!rangeStart || !events.length) return null;
+                                    // Build per-clip epoch ranges so markers shift correctly after trim/split/delete
+                                    const allVideoClips = (projectState.tracks || []).flat().filter(c => c?.type === 'video');
+                                    const clipEpochRanges = allVideoClips
+                                        .filter(clip => clip?.recordingSessionId && (!sessionId || String(clip.recordingSessionId) === sessionId))
+                                        .map(clip => ({
+                                            startAt: Number(clip.startAt || 0),
+                                            epochStart: rangeStart + Number(clip.trimStart || 0) * 1000,
+                                            epochEnd: rangeStart + Number(clip.trimEnd ?? (Number(clip.trimStart || 0) + Number(clip.duration || 0))) * 1000,
+                                        }))
+                                        .filter(r => r.epochEnd > r.epochStart);
                                     return events
                                         .filter(ev => ev?.epochMs && (!sessionId || (ev.sessionId || '') === sessionId))
                                         .map((ev, i) => {
-                                            const timeS = (ev.epochMs - rangeStart) / 1000;
+                                            let timeS;
+                                            if (clipEpochRanges.length > 0) {
+                                                const clip = clipEpochRanges.find(r => ev.epochMs >= r.epochStart && ev.epochMs < r.epochEnd);
+                                                if (!clip) return null; // in a deleted/trimmed segment
+                                                timeS = clip.startAt + (ev.epochMs - clip.epochStart) / 1000;
+                                            } else {
+                                                timeS = (ev.epochMs - rangeStart) / 1000;
+                                            }
                                             if (timeS < 0 || timeS > totalDuration + 5) return null;
                                             const left = timeS * pixelsPerSecond + TIMELINE_OFFSET;
                                             const label = ev.targetText ? ev.targetText.slice(0, 24) : `${timeS.toFixed(2)}s`;
