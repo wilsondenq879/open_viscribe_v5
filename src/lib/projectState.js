@@ -22,6 +22,7 @@ export function createEmptyProjectState() {
         articlePerspective: 'kol',
         articleIncludeClickHighlight: true,
         motionDesign: { ...DEFAULT_MOTION_DESIGN },
+        automationScript: null,
         uxResearchFlowName: '',
         uxResearchGoal: '',
         uxResearchAudience: '',

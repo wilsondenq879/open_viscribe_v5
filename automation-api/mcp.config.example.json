@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "openviscribe": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/open_viscribe_v5/automation-api/mcp-server.mjs"],
+      "env": {
+        "OPEN_VISCRIBE_API_URL": "http://127.0.0.1:4318",
+        "OPEN_VISCRIBE_API_TOKEN": "replace-with-your-stable-token"
+      }
+    }
+  }
+}

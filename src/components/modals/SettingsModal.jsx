@@ -587,6 +587,44 @@ export default function SettingsModal({
                             </div>
                         </div>
                     </div>
+
+                    <div className="rounded-2xl border border-fuchsia-400/25 bg-fuchsia-500/5 p-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.2em] text-fuchsia-200 mb-3">Codex Automation API</div>
+                        <label className="flex items-center justify-between gap-4 rounded-xl border border-fuchsia-300/20 bg-gray-950/50 px-4 py-3 cursor-pointer">
+                            <div className="pr-3">
+                                <div className="text-sm font-semibold text-white">允許 Codex 工作流控制</div>
+                                <div className="mt-1 text-xs leading-5 text-gray-400">讓本機 API 排程字幕、文章、設計與輸出。錄製與匯出仍會要求你在瀏覽器內確認權限。</div>
+                            </div>
+                            <input
+                                type="checkbox"
+                                checked={!!settings.automationApiEnabled}
+                                onChange={(e) => setSettings({ ...settings, automationApiEnabled: e.target.checked })}
+                                className="h-4 w-4 shrink-0 rounded accent-fuchsia-500"
+                            />
+                        </label>
+                        <div className="mt-3">
+                            <label className="mb-1.5 block text-xs text-gray-400">Automation API URL</label>
+                            <input
+                                type="url"
+                                value={settings.automationApiUrl || 'http://127.0.0.1:4318'}
+                                onChange={(e) => setSettings({ ...settings, automationApiUrl: e.target.value })}
+                                placeholder="http://127.0.0.1:4318"
+                                className="w-full rounded-xl border border-gray-600 bg-gray-900 px-3 py-2.5 text-sm focus:border-fuchsia-400 focus:outline-none"
+                            />
+                        </div>
+                        <div className="mt-3">
+                            <label className="mb-1.5 block text-xs text-gray-400">Automation API Token</label>
+                            <input
+                                type="password"
+                                value={settings.automationApiToken || ''}
+                                onChange={(e) => setSettings({ ...settings, automationApiToken: e.target.value })}
+                                placeholder="與 OPEN_VISCRIBE_API_TOKEN 相同"
+                                autoComplete="off"
+                                className="w-full rounded-xl border border-gray-600 bg-gray-900 px-3 py-2.5 text-sm focus:border-fuchsia-400 focus:outline-none"
+                            />
+                            <p className="mt-1.5 text-[11px] leading-4 text-gray-500">僅用於連接本機 API，不會傳給 AI 服務。</p>
+                        </div>
+                    </div>
                 </div>
 
                 <div className="mt-6 border-t border-gray-700 pt-4">

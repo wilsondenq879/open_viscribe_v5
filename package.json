@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "automation:api": "node automation-api/server.mjs",
+    "automation:mcp": "node automation-api/mcp-server.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.344.0",

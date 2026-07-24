@@ -9,6 +9,7 @@ import {
 import SettingsModal from './components/modals/SettingsModal';
 import ArticleScreenshotReview from './components/ArticleScreenshotReview';
 import useAiTaskState from './hooks/useAiTaskState';
+import useAutomationBridge from './hooks/useAutomationBridge';
 import {
     AI_TASK_CANCELLED_MESSAGE,
     ARTICLE_PERSPECTIVE_OPTIONS,
@@ -1590,6 +1591,34 @@ function MediaLibraryPreview({ asset }) {
     return <div className="flex h-10 w-16 shrink-0 items-center justify-center rounded-md border border-white/10 bg-slate-900 text-gray-500"><FileVideo size={15} /></div>;
 }
 
+function buildAutomationProjectSnapshot(projectState, activeSkillId, isRecording) {
+    const tracks = Array.isArray(projectState?.tracks) ? projectState.tracks : [];
+    const duration = Math.max(0, ...tracks.flatMap(track => (track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0))), ...((projectState?.subtitles || []).map(item => Number(item?.endAt || 0))));
+    const activeSkill = getSkillById(activeSkillId);
+    const markdown = String(projectState?.[activeSkill.markdownField] || '');
+    return {
+        phase: isRecording ? 'recording' : 'ready',
+        skillId: activeSkillId,
+        title: projectState?.articleTopic || projectState?.tutorialDescription || '',
+        duration: Number(duration.toFixed(2)),
+        mediaCount: tracks.flat().length,
+        subtitleCount: Array.isArray(projectState?.subtitles) ? projectState.subtitles.length : 0,
+        capturedFrameCount: Array.isArray(projectState?.[activeSkill.frameField]) ? projectState[activeSkill.frameField].length : 0,
+        hasArticle: Boolean(markdown.trim()),
+        motionDesign: projectState?.motionDesign || DEFAULT_MOTION_DESIGN,
+        automationScript: projectState?.automationScript
+            ? {
+                id: projectState.automationScript.id,
+                title: projectState.automationScript.title,
+                status: projectState.automationScript.status,
+                completedSteps: (projectState.automationScript.steps || []).filter(step => step.status === 'completed').length,
+                stepCount: (projectState.automationScript.steps || []).length
+            }
+            : null,
+        updatedAt: new Date().toISOString()
+    };
+}
+
 export default function App() {
     const [activeSkillId, setActiveSkillId] = useState(() => {
         const saved = localStorage.getItem('openviscribe_active_skill');
@@ -1620,6 +1649,20 @@ export default function App() {
             parsed.ollamaCustomEndpoint = parsed.ollamaEndpoint || DEFAULT_SETTINGS.ollamaCustomEndpoint;
         }
         return parsed;
+    });
+    const [automationProjectId, setAutomationProjectId] = useState('');
+    const pendingAutomationApprovalRef = useRef(null);
+    const pendingAutomationRenderRef = useRef(null);
+    const {
+        bridgeState: automationBridgeState,
+        reportCommandResult: reportAutomationCommandResult,
+        reportSnapshot: reportAutomationSnapshot,
+        setCommandHandler: setAutomationCommandHandler
+    } = useAutomationBridge({
+        enabled: !!settings.automationApiEnabled,
+        baseUrl: settings.automationApiUrl,
+        token: settings.automationApiToken,
+        clientName: 'OpenViscribe Studio'
     });
     const [showSettings, setShowSettings] = useState(
         settings.aiProvider === 'azure'
@@ -2085,6 +2128,9 @@ export default function App() {
 
     const projectStateRef = useRef(projectState);
     useEffect(() => { projectStateRef.current = projectState; }, [projectState]);
+    const getAutomationSnapshot = useCallback(() => (
+        buildAutomationProjectSnapshot(projectStateRef.current, activeSkillId, isRecording)
+    ), [activeSkillId, isRecording]);
     useEffect(() => {
         if (!isRecording) return;
         const canvas = recordingPreviewCanvasRef.current;
@@ -2637,6 +2683,7 @@ export default function App() {
     const startRecording = async (options = {}) => {
         const includeAudio = !!options.includeAudio;
         const includeWebcam = !!options.includeWebcam;
+        const requireRealCapture = !!options.requireRealCapture;
         const needsPageDebugRecording = activeSkillId === 'ui-debug' || activeSkillId === 'ux-research';
         const needsClickSession = settings.clickRippleEnabled; // track clicks for any skill when ripple is enabled
         try {
@@ -2671,6 +2718,9 @@ export default function App() {
             try {
                 stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
             } catch (mediaErr) {
+                if (requireRealCapture) {
+                    throw new Error('未取得真實畫面分享權限；腳本教學不會改用模擬錄影。');
+                }
                 alert("預覽環境受限，無法真實錄影。\n已啟動「模擬錄影」模式！");
                 const canvas = document.createElement('canvas');
                 canvas.width = settings.resolution === '1080p' ? 1920 : 1280;
@@ -2905,18 +2955,42 @@ export default function App() {
 
             mediaRecorder.start(1000);
             setIsRecording(true);
+            return true;
         } catch (err) {
             recordingSessionIdRef.current = '';
             if (needsClickSession) await setGlobalClickSession('');
             if (needsPageDebugRecording) await syncPageDebugSetting(false);
             alert("啟動錄影失敗，請檢查瀏覽器權限。");
+            return false;
         }
     };
 
     const handleConfirmRecording = async () => {
+        const pendingApproval = pendingAutomationApprovalRef.current;
         setShowRecordingModal(false);
         setSettings(prev => ({ ...prev, includeAudio: recordingOptions.includeAudio }));
-        await startRecording(recordingOptions);
+        const started = await startRecording({ ...recordingOptions, requireRealCapture: !!pendingApproval?.requireRealCapture });
+        if (pendingApproval?.kind === 'capture') {
+            pendingAutomationApprovalRef.current = null;
+            await reportAutomationCommandResult(pendingApproval.commandId, {
+                status: started ? 'completed' : 'failed',
+                detail: started ? 'Browser recording was approved and started.' : 'Browser recording permission was not granted.',
+                snapshot: getAutomationSnapshot()
+            }).catch(() => {});
+        }
+    };
+
+    const handleCancelRecordingModal = () => {
+        const pendingApproval = pendingAutomationApprovalRef.current;
+        setShowRecordingModal(false);
+        if (pendingApproval?.kind === 'capture') {
+            pendingAutomationApprovalRef.current = null;
+            void reportAutomationCommandResult(pendingApproval.commandId, {
+                status: 'cancelled',
+                detail: 'Browser recording approval was cancelled by the user.',
+                snapshot: getAutomationSnapshot()
+            }).catch(() => {});
+        }
     };
 
     const stopRecording = () => {
@@ -3350,8 +3424,17 @@ export default function App() {
         setIsPlaying(false);
         setAiLoading(false);
         setAiProgress('');
+        const pendingRender = pendingAutomationRenderRef.current;
+        if (pendingRender) {
+            pendingAutomationRenderRef.current = null;
+            void reportAutomationCommandResult(pendingRender.commandId, {
+                status: 'completed',
+                detail: 'Video rendering completed and the export was handed to the selected folder or browser download.',
+                snapshot: getAutomationSnapshot()
+            }).catch(() => {});
+        }
         alert('✅ 影片即時渲染合成完畢！');
-    }, []);
+    }, [getAutomationSnapshot, reportAutomationCommandResult]);
 
     useEffect(() => {
         let lastTime = performance.now();
@@ -9696,7 +9779,7 @@ ${JSON.stringify(subtitlePayload)}
                 exportDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
                 exportDirectoryRef.current = exportDirHandle;
             } catch (err) {
-                if (err?.name === 'AbortError') return;
+                if (err?.name === 'AbortError') return false;
                 console.warn('directory picker unavailable', err);
             }
         }
@@ -9850,6 +9933,35 @@ ${JSON.stringify(subtitlePayload)}
             setTimeout(() => {
                 startRendering(exportDirHandle);
             }, 800);
+        }
+        return true;
+    };
+
+    const handleConfirmExport = async () => {
+        const pendingApproval = pendingAutomationApprovalRef.current;
+        const didStartExport = await executeExport();
+        if (pendingApproval?.kind === 'export') {
+            pendingAutomationApprovalRef.current = null;
+            const waitForRender = didStartExport !== false && exportSettings.renderVideo;
+            if (waitForRender) pendingAutomationRenderRef.current = pendingApproval;
+            await reportAutomationCommandResult(pendingApproval.commandId, {
+                status: didStartExport === false ? 'cancelled' : waitForRender ? 'running' : 'completed',
+                detail: didStartExport === false ? 'Export location selection was cancelled.' : waitForRender ? 'Export was approved; video rendering is in progress.' : 'Export was approved and selected files are being produced.',
+                snapshot: getAutomationSnapshot()
+            }).catch(() => {});
+        }
+    };
+
+    const handleCancelExportModal = () => {
+        const pendingApproval = pendingAutomationApprovalRef.current;
+        setShowExportModal(false);
+        if (pendingApproval?.kind === 'export') {
+            pendingAutomationApprovalRef.current = null;
+            void reportAutomationCommandResult(pendingApproval.commandId, {
+                status: 'cancelled',
+                detail: 'Export approval was cancelled by the user.',
+                snapshot: getAutomationSnapshot()
+            }).catch(() => {});
         }
     };
 
@@ -10070,6 +10182,132 @@ ${JSON.stringify(subtitlePayload)}
     const uiDebugRecommendationGroups = projectState.uiDebugReport?.recommendationsByModule || {};
     const uxResearchFindings = Array.isArray(projectState.uxResearchReport?.topFindings) ? projectState.uxResearchReport.topFindings : [];
     const uxResearchTopFindings = uxResearchFindings.slice(0, 3);
+    const handleAutomationCommand = useCallback(async (command) => {
+        const input = command?.input && typeof command.input === 'object' ? command.input : {};
+        const projectId = String(command?.projectId || '');
+        if (!projectId) throw new Error('Automation command does not include a project ID.');
+
+        if (command.action === 'project.initialize') {
+            const skillId = getSkillById(input.skillId || 'tutorial').id;
+            const nextProject = {
+                ...createEmptyProjectState(),
+                articleTopic: String(input.topic || input.title || '').trim(),
+                tutorialDescription: String(input.brief || '').trim()
+            };
+            resetProjectHistory();
+            setActiveSkillId(skillId);
+            setProjectState(nextProject, { recordHistory: false });
+            setSelectedIds([]);
+            setAutomationProjectId(projectId);
+            return {
+                status: 'completed',
+                detail: 'A new OpenViscribe project is ready in Studio.',
+                result: { projectId, skillId }
+            };
+        }
+
+        if (automationProjectId && automationProjectId !== projectId) {
+            throw new Error('This Studio is currently open on another automation project. Initialize or finish that project first.');
+        }
+        if (!automationProjectId) setAutomationProjectId(projectId);
+
+        if (command.action === 'capture.start') {
+            pendingAutomationApprovalRef.current = { commandId: command.id, kind: 'capture', requireRealCapture: input.requireRealCapture !== false };
+            setRecordingOptions({
+                includeAudio: input.includeAudio ?? !!settings.includeAudio,
+                includeWebcam: input.includeWebcam ?? false
+            });
+            setShowRecordingModal(true);
+            return { status: 'waiting_for_user', detail: 'Choose the recording source and confirm browser capture in OpenViscribe Studio.' };
+        }
+
+        if (command.action === 'script.prepare') {
+            const script = input.script && typeof input.script === 'object' ? input.script : null;
+            if (!script?.steps?.length) throw new Error('The automation UI script is empty.');
+            setProjectState(prev => ({ ...prev, automationScript: script }));
+            return {
+                status: 'completed',
+                detail: `UI script “${script.title || 'Untitled'}” is ready. Start a real recording, then execute its steps with Computer Use.`,
+                result: { scriptId: script.id, stepCount: script.steps.length }
+            };
+        }
+
+        if (command.action === 'capture.stop') {
+            if (!isRecording) throw new Error('There is no active recording to stop.');
+            stopRecording();
+            return { status: 'completed', detail: 'Recording stop was requested. The clip is being finalized in Studio.', result: getAutomationSnapshot() };
+        }
+
+        if (command.action === 'subtitles.generate') {
+            await generateAiSubtitles();
+            return { status: 'completed', detail: 'Subtitle generation finished.', result: getAutomationSnapshot() };
+        }
+
+        if (command.action === 'article.generate') {
+            await generateArticleFromSubtitles();
+            return { status: 'completed', detail: 'Article generation finished.', result: getAutomationSnapshot() };
+        }
+
+        if (command.action === 'voice.generate') {
+            await generateAiVoice();
+            return { status: 'completed', detail: 'Voice generation finished.', result: getAutomationSnapshot() };
+        }
+
+        if (command.action === 'design.apply') {
+            const preset = getMotionDesignPreset(input.presetId || projectStateRef.current.motionDesign?.presetId);
+            const mode = input.mode === 'manual' ? 'manual' : 'ai';
+            const nextDuration = (value, fallback) => Math.max(0.8, Math.min(10, Number(value) || fallback));
+            setProjectState(prev => ({
+                ...prev,
+                motionDesign: {
+                    ...DEFAULT_MOTION_DESIGN,
+                    ...(prev.motionDesign || {}),
+                    presetId: preset.id,
+                    enabled: mode === 'ai' ? true : prev.motionDesign?.enabled,
+                    aiAutoEnabled: mode === 'ai',
+                    includeIntro: input.includeIntro ?? prev.motionDesign?.includeIntro ?? true,
+                    includeOutro: input.includeOutro ?? prev.motionDesign?.includeOutro ?? true,
+                    includeLowerThird: input.includeLowerThird ?? prev.motionDesign?.includeLowerThird ?? true,
+                    manualIntroEnabled: mode === 'manual' ? (input.includeIntro ?? true) : prev.motionDesign?.manualIntroEnabled,
+                    manualOutroEnabled: mode === 'manual' ? (input.includeOutro ?? true) : prev.motionDesign?.manualOutroEnabled,
+                    introDuration: nextDuration(input.introDuration, prev.motionDesign?.introDuration || DEFAULT_MOTION_DESIGN.introDuration),
+                    outroDuration: nextDuration(input.outroDuration, prev.motionDesign?.outroDuration || DEFAULT_MOTION_DESIGN.outroDuration),
+                    cardDuration: nextDuration(input.cardDuration, prev.motionDesign?.cardDuration || DEFAULT_MOTION_DESIGN.cardDuration)
+                }
+            }));
+            return { status: 'completed', detail: `${preset.name} design pack was applied.`, result: { presetId: preset.id, mode } };
+        }
+
+        if (command.action === 'export.start') {
+            pendingAutomationApprovalRef.current = { commandId: command.id, kind: 'export' };
+            setExportSettings(prev => ({
+                ...prev,
+                renderVideo: input.renderVideo ?? true,
+                includeMarkdown: input.includeMarkdown ?? true,
+                includeSubtitles: input.includeSubtitles ?? true,
+                includeAudio: input.includeAudio ?? false,
+                rawMedia: input.rawMedia ?? false,
+                projectJson: input.projectJson ?? true
+            }));
+            setShowExportModal(true);
+            return { status: 'waiting_for_user', detail: 'Choose an export folder and confirm export in OpenViscribe Studio.' };
+        }
+
+        throw new Error(`Unsupported automation action: ${command.action}`);
+    }, [automationProjectId, generateAiSubtitles, generateAiVoice, generateArticleFromSubtitles, getAutomationSnapshot, isRecording, resetProjectHistory, setProjectState, settings.includeAudio, stopRecording]);
+
+    useEffect(() => {
+        setAutomationCommandHandler(handleAutomationCommand);
+        return () => setAutomationCommandHandler(null);
+    }, [handleAutomationCommand, setAutomationCommandHandler]);
+
+    useEffect(() => {
+        if (!automationProjectId || !settings.automationApiEnabled) return undefined;
+        const timer = setTimeout(() => {
+            void reportAutomationSnapshot(automationProjectId, getAutomationSnapshot()).catch(() => {});
+        }, 350);
+        return () => clearTimeout(timer);
+    }, [automationProjectId, getAutomationSnapshot, projectState, reportAutomationSnapshot, settings.automationApiEnabled]);
 
     return (
         <div className="flex flex-col h-screen bg-gray-900 text-white font-sans overflow-hidden">
@@ -10102,7 +10340,14 @@ ${JSON.stringify(subtitlePayload)}
                     <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-inner">
                         <MonitorPlay size={20} className="text-white" />
                     </div>
-                    <h1 className="text-lg font-bold tracking-wide">OpenViscribe</h1>
+                    <div>
+                        <h1 className="text-lg font-bold tracking-wide">OpenViscribe</h1>
+                        {settings.automationApiEnabled && (
+                            <div className={`text-[10px] ${automationBridgeState.phase === 'connected' ? 'text-emerald-300' : automationBridgeState.phase === 'offline' ? 'text-amber-300' : 'text-gray-400'}`}>
+                                Codex API：{automationBridgeState.phase === 'connected' ? '已連線' : automationBridgeState.phase === 'connecting' ? '連線中' : automationBridgeState.phase === 'offline' ? '離線' : '未啟用'}
+                            </div>
+                        )}
+                    </div>
                 </div>
 
                 <div className="flex items-center space-x-4">
@@ -12315,8 +12560,8 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
 
                         <div className="flex justify-end pt-2 border-t border-gray-700 space-x-3">
-                            <button onClick={() => setShowExportModal(false)} className="px-4 py-2 rounded text-sm text-gray-400 hover:text-white transition">取消</button>
-                            <button onClick={executeExport} className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded text-sm font-medium transition">確認匯出</button>
+                            <button onClick={handleCancelExportModal} className="px-4 py-2 rounded text-sm text-gray-400 hover:text-white transition">取消</button>
+                            <button onClick={handleConfirmExport} className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded text-sm font-medium transition">確認匯出</button>
                         </div>
                     </div>
                 </div>
@@ -12363,7 +12608,7 @@ ${JSON.stringify(subtitlePayload)}
 
                         <div className="mt-6 flex justify-end space-x-3">
                             <button
-                                onClick={() => setShowRecordingModal(false)}
+                                onClick={handleCancelRecordingModal}
                                 className="px-4 py-2 rounded text-sm text-gray-400 hover:text-white transition"
                             >
                                 取消

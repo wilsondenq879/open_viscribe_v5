@@ -44,6 +44,9 @@ export const DEFAULT_SETTINGS = {
     resolution: '1080p',
     aspectRatio: '16:9',
     clickRippleEnabled: true,
+    automationApiEnabled: false,
+    automationApiUrl: 'http://127.0.0.1:4318',
+    automationApiToken: '',
     // Vertical pixel offset to compensate when the screen recording includes browser
     // chrome above the viewport (address bar, tabs).  Set to ~130 if your recording
     // source is the whole browser window; leave at 0 for tab-only capture.

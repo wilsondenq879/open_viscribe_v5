@@ -179,6 +179,22 @@ npm run build
 
 若瀏覽器支援 `showDirectoryPicker`，可直接寫入指定資料夾；否則改用瀏覽器下載。
 
+## Codex + Computer Use 自動教學產線
+
+OpenViscribe 可透過本機 Automation API 接收「使用者操作腳本」。Codex 先用 Computer Use 實際操作目標網站或產品介面，OpenViscribe 同步錄製並記錄每一步；完成後再依序生成 AI 字幕、動態 Intro / Outro / Lower Third、教學文章與匯出檔案。
+
+錄影來源選擇和最終輸出資料夾仍由使用者在瀏覽器確認一次。腳本模式只接受真實畫面擷取，不會在權限失敗時自動改成模擬影片。詳細的本機 API、MCP 與腳本格式請見 [automation-api/README.md](automation-api/README.md)。
+
+## Codex 自動化 API
+
+OpenViscribe 內建可供 Codex 排程的本機 Automation API。它可以建立專案、要求開始或停止錄影、生成字幕與文章、套用動態設計並啟動匯出；瀏覽器的錄製來源與輸出資料夾仍由使用者確認。
+
+1. 使用固定 token 啟動本機 API：`OPEN_VISCRIBE_API_TOKEN="your-token" npm run automation:api`
+2. 在 OpenViscribe「設定」啟用「允許 Codex 工作流控制」。
+3. 依 [automation-api/README.md](automation-api/README.md) 將 `automation-api/mcp.config.example.json` 加入 Codex MCP 設定。
+
+API 服務不會讀取或保存你的 AI 金鑰；實際 AI 呼叫仍在已設定金鑰的瀏覽器 Studio 中進行。
+
 ## 系統架構
 
 ### 元件分工
