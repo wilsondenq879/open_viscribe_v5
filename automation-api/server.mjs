@@ -3,6 +3,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import hyperframeTemplates from '../src/data/hyperframeTemplates.json' with { type: 'json' };
+import hyperframeAssets from '../src/data/hyperframeAssets.json' with { type: 'json' };
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const projectDirectory = resolve(moduleDirectory, '..');
@@ -17,6 +19,7 @@ const supportedActions = new Set([
     'subtitles.generate',
     'article.generate',
     'voice.generate',
+    'contents.apply',
     'design.apply',
     'export.start',
     'script.prepare'
@@ -114,6 +117,8 @@ function createProject(input = {}) {
     const project = {
         id,
         name: String(input.name || input.title || 'Untitled OpenViscribe project').slice(0, 160),
+        topic: String(input.topic || input.title || '').slice(0, 500),
+        brief: String(input.brief || '').slice(0, 2000),
         skillId: String(input.skillId || 'tutorial'),
         createdAt: now(),
         updatedAt: now(),
@@ -125,6 +130,35 @@ function createProject(input = {}) {
     };
     store.projects[id] = project;
     return project;
+}
+
+function findHyperframeTemplate(templateId) {
+    return hyperframeTemplates.find(template => template.id === templateId) || null;
+}
+
+function publicHyperframeTemplate(template) {
+    if (!template) return null;
+    return {
+        id: template.id,
+        name: template.name,
+        nameZh: template.nameZh,
+        description: template.description,
+        useWhen: template.useWhen,
+        tags: template.tags,
+        catalogBlocks: template.catalogBlocks,
+        preview: template.preview,
+        defaults: template.defaults,
+        presetId: template.presetId
+    };
+}
+
+function findHyperframeAsset(assetId) {
+    return hyperframeAssets.find(asset => asset.id === assetId) || null;
+}
+
+function publicHyperframeAsset(asset) {
+    if (!asset) return null;
+    return { id: asset.id, nameZh: asset.nameZh, catalogId: asset.catalogId, assetType: asset.assetType, category: asset.category, description: asset.description, narrativeReason: asset.narrativeReason || '', duration: asset.duration, presetId: asset.presetId };
 }
 
 function queueAction(project, action, input = {}, options = {}) {
@@ -234,6 +268,7 @@ function startTutorialWorkflow(project, input = {}) {
         steps: [
             { action: 'subtitles.generate', input: {} },
             ...(includeVoice ? [{ action: 'voice.generate', input: {} }] : []),
+            ...(input.autoContents === false ? [] : [{ action: 'contents.apply', input: { brief: String(input.contentsBrief || project.brief || project.topic || project.name) } }]),
             { action: 'design.apply', input: input.design || { mode: 'ai', presetId: 'signal', includeIntro: true, includeOutro: true, includeLowerThird: true } },
             { action: 'article.generate', input: {} },
             { action: 'export.start', input: input.export || { renderVideo: true, includeMarkdown: true, includeSubtitles: true, projectJson: true } }
@@ -310,7 +345,11 @@ function openApiDocument() {
             '/v1/projects/{projectId}/actions': { post: { summary: 'Queue an action for OpenViscribe Studio' } },
             '/v1/projects/{projectId}/script': { get: { summary: 'Read a UI tutorial script' }, post: { summary: 'Prepare a UI script for Computer Use recording' } },
             '/v1/projects/{projectId}/script/steps/{stepId}': { post: { summary: 'Report a Computer Use script step result' } },
-            '/v1/projects/{projectId}/workflows/tutorial-production': { post: { summary: 'Run subtitles, design, article and export in sequence' } },
+            '/v1/projects/{projectId}/workflows/tutorial-production': { post: { summary: 'Run subtitles, narrative Contents, design, article and export in sequence' } },
+            '/v1/hyperframes/templates': { get: { summary: 'List curated HyperFrames template recipes and preview descriptions' } },
+            '/v1/hyperframes/assets': { get: { summary: 'List built-in animated HyperFrames assets such as maps, charts, console and code' } },
+            '/v1/projects/{projectId}/hyperframes-template': { post: { summary: 'Apply a curated HyperFrames template recipe in Studio' } },
+            '/v1/projects/{projectId}/hyperframes-assets': { post: { summary: 'Add a built-in animated HyperFrames asset to the Studio playhead' } },
             '/v1/jobs/{jobId}': { get: { summary: 'Get asynchronous job status' } },
             '/v1/jobs/{jobId}/cancel': { post: { summary: 'Cancel a queued job' } }
         }
@@ -376,6 +415,13 @@ async function handleApi(request, response, method, pathname) {
     if (method === 'GET' && pathname === '/v1/openapi.json') return sendJson(response, 200, openApiDocument());
     if (!isAuthorized(request)) return sendError(response, 401, 'A valid OpenViscribe API token is required.', 'unauthorized');
 
+    if (method === 'GET' && pathname === '/v1/hyperframes/templates') {
+        return sendJson(response, 200, { templates: hyperframeTemplates.map(publicHyperframeTemplate) });
+    }
+    if (method === 'GET' && pathname === '/v1/hyperframes/assets') {
+        return sendJson(response, 200, { assets: hyperframeAssets.map(publicHyperframeAsset) });
+    }
+
     if (method === 'GET' && pathname === '/v1/projects') {
         return sendJson(response, 200, { projects: Object.values(store.projects).map(publicProject) });
     }
@@ -436,6 +482,47 @@ async function handleApi(request, response, method, pathname) {
         const { workflow, job } = startTutorialWorkflow(project, body);
         await persist();
         return sendJson(response, 202, { workflow, job: publicJob(job) });
+    }
+
+    const templateMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/hyperframes-template$/);
+    if (method === 'POST' && templateMatch) {
+        const project = getProject(templateMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        const body = await readJson(request);
+        const template = findHyperframeTemplate(String(body.templateId || ''));
+        if (!template) return sendError(response, 400, 'Unknown HyperFrames template ID.', 'unknown_hyperframe_template');
+        const mode = body.mode === 'manual' ? 'manual' : 'ai';
+        const job = queueAction(project, 'design.apply', {
+            ...template.defaults,
+            presetId: template.presetId,
+            templateId: template.id,
+            mode,
+            includeIntro: body.includeIntro ?? template.defaults.includeIntro,
+            includeOutro: body.includeOutro ?? template.defaults.includeOutro,
+            includeLowerThird: body.includeLowerThird ?? template.defaults.includeLowerThird,
+            introDuration: body.introDuration ?? template.defaults.introDuration,
+            outroDuration: body.outroDuration ?? template.defaults.outroDuration,
+            cardDuration: body.cardDuration ?? template.defaults.cardDuration
+        });
+        await persist();
+        return sendJson(response, 202, { template: publicHyperframeTemplate(template), job: publicJob(job) });
+    }
+
+    const assetMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/hyperframes-assets$/);
+    if (method === 'POST' && assetMatch) {
+        const project = getProject(assetMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        const body = await readJson(request);
+        const asset = findHyperframeAsset(String(body.assetId || ''));
+        if (!asset) return sendError(response, 400, 'Unknown HyperFrames asset ID.', 'unknown_hyperframe_asset');
+        const job = queueAction(project, 'design.apply', {
+            assetId: asset.id,
+            presetId: body.presetId || asset.presetId,
+            startAt: Number.isFinite(Number(body.startAt)) ? Number(body.startAt) : undefined,
+            duration: Number.isFinite(Number(body.duration)) ? Number(body.duration) : asset.duration
+        });
+        await persist();
+        return sendJson(response, 202, { asset: publicHyperframeAsset(asset), job: publicJob(job) });
     }
 
     const projectMatch = pathname.match(/^\/v1\/projects\/([^/]+)$/);

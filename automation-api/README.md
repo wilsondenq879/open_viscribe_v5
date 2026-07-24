@@ -37,6 +37,15 @@ The MCP provides these tools:
 - Apply AI or manual motion design.
 - Start export and inspect asynchronous jobs.
 - Store an interaction script, use Computer Use to execute and verify each step, then run the whole production sequence.
+- List and apply curated **Contents** recipes, so an agent can turn a natural-language style request into an inspectable motion template before it edits the video.
+
+## Contents natural-language templates
+
+Use `openviscribe_list_hyperframe_templates` before choosing a visual treatment. It returns a compact, agent-readable catalog with a plain-language visual preview, best use case, the source HyperFrames Catalog block IDs, and the OpenViscribe-native Intro / Outro / Lower Third treatment that will actually render. In the Studio this area is called **Contents**, so people choose by narrative purpose rather than by implementation name.
+
+For example, an agent can answer “I want a calm B2B product tutorial” with **產品清晰教學**, explain its `lt-clean-bar` and `caption-editorial-emphasis` recipe, then apply it through `openviscribe_apply_hyperframe_template`. The same dynamic previews are available in Studio’s **素材庫 → Contents** tab for manual selection.
+
+For individual visual moments, call `openviscribe_list_hyperframe_assets` and `openviscribe_add_hyperframe_asset`. Or call `openviscribe_auto_add_contents` with a natural-language brief: it adds at most two justified layers and deliberately adds nothing when the video does not need an extra visual. The built-in collection currently includes 15 editable animations: world map, global flow, data chart, flowchart, terminal, code diff, code typing, app showcase, device reveal, liquid glass, social follow, news ticker, caption highlight, neon code, and release roadmap.
 
 ## Computer Use tutorial run
 
@@ -47,7 +56,7 @@ Give Codex a UI script as plain steps or structured `{ instruction, expected }` 
 3. `openviscribe_start_recording` with `requireRealCapture: true`, then approve the one Chromium sharing dialog.
 4. Codex uses **Computer Use** to open the script's `startUrl`, complete one visible step at a time, and calls `openviscribe_report_ui_step` with concise evidence after each verified result.
 5. `openviscribe_stop_recording`
-6. `openviscribe_start_tutorial_production` to chain subtitles → optional voice → intro/outro/lower third design → Markdown article → export.
+6. `openviscribe_start_tutorial_production` to chain subtitles → optional voice → automatic narrative Contents selection → intro/outro/lower third design → Markdown article with screenshots → export.
 
 The script run intentionally fails if screen sharing is unavailable; it never replaces the tutorial with a simulated recording. The final export folder still needs your browser confirmation.
 
@@ -71,6 +80,10 @@ POST /v1/projects/{projectId}/script
 GET  /v1/projects/{projectId}/script
 POST /v1/projects/{projectId}/script/steps/{stepId}
 POST /v1/projects/{projectId}/workflows/tutorial-production
+GET  /v1/hyperframes/templates
+GET  /v1/hyperframes/assets
+POST /v1/projects/{projectId}/hyperframes-template
+POST /v1/projects/{projectId}/hyperframes-assets
 GET  /v1/projects/{projectId}
 GET  /v1/jobs/{jobId}
 POST /v1/jobs/{jobId}/cancel

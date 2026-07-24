@@ -1,4 +1,6 @@
 import { DEFAULT_MOTION_DESIGN, MOTION_DESIGN_PRESETS } from '../constants/appConstants';
+import { getHyperframeTemplate } from './hyperframeTemplates';
+import { getHyperframeAsset } from './hyperframeAssets';
 
 const clamp = (value, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 const easeOutCubic = (value) => 1 - Math.pow(1 - clamp(value), 3);
@@ -8,12 +10,14 @@ export function getMotionDesignSettings(value) {
     const presetId = MOTION_DESIGN_PRESETS.some(item => item.id === raw.presetId)
         ? raw.presetId
         : DEFAULT_MOTION_DESIGN.presetId;
+    const template = getHyperframeTemplate(raw.hyperframeTemplateId || DEFAULT_MOTION_DESIGN.hyperframeTemplateId);
     return {
         ...DEFAULT_MOTION_DESIGN,
         ...raw,
         enabled: Boolean(raw.enabled),
         aiAutoEnabled: raw.aiAutoEnabled === undefined ? Boolean(raw.enabled) : Boolean(raw.aiAutoEnabled),
         presetId,
+        hyperframeTemplateId: template.id,
         includeIntro: raw.includeIntro !== false,
         includeOutro: raw.includeOutro !== false,
         includeLowerThird: raw.includeLowerThird !== false,
@@ -32,8 +36,10 @@ export function getMotionDesignSettings(value) {
                     text: String(card?.text || '').trim().slice(0, 92),
                     creator: String(card?.creator || '').trim().slice(0, 44),
                     presetId: MOTION_DESIGN_PRESETS.some(item => item.id === card?.presetId) ? card.presetId : presetId,
+                    assetId: getHyperframeAsset(card?.assetId)?.id || '',
                     startAt: Math.max(0, Number(card?.startAt) || 0),
-                    endAt: Math.max(0, Number(card?.endAt) || 0)
+                    endAt: Math.max(0, Number(card?.endAt) || 0),
+                    source: card?.source === 'auto-contents' ? 'auto-contents' : 'manual'
                 }))
                 .filter(card => card.text && card.endAt > card.startAt)
             : []
@@ -68,11 +74,11 @@ export function getMotionDesignLayers({ design, time, duration, subtitles = [] }
 
     if (outroEnabled && safeTime >= Math.max(0, duration - outroDuration)) {
         const startAt = Math.max(0, duration - outroDuration);
-        layers.push({ kind: 'outro', progress: clamp((safeTime - startAt) / outroDuration), presetId: settings.presetId });
+        layers.push({ kind: 'outro', progress: clamp((safeTime - startAt) / outroDuration), presetId: settings.presetId, templateId: settings.hyperframeTemplateId });
         return layers;
     }
     if (introEnabled && safeTime <= introDuration) {
-        layers.push({ kind: 'intro', progress: clamp(safeTime / introDuration), presetId: settings.presetId });
+        layers.push({ kind: 'intro', progress: clamp(safeTime / introDuration), presetId: settings.presetId, templateId: settings.hyperframeTemplateId });
     }
     if (autoEnabled && settings.includeLowerThird && (!introEnabled || safeTime > introDuration)) {
         const activeSubtitle = subtitles
@@ -88,7 +94,8 @@ export function getMotionDesignLayers({ design, time, duration, subtitles = [] }
                 progress: clamp(elapsed / 0.38),
                 exitProgress,
                 text: String(activeSubtitle.text || '').trim().slice(0, 92),
-                presetId: settings.presetId
+                presetId: settings.presetId,
+                templateId: settings.hyperframeTemplateId
             });
         }
     }
@@ -98,13 +105,15 @@ export function getMotionDesignLayers({ design, time, duration, subtitles = [] }
             const duration = Math.max(0.2, card.endAt - card.startAt);
             const elapsed = safeTime - card.startAt;
             layers.push({
-                kind: 'lower-third',
+                kind: card.assetId ? 'hyperframe-asset' : 'lower-third',
                 id: card.id,
                 progress: clamp(elapsed / 0.38),
                 exitProgress: duration > 0.5 ? clamp((elapsed - (duration - 0.35)) / 0.35) : 0,
                 text: card.text,
                 creator: card.creator,
                 presetId: card.presetId,
+                templateId: settings.hyperframeTemplateId,
+                assetId: card.assetId,
                 manual: true
             });
         });
@@ -172,7 +181,7 @@ function drawAtmosphere(ctx, canvas, preset, intensity = 1) {
     }
 }
 
-function drawIntro(ctx, canvas, layer, preset, copy) {
+function drawIntro(ctx, canvas, layer, preset, copy, template) {
     const { width, height } = canvas;
     const entrance = easeOutCubic(clamp(layer.progress / 0.42));
     const holdExit = layer.progress > 0.84 ? clamp((layer.progress - 0.84) / 0.16) : 0;
@@ -181,27 +190,26 @@ function drawIntro(ctx, canvas, layer, preset, copy) {
     drawAtmosphere(ctx, canvas, preset, entrance);
 
     const contentX = width * 0.105;
-    const contentY = height * 0.36 + (1 - entrance) * 54;
+    const eyebrowY = height * 0.29 + (1 - entrance) * 38;
+    const titleY = eyebrowY + width * 0.07;
     ctx.globalAlpha = Math.min(1, entrance * 1.35) * (1 - holdExit);
+    ctx.fillStyle = template.introStyle === 'pulse-title' ? preset.accentAlt : preset.accent;
+    ctx.fillRect(contentX, eyebrowY - 28, width * 0.075 * entrance, 7);
+    ctx.font = `700 ${Math.round(width * 0.014)}px "Arial", "Noto Sans TC", sans-serif`;
     ctx.fillStyle = preset.accent;
-    ctx.fillRect(contentX, contentY - 83, width * 0.09 * entrance, 9);
-    ctx.font = `700 ${Math.round(width * 0.018)}px "Arial", sans-serif`;
-    ctx.letterSpacing = '0.16em';
-    ctx.fillStyle = preset.accent;
-    ctx.fillText('OPEN VISCRIBE / AI EDITED', contentX, contentY - 42);
-    ctx.letterSpacing = '0px';
+    ctx.fillText(template.introStyle === 'editorial-emphasis' ? 'OPEN VISCRIBE  /  YOUTUBE WORKFLOW' : 'OPEN VISCRIBE  /  AI EDITED', contentX, eyebrowY);
 
-    ctx.font = `800 ${Math.round(width * 0.068)}px "Arial", "Noto Sans TC", sans-serif`;
+    ctx.font = `800 ${Math.round(width * 0.058)}px "Arial", "Noto Sans TC", sans-serif`;
     ctx.fillStyle = preset.foreground;
-    drawWrappedText(ctx, copy.title, contentX, contentY + 28, width * 0.72, width * 0.076, 2);
+    const titleLines = drawWrappedText(ctx, copy.title, contentX, titleY, width * 0.76, width * 0.07, 2);
 
-    ctx.font = `500 ${Math.round(width * 0.023)}px "Arial", "Noto Sans TC", sans-serif`;
+    ctx.font = `600 ${Math.round(width * 0.016)}px "Arial", "Noto Sans TC", sans-serif`;
     ctx.fillStyle = preset.muted;
-    ctx.fillText(copy.creator.toUpperCase(), contentX, height * 0.81);
+    ctx.fillText(copy.creator.toUpperCase(), contentX, titleY + titleLines * width * 0.07 + height * 0.065);
     ctx.restore();
 }
 
-function drawOutro(ctx, canvas, layer, preset, copy) {
+function drawOutro(ctx, canvas, layer, preset, copy, template) {
     const { width, height } = canvas;
     const entrance = easeOutCubic(clamp(layer.progress / 0.36));
     ctx.save();
@@ -213,7 +221,7 @@ function drawOutro(ctx, canvas, layer, preset, copy) {
     const panelX = (width - panelW) / 2;
     const panelY = height * 0.29 + (1 - entrance) * 48;
     ctx.globalAlpha = entrance;
-    ctx.fillStyle = `${preset.surface}eb`;
+    ctx.fillStyle = template.outroStyle === 'creator-cta' ? `${preset.background}f4` : `${preset.surface}eb`;
     roundedRect(ctx, panelX, panelY, panelW, panelH, 36);
     ctx.fill();
     ctx.strokeStyle = `${preset.accent}cc`;
@@ -223,7 +231,7 @@ function drawOutro(ctx, canvas, layer, preset, copy) {
     ctx.textAlign = 'center';
     ctx.font = `700 ${Math.round(width * 0.023)}px Arial, sans-serif`;
     ctx.fillStyle = preset.accent;
-    ctx.fillText('THANKS FOR WATCHING', width / 2, panelY + panelH * 0.27);
+    ctx.fillText(template.outroStyle === 'creator-cta' ? 'FOLLOW FOR THE NEXT STEP' : 'THANKS FOR WATCHING', width / 2, panelY + panelH * 0.27);
     ctx.font = `800 ${Math.round(width * 0.043)}px "Arial", "Noto Sans TC", sans-serif`;
     ctx.fillStyle = preset.foreground;
     ctx.fillText(copy.creator, width / 2, panelY + panelH * 0.52);
@@ -234,29 +242,181 @@ function drawOutro(ctx, canvas, layer, preset, copy) {
     ctx.restore();
 }
 
-function drawLowerThird(ctx, canvas, layer, preset, copy) {
+function drawLowerThird(ctx, canvas, layer, preset, copy, template) {
     const { width, height } = canvas;
     const entered = easeOutCubic(layer.progress);
     const x = width * 0.065 + (1 - entered + layer.exitProgress) * width * 0.22;
-    const y = height * 0.735;
-    const cardW = width * 0.53;
+    const y = template.lowerThirdStyle === 'soft-pill' ? height * 0.76 : height * 0.735;
+    const cardW = template.lowerThirdStyle === 'soft-pill' ? width * 0.46 : width * 0.53;
     const cardH = height * 0.15;
     ctx.save();
     ctx.globalAlpha = entered * (1 - layer.exitProgress);
-    ctx.fillStyle = `${preset.surface}ee`;
-    roundedRect(ctx, x, y, cardW, cardH, 22);
+    if (template.lowerThirdStyle === 'accent-underline') {
+        const textX = x + 4;
+        const nameY = y + height * 0.052;
+        ctx.font = `800 ${Math.round(width * 0.027)}px "Arial", "Noto Sans TC", sans-serif`;
+        const ruleW = Math.min(width * 0.34, Math.max(width * 0.16, ctx.measureText(layer.text).width));
+        ctx.fillStyle = preset.foreground;
+        drawWrappedText(ctx, layer.text, textX, nameY, width * 0.58, width * 0.033, 2);
+        ctx.fillStyle = preset.accent;
+        ctx.fillRect(textX, nameY + height * 0.026, ruleW * entered, 6);
+        ctx.font = `600 ${Math.round(width * 0.014)}px "Arial", "Noto Sans TC", sans-serif`;
+        ctx.fillStyle = preset.muted;
+        ctx.fillText(`${copy.creator.toUpperCase()}  ·  STEP`, textX, nameY + height * 0.062);
+        ctx.restore();
+        return;
+    }
+    ctx.fillStyle = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta' ? preset.accent : `${preset.surface}ee`;
+    roundedRect(ctx, x, y, cardW, cardH, template.lowerThirdStyle === 'soft-pill' ? cardH / 2 : 22);
     ctx.fill();
-    ctx.fillStyle = preset.accent;
-    roundedRect(ctx, x, y, 12, cardH, 8);
+    if (template.lowerThirdStyle === 'code-window') {
+        ctx.fillStyle = `${preset.foreground}20`;
+        roundedRect(ctx, x + 14, y + 14, cardW - 28, cardH - 28, 12);
+        ctx.fill();
+        [0, 1, 2].forEach(index => {
+            ctx.fillStyle = [preset.accent, preset.accentAlt, preset.foreground][index];
+            ctx.beginPath(); ctx.arc(x + 34 + index * 17, y + 34, 5, 0, Math.PI * 2); ctx.fill();
+        });
+    } else {
+        ctx.fillStyle = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta' ? preset.background : preset.accent;
+        roundedRect(ctx, x, y, 12, cardH, 8);
+        ctx.fill();
+        ctx.fillStyle = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta' ? preset.background : preset.accentAlt;
+        ctx.fillRect(x + 34, y + 30, width * 0.055, 5);
+    }
+    ctx.font = `700 ${Math.round(width * 0.018)}px Arial, sans-serif`;
+    ctx.fillStyle = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta' ? preset.background : preset.accent;
+    ctx.fillText(template.lowerThirdStyle === 'creator-cta' ? 'OPEN VISCRIBE / FOLLOW' : copy.creator.toUpperCase(), x + 34, y + 65);
+    ctx.font = `700 ${Math.round(width * 0.026)}px "Arial", "Noto Sans TC", sans-serif`;
+    ctx.fillStyle = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta' ? preset.background : preset.foreground;
+    drawWrappedText(ctx, layer.text, x + 34, y + 109, cardW - 72, width * 0.031, 2);
+    ctx.restore();
+}
+
+function drawAssetPanel(ctx, x, y, width, height, preset, entered) {
+    ctx.globalAlpha = entered;
+    ctx.fillStyle = `${preset.background}f2`;
+    roundedRect(ctx, x, y, width, height, 30);
     ctx.fill();
-    ctx.fillStyle = preset.accentAlt;
-    ctx.fillRect(x + 34, y + 30, width * 0.055, 5);
+    ctx.strokeStyle = `${preset.accent}b8`;
+    ctx.lineWidth = 3;
+    roundedRect(ctx, x, y, width, height, 30);
+    ctx.stroke();
+}
+
+function drawCodeRows(ctx, x, y, width, count, preset, progress, mode = 'normal') {
+    for (let index = 0; index < count; index += 1) {
+        const ratio = [0.72, 0.48, 0.82, 0.59, 0.68][index % 5];
+        const rowProgress = clamp((progress * count - index) * 1.8);
+        ctx.fillStyle = index % 3 === 0 ? preset.accent : index % 3 === 1 ? preset.accentAlt : preset.foreground;
+        ctx.globalAlpha = 0.22 + rowProgress * 0.68;
+        ctx.fillRect(x, y + index * 26, width * ratio * rowProgress, mode === 'neon' ? 8 : 10);
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawHyperframeAsset(ctx, canvas, layer, preset) {
+    const asset = getHyperframeAsset(layer.assetId);
+    if (!asset) return;
+    const { width, height } = canvas;
+    const entered = easeOutCubic(layer.progress) * (1 - layer.exitProgress);
+    const x = width * 0.12;
+    const y = height * 0.15 + (1 - entered) * 42;
+    const panelW = width * 0.76;
+    const panelH = height * 0.66;
+    ctx.save();
+    drawAssetPanel(ctx, x, y, panelW, panelH, preset, entered);
+    ctx.globalAlpha = entered;
     ctx.font = `700 ${Math.round(width * 0.018)}px Arial, sans-serif`;
     ctx.fillStyle = preset.accent;
-    ctx.fillText(copy.creator.toUpperCase(), x + 34, y + 65);
-    ctx.font = `700 ${Math.round(width * 0.026)}px "Arial", "Noto Sans TC", sans-serif`;
-    ctx.fillStyle = preset.foreground;
-    drawWrappedText(ctx, layer.text, x + 34, y + 109, cardW - 72, width * 0.031, 2);
+    ctx.fillText(asset.nameZh.toUpperCase(), x + 44, y + 52);
+    const contentX = x + 46;
+    const contentY = y + 88;
+    const contentW = panelW - 92;
+
+    if (asset.assetType === 'world-map' || asset.assetType === 'world-flow') {
+        ctx.font = `600 ${Math.round(width * 0.013)}px Arial, sans-serif`;
+        ctx.fillStyle = preset.muted;
+        ctx.fillText('GLOBAL SERVICE COVERAGE', contentX, contentY + 2);
+        const mapTop = contentY + 32;
+        const mapHeight = panelH * 0.52;
+        ctx.strokeStyle = `${preset.foreground}24`; ctx.lineWidth = 1.5;
+        [0.2, 0.42, 0.64].forEach(row => { ctx.beginPath(); ctx.moveTo(contentX, mapTop + mapHeight * row); ctx.lineTo(contentX + contentW, mapTop + mapHeight * row); ctx.stroke(); });
+        [0.18, 0.42, 0.66, 0.86].forEach(column => { ctx.beginPath(); ctx.moveTo(contentX + contentW * column, mapTop); ctx.lineTo(contentX + contentW * column, mapTop + mapHeight); ctx.stroke(); });
+        const continents = [
+            [[0.04, 0.12], [0.17, 0.04], [0.29, 0.13], [0.25, 0.26], [0.18, 0.34], [0.08, 0.28]],
+            [[0.29, 0.34], [0.38, 0.31], [0.43, 0.46], [0.39, 0.71], [0.32, 0.64]],
+            [[0.48, 0.16], [0.64, 0.07], [0.82, 0.17], [0.91, 0.33], [0.76, 0.39], [0.61, 0.31]],
+            [[0.69, 0.46], [0.8, 0.51], [0.86, 0.73], [0.78, 0.82], [0.71, 0.66]]
+        ];
+        continents.forEach(points => { ctx.beginPath(); points.forEach(([px, py], index) => { const cx = contentX + contentW * px; const cy = mapTop + mapHeight * py; index ? ctx.lineTo(cx, cy) : ctx.moveTo(cx, cy); }); ctx.closePath(); ctx.fillStyle = `${preset.foreground}24`; ctx.fill(); ctx.strokeStyle = `${preset.foreground}56`; ctx.stroke(); });
+        const nodes = [[0.16, 0.44], [0.34, 0.31], [0.56, 0.48], [0.76, 0.28], [0.88, 0.52]];
+        nodes.forEach(([nx, ny], index) => { const cx = contentX + contentW * nx; const cy = mapTop + mapHeight * ny; ctx.fillStyle = index % 2 ? preset.accentAlt : preset.accent; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 0.25 + 0.25 * Math.sin((layer.progress + index) * Math.PI * 3); ctx.beginPath(); ctx.arc(cx, cy, 20, 0, Math.PI * 2); ctx.strokeStyle = ctx.fillStyle; ctx.stroke(); ctx.globalAlpha = entered; });
+        ctx.strokeStyle = preset.accent; ctx.lineWidth = 4;
+        for (let i = 0; i < nodes.length - 1; i += 1) { const [ax, ay] = nodes[i]; const [bx, by] = nodes[i + 1]; ctx.beginPath(); ctx.moveTo(contentX + contentW * ax, mapTop + mapHeight * ay); ctx.quadraticCurveTo(contentX + contentW * ((ax + bx) / 2), mapTop + mapHeight * (Math.min(ay, by) - 0.22), contentX + contentW * bx, mapTop + mapHeight * by); ctx.stroke(); }
+        ctx.font = `600 ${Math.round(width * 0.012)}px Arial, sans-serif`;
+        ctx.fillStyle = preset.muted;
+        [['US', 0.14, 0.64], ['EU', 0.54, 0.68], ['APAC', 0.78, 0.58]].forEach(([label, px, py]) => ctx.fillText(label, contentX + contentW * px, mapTop + mapHeight * py));
+    } else if (asset.assetType === 'data-chart') {
+        const bars = [0.38, 0.61, 0.49, 0.79, 0.92];
+        bars.forEach((bar, index) => { const bw = contentW / 10; const bh = panelH * 0.42 * bar * entered; const bx = contentX + index * (contentW / 6); const by = contentY + panelH * 0.45 - bh; ctx.fillStyle = index === bars.length - 1 ? preset.accent : `${preset.accentAlt}aa`; roundedRect(ctx, bx, by, bw, bh, 8); ctx.fill(); });
+        ctx.strokeStyle = preset.foreground; ctx.lineWidth = 3; ctx.beginPath(); bars.forEach((bar, index) => { const px = contentX + index * (contentW / 6) + contentW / 20; const py = contentY + panelH * (0.5 - bar * 0.32); index ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }); ctx.stroke();
+    } else if (asset.assetType === 'flowchart' || asset.assetType === 'release-roadmap') {
+        const labels = asset.assetType === 'release-roadmap' ? ['v1.0', 'v1.5', 'v2.0'] : ['輸入', '處理', '完成'];
+        labels.forEach((label, index) => { const bx = contentX + index * (contentW / 3.4); const by = contentY + panelH * 0.25; ctx.fillStyle = `${preset.surface}ee`; roundedRect(ctx, bx, by, contentW * 0.22, panelH * 0.2, 16); ctx.fill(); ctx.strokeStyle = index === 2 ? preset.accent : `${preset.foreground}66`; ctx.stroke(); ctx.fillStyle = preset.foreground; ctx.font = `700 ${Math.round(width * 0.024)}px Arial`; ctx.fillText(label, bx + 24, by + panelH * 0.12); if (index < 2) { ctx.strokeStyle = preset.accent; ctx.beginPath(); ctx.moveTo(bx + contentW * 0.23, by + panelH * 0.1); ctx.lineTo(bx + contentW * 0.29, by + panelH * 0.1); ctx.stroke(); } });
+    } else if (asset.assetType === 'code-diff') {
+        const columnGap = contentW * 0.035;
+        const columnW = (contentW - columnGap) / 2;
+        const columnY = contentY + 10;
+        const columnH = panelH * 0.52;
+        [['− before', '#fb7185', ['region: "legacy"', 'retry: false', 'status: "pending"']], ['+ after', '#86efac', ['region: "apac"', 'retry: true', 'status: "ready"']]].forEach(([label, color, lines], columnIndex) => {
+            const columnX = contentX + columnIndex * (columnW + columnGap);
+            ctx.fillStyle = '#0a0d12'; roundedRect(ctx, columnX, columnY, columnW, columnH, 16); ctx.fill();
+            ctx.fillStyle = `${color}24`; roundedRect(ctx, columnX, columnY, columnW, 44, 16); ctx.fill(); ctx.fillRect(columnX, columnY + 24, columnW, 20);
+            ctx.fillStyle = color; ctx.font = `700 ${Math.round(width * 0.014)}px "SF Mono", Menlo, monospace`; ctx.fillText(label, columnX + 22, columnY + 28);
+            lines.forEach((line, lineIndex) => {
+                const lineProgress = clamp((entered * lines.length * 1.25) - lineIndex);
+                ctx.globalAlpha = 0.22 + lineProgress * 0.78;
+                ctx.fillStyle = lineIndex === 0 ? color : '#c7d2df';
+                ctx.font = `500 ${Math.round(width * 0.015)}px "SF Mono", Menlo, monospace`;
+                ctx.fillText(line, columnX + 24, columnY + 84 + lineIndex * 42);
+            });
+        });
+        ctx.globalAlpha = entered;
+    } else if (asset.assetType === 'console' || asset.assetType === 'code-typing' || asset.assetType === 'neon-code') {
+        const terminalH = panelH * 0.55;
+        ctx.fillStyle = '#07090d'; roundedRect(ctx, contentX, contentY, contentW, terminalH, 16); ctx.fill();
+        ctx.fillStyle = '#1b1e24'; roundedRect(ctx, contentX, contentY, contentW, 46, 16); ctx.fill(); ctx.fillRect(contentX, contentY + 25, contentW, 21);
+        [['#ff5f57', 0], ['#febc2e', 1], ['#28c840', 2]].forEach(([color, index]) => { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(contentX + 24 + index * 19, contentY + 23, 6, 0, Math.PI * 2); ctx.fill(); });
+        ctx.font = `500 ${Math.round(width * 0.012)}px "SF Mono", Menlo, monospace`; ctx.fillStyle = '#a5abb4'; ctx.textAlign = 'center'; ctx.fillText('openviscribe — deployment', contentX + contentW / 2, contentY + 28); ctx.textAlign = 'start';
+        const terminalLines = ['user@studio % openviscribe capture --source=tab', '✓ youtube.com loaded', '✓ search workflow recorded', '✓ tutorial result verified', 'status: ready to export'];
+        terminalLines.forEach((line, index) => {
+            const lineProgress = clamp((entered * terminalLines.length * 1.35) - index);
+            ctx.globalAlpha = 0.18 + lineProgress * 0.82;
+            ctx.font = `500 ${Math.round(width * 0.014)}px "SF Mono", Menlo, monospace`;
+            ctx.fillStyle = index === 0 ? '#e5e7eb' : index === terminalLines.length - 1 ? '#88ff67' : '#a5abb4';
+            ctx.fillText(line, contentX + 30, contentY + 84 + index * 34);
+        });
+        ctx.globalAlpha = entered;
+        if (asset.assetType === 'code-typing' || asset.assetType === 'console') { ctx.fillStyle = '#88ff67'; ctx.fillRect(contentX + Math.min(contentW * 0.84, 30 + entered * contentW * 0.54), contentY + 68, 4, 20); }
+    } else if (asset.assetType === 'app-showcase' || asset.assetType === 'device-reveal' || asset.assetType === 'liquid-glass') {
+        const deviceW = asset.assetType === 'device-reveal' ? contentW * 0.3 : contentW * 0.64;
+        const deviceX = contentX + (contentW - deviceW) / 2;
+        ctx.fillStyle = asset.assetType === 'liquid-glass' ? `${preset.foreground}22` : `${preset.surface}f2`;
+        roundedRect(ctx, deviceX, contentY + 12, deviceW, panelH * 0.47, asset.assetType === 'device-reveal' ? 42 : 20); ctx.fill();
+        ctx.strokeStyle = preset.accent; ctx.lineWidth = 3; roundedRect(ctx, deviceX, contentY + 12, deviceW, panelH * 0.47, asset.assetType === 'device-reveal' ? 42 : 20); ctx.stroke();
+        ctx.fillStyle = `${preset.accentAlt}99`; roundedRect(ctx, deviceX + deviceW * 0.12, contentY + 70, deviceW * 0.76, 34, 12); ctx.fill();
+        ctx.fillStyle = preset.foreground; ctx.fillRect(deviceX + deviceW * 0.12, contentY + 126, deviceW * 0.48, 13); ctx.fillRect(deviceX + deviceW * 0.12, contentY + 154, deviceW * 0.65, 13);
+    } else if (asset.assetType === 'social-follow') {
+        ctx.fillStyle = `${preset.surface}f5`; roundedRect(ctx, contentX + contentW * 0.12, contentY + 35, contentW * 0.76, panelH * 0.32, 22); ctx.fill();
+        ctx.fillStyle = preset.accentAlt; ctx.beginPath(); ctx.arc(contentX + contentW * 0.22, contentY + 112, 34, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = preset.foreground; ctx.font = `700 ${Math.round(width * 0.031)}px Arial`; ctx.fillText('OPEN VISCRIBE', contentX + contentW * 0.3, contentY + 105);
+        ctx.fillStyle = preset.accent; roundedRect(ctx, contentX + contentW * 0.3, contentY + 128, contentW * 0.25, 42, 14); ctx.fill(); ctx.fillStyle = preset.background; ctx.font = `700 ${Math.round(width * 0.018)}px Arial`; ctx.fillText('FOLLOW', contentX + contentW * 0.36, contentY + 156);
+    } else if (asset.assetType === 'news-ticker') {
+        ctx.fillStyle = preset.accent; ctx.fillRect(contentX, contentY + panelH * 0.3, contentW, 76); ctx.fillStyle = preset.background; ctx.font = `800 ${Math.round(width * 0.032)}px Arial`; ctx.fillText('BREAKING  •  重要教學步驟與更新資訊', contentX + 32 - (1 - entered) * 180, contentY + panelH * 0.3 + 49);
+    } else if (asset.assetType === 'caption-highlight') {
+        ctx.textAlign = 'center'; ctx.font = `800 ${Math.round(width * 0.048)}px "Noto Sans TC", Arial`; ctx.fillStyle = preset.foreground; ctx.fillText('把設定流程', width / 2, contentY + 125); ctx.fillStyle = preset.accent; ctx.fillText('一次說清楚', width / 2, contentY + 194); ctx.textAlign = 'start';
+    }
     ctx.restore();
 }
 
@@ -265,12 +425,15 @@ export function drawMotionDesignToCanvas(ctx, canvas, { design, time, duration, 
     const layers = getMotionDesignLayers({ design: settings, time, duration, subtitles });
     if (!layers.length) return;
     const copy = getMotionDesignCopy(settings, { fallbackTitle, fallbackCreator });
+    const template = getHyperframeTemplate(settings.hyperframeTemplateId);
     layers.forEach(layer => {
         const preset = getMotionDesignPreset(layer.presetId || settings.presetId);
         const layerCopy = layer.creator ? { ...copy, creator: layer.creator } : copy;
-        if (layer.kind === 'intro') drawIntro(ctx, canvas, layer, preset, layerCopy);
-        if (layer.kind === 'outro') drawOutro(ctx, canvas, layer, preset, layerCopy);
-        if (layer.kind === 'lower-third') drawLowerThird(ctx, canvas, layer, preset, layerCopy);
+        const layerTemplate = getHyperframeTemplate(layer.templateId || template.id);
+        if (layer.kind === 'intro') drawIntro(ctx, canvas, layer, preset, layerCopy, layerTemplate);
+        if (layer.kind === 'outro') drawOutro(ctx, canvas, layer, preset, layerCopy, layerTemplate);
+        if (layer.kind === 'lower-third') drawLowerThird(ctx, canvas, layer, preset, layerCopy, layerTemplate);
+        if (layer.kind === 'hyperframe-asset') drawHyperframeAsset(ctx, canvas, layer, preset);
     });
 }
 

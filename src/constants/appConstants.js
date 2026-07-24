@@ -133,6 +133,7 @@ export const DEFAULT_MOTION_DESIGN = {
     enabled: false,
     aiAutoEnabled: false,
     presetId: 'signal',
+    hyperframeTemplateId: 'hf-clean-product',
     includeIntro: true,
     includeOutro: true,
     includeLowerThird: true,

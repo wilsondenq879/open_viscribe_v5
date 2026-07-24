@@ -51,6 +51,7 @@ const actionTools = [
             properties: {
                 projectId: { type: 'string' },
                 presetId: { type: 'string', enum: ['signal', 'editorial', 'creator'] },
+                templateId: { type: 'string', description: 'Curated HyperFrames recipe ID. Prefer openviscribe_apply_hyperframe_template for a listed template.' },
                 mode: { type: 'string', enum: ['ai', 'manual'], default: 'ai' },
                 includeIntro: { type: 'boolean' },
                 includeOutro: { type: 'boolean' },
@@ -58,6 +59,19 @@ const actionTools = [
                 introDuration: { type: 'number', minimum: 0.8, maximum: 10 },
                 outroDuration: { type: 'number', minimum: 0.8, maximum: 10 },
                 cardDuration: { type: 'number', minimum: 0.8, maximum: 10 }
+            },
+            required: ['projectId']
+        }
+    },
+    {
+        name: 'openviscribe_auto_add_contents',
+        description: 'Read the project topic, brief, and completed UI script, then add at most two narrative Contents layers (for example map, terminal, chart, flow, or product UI). It skips decoration when no supporting visual is justified.',
+        action: 'contents.apply',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                brief: { type: 'string', description: 'Optional natural-language focus that overrides the project brief for Contents selection.' }
             },
             required: ['projectId']
         }
@@ -99,6 +113,50 @@ const tools = [
         }
     },
     ...actionTools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    {
+        name: 'openviscribe_list_hyperframe_templates',
+        description: 'List OpenViscribe curated Contents template recipes. Use this first when a user describes desired style in natural language. Show at most three fitting candidates with their preview, useWhen, and catalogBlocks before applying one.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    {
+        name: 'openviscribe_apply_hyperframe_template',
+        description: 'Apply one user-approved HyperFrames template to an OpenViscribe project. This writes a real native motion treatment for intro, outro, and lower thirds; the response includes the catalog source blocks used for the recipe.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                templateId: { type: 'string', enum: ['hf-clean-product', 'hf-editorial-story', 'hf-creator-cta', 'hf-dev-release', 'hf-bold-announcement'] },
+                mode: { type: 'string', enum: ['ai', 'manual'], default: 'ai' },
+                includeIntro: { type: 'boolean' },
+                includeOutro: { type: 'boolean' },
+                includeLowerThird: { type: 'boolean' },
+                introDuration: { type: 'number', minimum: 0.8, maximum: 10 },
+                outroDuration: { type: 'number', minimum: 0.8, maximum: 10 },
+                cardDuration: { type: 'number', minimum: 0.8, maximum: 10 }
+            },
+            required: ['projectId', 'templateId']
+        }
+    },
+    {
+        name: 'openviscribe_list_hyperframe_assets',
+        description: 'List the built-in animated Contents library: world maps, data charts, flowcharts, terminal, code, app/device showcases, social cards, ticker, captions, and roadmap. Use this when the user asks for a specific visual element rather than a full design pack.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    {
+        name: 'openviscribe_add_hyperframe_asset',
+        description: 'Add one built-in animated HyperFrames asset to the project timeline. Use list_hyperframe_assets first, state why the selected asset supports the current tutorial step, then add it at the current playhead or an explicit startAt time.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                assetId: { type: 'string', enum: ['hf-world-map', 'hf-world-flow', 'hf-data-chart', 'hf-flowchart', 'hf-console', 'hf-code-diff', 'hf-code-typing', 'hf-app-showcase', 'hf-device-reveal', 'hf-liquid-glass', 'hf-social-follow', 'hf-news-ticker', 'hf-caption-highlight', 'hf-neon-code', 'hf-release-roadmap'] },
+                startAt: { type: 'number', minimum: 0 },
+                duration: { type: 'number', minimum: 0.8, maximum: 10 },
+                presetId: { type: 'string', enum: ['signal', 'editorial', 'creator'] }
+            },
+            required: ['projectId', 'assetId']
+        }
+    },
     {
         name: 'openviscribe_prepare_ui_script',
         description: 'Store a user-interface tutorial script in the project and prepare Studio for a Computer Use recording. After Studio reports this job completed, use Computer Use to navigate startUrl and perform every script step. Do not claim a step completed until the UI visibly reached its expected state.',
@@ -146,12 +204,14 @@ const tools = [
     },
     {
         name: 'openviscribe_start_tutorial_production',
-        description: 'After all UI script steps are completed and recording has stopped, run subtitles, optional voice, motion design, article, and export in order. Export still requires a user to choose an output folder.',
+        description: 'After all UI script steps are completed and recording has stopped, run subtitles, optional voice, narrative Contents selection, motion design, article, and export in order. Export still requires a user to choose an output folder.',
         inputSchema: {
             type: 'object',
             properties: {
                 projectId: { type: 'string' },
                 includeVoice: { type: 'boolean', default: false },
+                autoContents: { type: 'boolean', default: true, description: 'Automatically add up to two Contents layers when the project brief justifies them.' },
+                contentsBrief: { type: 'string', description: 'Optional natural-language focus for automatic Contents selection.' },
                 design: { type: 'object' },
                 export: { type: 'object' }
             },
@@ -194,6 +254,16 @@ async function callTool(name, args = {}) {
     }
     if (name === 'openviscribe_get_project') return api(`/v1/projects/${encodeURIComponent(args.projectId)}`);
     if (name === 'openviscribe_get_job') return api(`/v1/jobs/${encodeURIComponent(args.jobId)}`);
+    if (name === 'openviscribe_list_hyperframe_templates') return api('/v1/hyperframes/templates');
+    if (name === 'openviscribe_list_hyperframe_assets') return api('/v1/hyperframes/assets');
+    if (name === 'openviscribe_apply_hyperframe_template') {
+        const { projectId, ...template } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/hyperframes-template`, { method: 'POST', body: JSON.stringify(template) });
+    }
+    if (name === 'openviscribe_add_hyperframe_asset') {
+        const { projectId, ...asset } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/hyperframes-assets`, { method: 'POST', body: JSON.stringify(asset) });
+    }
     if (name === 'openviscribe_prepare_ui_script') {
         const { projectId, ...script } = args;
         return api(`/v1/projects/${encodeURIComponent(projectId)}/script`, { method: 'POST', body: JSON.stringify({ script }) });

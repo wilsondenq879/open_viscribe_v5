@@ -44,43 +44,51 @@
 /* Compact previews retain the original composition while shrinking typography,
    spacing and accents together instead of only reducing the outer frame. */
 .design-motion-preview--compact .design-preview-lower-third {
-  border-left-width: 2px;
+  border-left-width: 3px;
   border-radius: 0.375rem;
 }
 .design-motion-preview--compact .design-preview-lower-third-content {
-  padding: 0.25rem 0.375rem;
+  padding: 0.375rem 0.5rem;
 }
 .design-motion-preview--compact .design-preview-outro {
-  padding: 0.375rem;
+  padding: 0.5rem;
   border-radius: 0.375rem;
 }
 .design-motion-preview--compact .design-preview-accent-bar {
-  width: 1.5rem;
-  height: 0.125rem;
-  margin-bottom: 0.25rem;
+  width: 2rem;
+  height: 0.16rem;
+  margin-bottom: 0.35rem;
 }
 .design-motion-preview--compact .design-preview-eyebrow {
-  font-size: 3.5px;
-  letter-spacing: 0.08em;
+  font-size: 4.5px;
+  letter-spacing: 0.1em;
 }
 .design-motion-preview--compact .design-preview-title {
-  margin-top: 2px;
-  font-size: 5.5px;
+  margin-top: 3px;
+  font-size: 7px;
 }
 .design-motion-preview--compact .design-preview-copy {
-  margin-top: 2px;
-  font-size: 3.5px;
+  margin-top: 3px;
+  font-size: 4.5px;
   letter-spacing: 0.07em;
 }
 .design-motion-preview--compact .design-preview-outro .design-preview-title {
-  font-size: 7px;
+  font-size: 9px;
 }
 .design-motion-preview--compact .design-preview-intro .design-preview-title {
-  font-size: 9px;
+  font-size: 11px;
 }
 .design-motion-preview--compact .design-preview-intro .design-preview-copy {
   margin-top: 0.25rem;
 }
+
+/* Half-size gallery previews keep the composition readable instead of shrinking
+   the entire layout into illegible UI chrome. */
+.design-motion-preview--half .design-preview-lower-third-content { padding: 0.5rem 0.65rem; }
+.design-motion-preview--half .design-preview-accent-bar { width: 2.4rem; height: 0.17rem; margin-bottom: 0.28rem; }
+.design-motion-preview--half .design-preview-eyebrow { font-size: 5px; letter-spacing: 0.11em; }
+.design-motion-preview--half .design-preview-title { margin-top: 3px; font-size: 10px; }
+.design-motion-preview--half .design-preview-copy { margin-top: 3px; font-size: 5px; }
 
 @keyframes transition-preview-fade {
   0%, 12% { opacity: 0.08; }
@@ -131,11 +139,130 @@
   animation: audio-motion-preview 1.15s ease-in-out var(--audio-preview-delay, 0s) infinite;
 }
 
+@keyframes hyperframe-asset-glow {
+  0%, 100% { transform: translate3d(9%, -6%, 0) scale(0.82); opacity: 0.32; }
+  50% { transform: translate3d(-11%, 8%, 0) scale(1.18); opacity: 0.88; }
+}
+
+@keyframes hyperframe-asset-card {
+  0%, 12% { transform: translateY(22%) scale(0.92); opacity: 0; }
+  30%, 78% { transform: translateY(0) scale(1); opacity: 1; }
+  100% { transform: translateY(-5%) scale(1.02); opacity: 0.42; }
+}
+
+@keyframes hyperframe-map-node {
+  0%, 100% { transform: scale(0.75); opacity: 0.42; }
+  50% { transform: scale(1.5); opacity: 1; }
+}
+
+@keyframes hyperframe-code-row {
+  0%, 15% { transform: scaleX(0); opacity: 0; }
+  35%, 82% { transform: scaleX(1); opacity: 0.95; }
+  100% { transform: scaleX(0.75); opacity: 0.25; }
+}
+
+@keyframes hyperframe-preview-world {
+  0%, 100% { transform: translateX(-3px) scale(0.985); opacity: 0.68; }
+  50% { transform: translateX(3px) scale(1.018); opacity: 1; }
+}
+
+@keyframes hyperframe-preview-globe {
+  0%, 100% { transform: rotate(-2deg) scale(0.985); }
+  50% { transform: rotate(2deg) scale(1.015); }
+}
+
+@keyframes hyperframe-preview-terminator {
+  0%, 18% { transform: translateX(-22px); opacity: 0.08; }
+  42%, 75% { transform: translateX(1px); opacity: 0.75; }
+  100% { transform: translateX(18px); opacity: 0.22; }
+}
+
+@keyframes hyperframe-preview-node {
+  0%, 18%, 100% { transform: scale(0.8); opacity: 0.45; }
+  43%, 72% { transform: scale(1.18); opacity: 1; }
+}
+
+@keyframes hyperframe-preview-flow {
+  0%, 18% { stroke-dashoffset: 64; opacity: 0; }
+  42%, 78% { stroke-dashoffset: 0; opacity: 1; }
+  100% { stroke-dashoffset: -28; opacity: 0.35; }
+}
+
+@keyframes hyperframe-preview-bar {
+  0%, 16% { transform: scaleY(0.12); opacity: 0; }
+  38%, 78% { transform: scaleY(1); opacity: 1; }
+  100% { transform: scaleY(0.82); opacity: 0.45; }
+}
+
+@keyframes hyperframe-preview-chart-line {
+  0%, 18% { stroke-dashoffset: 400; opacity: 0; }
+  44%, 76% { stroke-dashoffset: 0; opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+@keyframes hyperframe-preview-step {
+  0%, 18% { transform: translateY(13px) scale(0.88); opacity: 0; }
+  38%, 78% { transform: translateY(0) scale(1); opacity: 1; }
+  100% { opacity: 0.55; }
+}
+
+@keyframes hyperframe-preview-code-line {
+  0%, 16% { transform: scaleX(0); opacity: 0; }
+  38%, 80% { transform: scaleX(1); opacity: 1; }
+  100% { transform: scaleX(0.88); opacity: 0.45; }
+}
+
+@keyframes hyperframe-preview-cursor {
+  0%, 44% { opacity: 1; }
+  45%, 100% { opacity: 0; }
+}
+
+@keyframes hyperframe-preview-ticker {
+  0%, 14% { transform: translateX(25%); opacity: 0; }
+  32%, 75% { transform: translateX(-8%); opacity: 1; }
+  100% { transform: translateX(-32%); opacity: 0.4; }
+}
+
+.hyperframe-asset-glow { animation: hyperframe-asset-glow 3.8s ease-in-out infinite; }
+.hyperframe-asset-card { animation: hyperframe-asset-card 3.8s cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+.hyperframe-map-grid { animation: hyperframe-asset-card 4.2s cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+.hyperframe-map-node { animation: hyperframe-map-node 1.8s ease-in-out infinite; }
+.hyperframe-code-row { transform-origin: left center; animation: hyperframe-code-row 3.1s ease-in-out var(--row-delay, 0s) infinite; }
+.hyperframe-preview-world { transform-origin: center; animation: hyperframe-preview-world 4.2s ease-in-out infinite; }
+.hyperframe-preview-globe { transform-origin: 170px 92px; animation: hyperframe-preview-globe 5.2s ease-in-out infinite; }
+.hyperframe-preview-terminator { animation: hyperframe-preview-terminator 5.2s cubic-bezier(0.45, 0, 0.55, 1) infinite; }
+.hyperframe-preview-flow { stroke-dasharray: 12 7; animation: hyperframe-preview-flow 3.6s ease-in-out infinite; }
+.hyperframe-preview-map-node { transform-origin: center; animation: hyperframe-map-node 1.8s ease-in-out infinite; }
+.hyperframe-preview-node { transform-box: fill-box; transform-origin: center; animation: hyperframe-preview-node 2.8s ease-in-out var(--node-delay, 0s) infinite; }
+.hyperframe-preview-bar { transform-origin: center bottom; animation: hyperframe-preview-bar 3.4s ease-in-out var(--bar-delay, 0s) infinite; }
+.hyperframe-preview-chart-line { stroke-dasharray: 400; animation: hyperframe-preview-chart-line 3.4s ease-in-out infinite; }
+.hyperframe-preview-step { animation: hyperframe-preview-step 3.4s ease-in-out var(--step-delay, 0s) infinite; }
+.hyperframe-preview-code-line { transform-origin: left center; animation: hyperframe-preview-code-line 3.2s ease-in-out var(--line-delay, 0s) infinite; }
+.hyperframe-preview-cursor { animation: hyperframe-preview-cursor 0.85s steps(1, end) infinite; }
+.hyperframe-preview-ticker { animation: hyperframe-preview-ticker 4.2s cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .design-preview-glow,
   .design-preview-lower-third,
   .design-preview-intro,
   .design-preview-outro,
   .transition-preview-panel,
-  .audio-motion-preview-bar { animation: none; opacity: 1; }
+  .audio-motion-preview-bar,
+  .hyperframe-asset-glow,
+  .hyperframe-asset-card,
+  .hyperframe-map-grid,
+  .hyperframe-map-node,
+  .hyperframe-code-row,
+  .hyperframe-preview-world,
+  .hyperframe-preview-globe,
+  .hyperframe-preview-terminator,
+  .hyperframe-preview-flow,
+  .hyperframe-preview-map-node,
+  .hyperframe-preview-node,
+  .hyperframe-preview-bar,
+  .hyperframe-preview-chart-line,
+  .hyperframe-preview-step,
+  .hyperframe-preview-code-line,
+  .hyperframe-preview-cursor,
+  .hyperframe-preview-ticker { animation: none; opacity: 1; }
 }

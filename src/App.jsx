@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
 import {
     Settings, HelpCircle, MonitorPlay, Square, Play, Pause, Scissors,
     Type, Mic, Download, Trash2, FolderOpen, Save, FileVideo,
@@ -100,6 +100,8 @@ import {
     getMotionDesignPreset,
     getMotionDesignSettings
 } from './lib/motionDesignUtils';
+import { HYPERFRAME_TEMPLATES, getHyperframeTemplate, getHyperframeTemplateDefaults } from './lib/hyperframeTemplates';
+import { HYPERFRAME_ASSETS } from './lib/hyperframeAssets';
 import {
     buildCompositeSubtitleText,
     clamp,
@@ -1512,16 +1514,24 @@ function normalizeServerModelOptions(items, preferredKeys = []) {
     return options.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
 }
 
-function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, compact = false }) {
+function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, compact = false, templateId = 'hf-clean-product' }) {
+    const template = getHyperframeTemplate(templateId);
+    const isStrongCard = template.lowerThirdStyle === 'bold-block' || template.lowerThirdStyle === 'creator-cta';
+    const isAccentUnderline = template.lowerThirdStyle === 'accent-underline';
     const title = variant === 'lower-third' ? '關鍵操作提示' : '快速完成設定';
     const previewSizeClass = compact === 'half'
-        ? 'h-24 w-44 shrink-0 rounded-lg'
+        ? 'h-28 w-48 shrink-0 rounded-xl'
         : compact
-            ? 'h-16 w-28 shrink-0 rounded-lg'
+            ? 'h-20 w-36 shrink-0 rounded-xl'
             : 'aspect-video rounded-xl';
+    const densityClass = compact === 'half'
+        ? 'design-motion-preview--half'
+        : compact
+            ? 'design-motion-preview--compact'
+            : '';
     return (
         <div
-            className={`design-motion-preview relative overflow-hidden border border-white/10 ${compact ? 'design-motion-preview--compact' : ''} ${previewSizeClass}`}
+            className={`design-motion-preview relative overflow-hidden border border-white/10 ${densityClass} ${previewSizeClass}`}
             style={{
                 backgroundColor: preset.background,
                 color: preset.foreground,
@@ -1532,23 +1542,23 @@ function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, 
             <div className="design-preview-glow absolute -right-[12%] -top-[45%] h-[120%] w-[62%] rounded-full blur-2xl" style={{ backgroundColor: `${preset.accent}66` }} />
             <div className="absolute inset-0 opacity-20" style={{ backgroundImage: `linear-gradient(112deg, transparent 0%, transparent 45%, ${preset.foreground} 45.35%, transparent 45.7%, transparent 66%, ${preset.foreground} 66.35%, transparent 66.7%)` }} />
             {variant === 'lower-third' ? (
-                <div className="design-preview-lower-third absolute bottom-[12%] left-[7%] w-[70%] overflow-hidden rounded-lg border border-white/10 shadow-xl" style={{ backgroundColor: `${preset.surface}f2`, borderLeft: `4px solid ${preset.accent}` }}>
+                <div className="design-preview-lower-third absolute bottom-[13%] left-[8%] w-[76%] overflow-hidden shadow-xl" style={{ backgroundColor: isAccentUnderline ? 'transparent' : (isStrongCard ? preset.accent : `${preset.surface}f4`), borderLeft: isAccentUnderline ? 'none' : `4px solid ${isStrongCard ? preset.background : preset.accent}`, borderBottom: isAccentUnderline ? `3px solid ${preset.accent}` : 'none', borderRadius: template.lowerThirdStyle === 'soft-pill' ? 999 : 8 }}>
                     <div className="design-preview-lower-third-content px-3 py-2">
-                        <div className="design-preview-accent-bar mb-1 h-0.5 w-7 rounded-full" style={{ backgroundColor: preset.accentAlt }} />
-                        <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.16em]" style={{ color: preset.accent }}>OPEN VISCRIBE</div>
-                        <div className="design-preview-title mt-0.5 text-[11px] font-bold leading-tight" style={{ color: preset.foreground }}>{title}</div>
+                        <div className="design-preview-accent-bar mb-1 h-0.5 w-12 rounded-full" style={{ backgroundColor: isStrongCard ? preset.background : preset.accent }} />
+                        <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.16em]" style={{ color: isStrongCard ? preset.background : preset.muted }}>{isAccentUnderline ? 'OPEN VISCRIBE  ·  STEP' : (template.lowerThirdStyle === 'code-window' ? '● ● ●  RELEASE' : 'OPEN VISCRIBE')}</div>
+                        <div className="design-preview-title mt-0.5 text-[11px] font-bold leading-tight" style={{ color: isStrongCard ? preset.background : preset.foreground }}>{title}</div>
                     </div>
                 </div>
             ) : variant === 'outro' ? (
                 <div className="design-preview-outro absolute left-1/2 top-1/2 w-[70%] -translate-x-1/2 -translate-y-1/2 rounded-xl border px-3 py-3 text-center shadow-xl" style={{ backgroundColor: `${preset.surface}ee`, borderColor: preset.accent }}>
-                    <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.16em]" style={{ color: preset.accent }}>THANKS FOR WATCHING</div>
+                    <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.16em]" style={{ color: preset.accent }}>{template.outroStyle === 'creator-cta' ? 'FOLLOW FOR NEXT STEP' : 'THANKS FOR WATCHING'}</div>
                     <div className="design-preview-title mt-1 text-sm font-extrabold" style={{ color: preset.foreground }}>OPEN VISCRIBE</div>
                     <div className="design-preview-copy mt-1 text-[7px]" style={{ color: preset.muted }}>訂閱更多實用教學</div>
                 </div>
             ) : (
-                <div className="design-preview-intro absolute left-[10%] top-[28%] max-w-[76%]">
+                <div className="design-preview-intro absolute left-[10%] top-[25%] max-w-[78%]">
                     <div className="design-preview-accent-bar mb-2 h-1 w-12 rounded-full" style={{ backgroundColor: preset.accent }} />
-                    <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.17em]" style={{ color: preset.accent }}>OPEN VISCRIBE / VIDEO</div>
+                    <div className="design-preview-eyebrow text-[7px] font-bold tracking-[0.17em]" style={{ color: preset.accent }}>{template.introStyle === 'editorial-title' ? 'OPEN VISCRIBE / EXPLAINED' : 'OPEN VISCRIBE / VIDEO'}</div>
                     <div className="design-preview-title mt-1 text-lg font-extrabold leading-tight" style={{ color: preset.foreground }}>{title}</div>
                     <div className="design-preview-copy mt-2 text-[7px] tracking-[0.14em]" style={{ color: preset.muted }}>OPEN VISCRIBE</div>
                 </div>
@@ -1557,19 +1567,131 @@ function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, 
     );
 }
 
+function HyperframeAssetPreview({ asset, className = '' }) {
+    const preset = getMotionDesignPreset(asset.presetId);
+    const accent = preset.accent;
+    const alt = preset.accentAlt;
+    const foreground = preset.foreground;
+    const previewId = useId().replace(/:/g, '');
+    const catalogLabel = String(asset.catalogId || '').replace(/^code-snippet-/, '').toUpperCase();
+    const renderWorldMap = (showFlow = false) => {
+        const nodes = [[132, 80, 'US'], [171, 75, 'EU'], [210, 101, 'APAC']];
+        return (
+            <svg viewBox="0 0 320 160" className="absolute inset-0 h-full w-full" aria-hidden="true">
+                <defs>
+                    <radialGradient id={`map-ocean-${previewId}`} cx="38%" cy="30%" r="78%">
+                        <stop offset="0" stopColor={`${alt}42`} />
+                        <stop offset="0.56" stopColor={`${preset.surface}e8`} />
+                        <stop offset="1" stopColor={`${preset.background}f4`} />
+                    </radialGradient>
+                    <linearGradient id={`map-land-${previewId}`} x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0" stopColor={foreground} stopOpacity="0.62" />
+                        <stop offset="1" stopColor={alt} stopOpacity="0.25" />
+                    </linearGradient>
+                    <linearGradient id={`map-route-${previewId}`} x1="0" y1="0" x2="1" y2="0">
+                        <stop offset="0" stopColor={alt} stopOpacity="0.2" />
+                        <stop offset="0.48" stopColor={accent} />
+                        <stop offset="1" stopColor={alt} stopOpacity="0.4" />
+                    </linearGradient>
+                    <filter id={`map-shadow-${previewId}`} x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="4" /></filter>
+                    <clipPath id={`map-globe-clip-${previewId}`}><circle cx="170" cy="92" r="62" /></clipPath>
+                </defs>
+                <text x="18" y="19" fill={foreground} opacity="0.92" fontSize="8" fontWeight="700" letterSpacing="1.45">{showFlow ? 'GLOBAL ROUTING' : 'GLOBAL INFRASTRUCTURE'}</text>
+                <text x="18" y="31" fill={foreground} opacity="0.43" fontSize="6" letterSpacing="0.9">{showFlow ? 'LIVE PATH / MULTI-REGION' : 'LIVE COVERAGE / 03 REGIONS'}</text>
+                <g transform="translate(0 1)">
+                    <circle cx="170" cy="94" r="66" fill={accent} opacity="0.18" filter={`url(#map-shadow-${previewId})`} />
+                    <circle cx="170" cy="92" r="64" fill={`url(#map-ocean-${previewId})`} stroke={`${foreground}44`} strokeWidth="1" />
+                    <g className="hyperframe-preview-globe" clipPath={`url(#map-globe-clip-${previewId})`}>
+                        <g className="hyperframe-preview-graticule" fill="none" stroke={`${foreground}22`} strokeWidth="0.7">
+                            <ellipse cx="170" cy="92" rx="62" ry="19" />
+                            <ellipse cx="170" cy="92" rx="62" ry="40" />
+                            <path d="M108 92 H232 M113 69 H227 M113 115 H227" />
+                            <ellipse cx="170" cy="92" rx="22" ry="62" />
+                            <ellipse cx="170" cy="92" rx="44" ry="62" />
+                        </g>
+                        <g className="hyperframe-preview-world" fill={`url(#map-land-${previewId})`} stroke={`${foreground}48`} strokeWidth="0.7">
+                            <path d="M115 57 C123 47 140 43 150 48 C153 54 148 61 142 65 L136 75 L127 72 L120 67 Z" />
+                            <path d="M142 78 C150 81 156 91 154 101 C151 112 146 123 140 132 L134 122 L136 107 L130 95 Z" />
+                            <path d="M160 58 C174 49 197 48 212 55 C224 60 231 70 235 81 L225 87 L214 83 L204 89 L192 84 L183 92 L171 84 L164 74 Z" />
+                            <path d="M184 91 C196 91 204 99 207 109 L200 124 L189 119 L181 106 Z" />
+                            <path d="M214 112 C224 108 233 114 236 121 L229 128 L218 125 Z" />
+                        </g>
+                        <path className="hyperframe-preview-terminator" d="M115 36 C149 55 180 83 226 150 L242 150 L242 35 Z" fill={`${preset.background}72`} />
+                    </g>
+                    <circle cx="170" cy="92" r="64" fill="none" stroke={`${foreground}26`} strokeWidth="1.25" />
+                    <path d="M108 92 H232" stroke={`${foreground}1c`} />
+                    <path d="M170 28 V156" stroke={`${foreground}16`} />
+                    {showFlow && <g className="hyperframe-preview-flow" fill="none" stroke={`url(#map-route-${previewId})`} strokeWidth="2.1"><path d="M132 80 Q151 42 171 75" /><path d="M171 75 Q204 51 210 101" /></g>}
+                    {!showFlow && <g fill="none" stroke={`${alt}5e`} strokeWidth="0.9" opacity="0.7"><path d="M132 80 Q151 59 171 75" /><path d="M171 75 Q193 70 210 101" /></g>}
+                    {nodes.map(([cx, cy, label], index) => <g key={label} className="hyperframe-preview-node" style={{ '--node-delay': `${index * -0.34}s` }}><circle cx={cx} cy={cy} r="9" fill="none" stroke={index === 2 ? alt : accent} strokeWidth="0.8" opacity="0.55" /><circle cx={cx} cy={cy} r="4.1" fill={index === 2 ? alt : accent} stroke={preset.background} strokeWidth="1.5" /><text x={cx + 7} y={cy - 6} fill={foreground} opacity="0.9" fontSize="5.5" fontFamily="monospace" fontWeight="700">{label}</text></g>)}
+                </g>
+                <g transform="translate(18 133)"><rect width="86" height="12" rx="6" fill={`${preset.surface}d9`} stroke={`${foreground}24`} /><circle cx="9" cy="6" r="2.2" fill={accent} /><text x="15" y="8.2" fill={foreground} opacity="0.74" fontSize="5.5" fontWeight="700" letterSpacing="0.45">NETWORK ONLINE</text></g>
+                <text x="270" y="143" fill={foreground} opacity="0.42" fontSize="5.5" textAnchor="end" letterSpacing="0.8">UTC · LIVE</text>
+            </svg>
+        );
+    };
+    const renderCodeWindow = () => {
+        const isDiff = asset.assetType === 'code-diff';
+        const isConsole = asset.assetType === 'console';
+        const isTyping = asset.assetType === 'code-typing';
+        return <div className="absolute inset-[9%] rounded-xl border border-white/15 bg-[#071019] p-3 shadow-inner shadow-black/40">
+            <div className="mb-3 flex items-center gap-1.5">{[accent, alt, foreground].map((color, index) => <span key={index} className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />)}<span className="ml-2 font-mono text-[7px] text-white/45">{isConsole ? 'deploy@global:~' : isDiff ? 'release.diff' : 'deploy.config.ts'}</span></div>
+            {isDiff ? <div className="grid grid-cols-2 gap-2"><div className="rounded-lg border border-rose-300/20 bg-rose-400/10 p-2"><span className="font-mono text-[8px] text-rose-200">− region: legacy</span><span className="mt-2 block h-1.5 w-4/5 rounded bg-rose-300/60" /><span className="mt-1.5 block h-1.5 w-3/5 rounded bg-rose-300/35" /></div><div className="rounded-lg border border-emerald-300/20 bg-emerald-400/10 p-2"><span className="font-mono text-[8px] text-emerald-200">+ region: apac</span><span className="mt-2 block h-1.5 w-4/5 rounded bg-emerald-300/60" /><span className="mt-1.5 block h-1.5 w-3/5 rounded bg-emerald-300/35" /></div></div> : <div className="space-y-2 font-mono text-[9px]">{isConsole && <div className="text-white/85"><span className="text-emerald-300">user@studio %</span> deploy --region apac</div>}{[0, 1, 2].map(index => <div key={index} className="hyperframe-preview-code-line flex gap-2" style={{ '--line-delay': `${index * -0.28}s` }}><span style={{ color: alt }}>{isConsole ? '✓' : `${index + 1}`}</span><span className="h-1.5 rounded" style={{ width: `${52 + index * 13}%`, backgroundColor: index % 2 ? alt : accent }} /></div>)}{isTyping && <span className="hyperframe-preview-cursor inline-block h-3 w-1.5" style={{ backgroundColor: foreground }} />}</div>}
+        </div>;
+    };
+    const renderProduct = () => {
+        const isDevice = asset.assetType === 'device-reveal';
+        const isGlass = asset.assetType === 'liquid-glass';
+        return <div className={`hyperframe-preview-product absolute ${isDevice ? 'left-[37%] top-[8%] h-[84%] w-[26%] rounded-[18px]' : 'inset-[15%] rounded-xl'} border shadow-2xl`} style={{ backgroundColor: isGlass ? `${foreground}18` : `${preset.surface}ee`, borderColor: `${accent}bb`, backdropFilter: isGlass ? 'blur(9px)' : undefined }}>
+            <div className="mx-auto mt-[9%] h-2 w-1/3 rounded-full bg-white/25" />
+            <div className="mx-[12%] mt-[11%] rounded-lg border border-white/10 p-2" style={{ backgroundColor: `${alt}66` }}><div className="flex items-center justify-between"><div className="h-2 w-2/5 rounded bg-white/80" /><div className="h-2 w-2 rounded-full" style={{ backgroundColor: accent }} /></div><div className="mt-3 grid grid-cols-3 gap-1"><span className="h-6 rounded bg-white/18" /><span className="h-6 rounded bg-white/10" /><span className="h-6 rounded bg-white/14" /></div><div className="mt-2 h-1.5 w-full rounded bg-white/45" /><div className="mt-1.5 h-1.5 w-4/5 rounded bg-white/30" /></div>
+        </div>;
+    };
+    const renderDiagram = () => {
+        if (asset.assetType === 'data-chart') return <svg viewBox="0 0 320 160" className="absolute inset-0 h-full w-full" aria-hidden="true"><text x="35" y="24" fill={foreground} opacity="0.85" fontSize="8" fontWeight="700">ADOPTION RATE</text><path d="M35 130 H290 M35 30 V130" stroke={`${foreground}4a`} strokeWidth="2" />{[0.32, 0.58, 0.43, 0.76, 0.92].map((bar, index) => <rect key={index} className="hyperframe-preview-bar" x={58 + index * 43} y={130 - bar * 88} width="22" height={bar * 88} rx="5" fill={index === 4 ? accent : `${alt}bb`} style={{ '--bar-delay': `${index * -0.16}s` }} />)}<path className="hyperframe-preview-chart-line" d="M69 94 L112 66 L155 80 L198 45 L241 36" fill="none" stroke={foreground} strokeWidth="3" /></svg>;
+        const roadmap = asset.assetType === 'release-roadmap';
+        return <div className="absolute inset-x-[9%] top-[26%] flex items-center justify-between"><div className="absolute left-[8%] right-[8%] top-1/2 h-0.5 -translate-y-1/2 bg-white/20" />{(roadmap ? ['v1.0', 'v1.5', 'v2.0'] : ['設定', '部署', '驗證']).map((label, index) => <div key={label} className="hyperframe-preview-step relative z-10 flex h-12 w-[27%] flex-col items-center justify-center rounded-lg border text-[8px] font-bold" style={{ backgroundColor: `${preset.surface}f2`, borderColor: index === 2 ? accent : `${foreground}55`, color: index === 2 ? accent : foreground, '--step-delay': `${index * -0.25}s` }}>{label}<span className="mt-1 h-1 w-5 rounded" style={{ backgroundColor: index === 2 ? accent : alt }} /></div>)}</div>;
+    };
+    const renderSocialOrText = () => {
+        if (asset.assetType === 'news-ticker') return <div className="hyperframe-preview-ticker absolute inset-x-0 bottom-[18%] flex h-9 items-center whitespace-nowrap px-4 text-[9px] font-extrabold" style={{ backgroundColor: accent, color: preset.background }}>BREAKING · 部署狀態已更新 · 服務健康檢查完成 ·</div>;
+        if (asset.assetType === 'caption-highlight') return <div className="absolute inset-0 flex flex-col items-center justify-center px-4 text-center font-extrabold leading-tight"><span className="text-sm" style={{ color: foreground }}>三步完成</span><span className="mt-1 text-base" style={{ color: accent }}>全球部署</span></div>;
+        return <div className="absolute inset-x-[14%] top-[25%] rounded-xl border p-3" style={{ backgroundColor: `${preset.surface}ee`, borderColor: `${accent}99` }}><div className="flex items-center gap-2"><span className="h-8 w-8 rounded-full" style={{ backgroundColor: alt }} /><div><div className="text-[9px] font-extrabold" style={{ color: foreground }}>OPEN VISCRIBE</div><div className="mt-1 h-1.5 w-16 rounded bg-white/30" /></div></div><span className="mt-3 block w-full rounded py-1 text-center text-[8px] font-bold" style={{ backgroundColor: accent, color: preset.background }}>FOLLOW / 訂閱</span></div>;
+    };
+    return (
+        <div className={`hyperframe-asset-preview relative overflow-hidden rounded-xl border border-white/10 ${className}`} style={{ backgroundColor: preset.background, '--hyperframe-accent': preset.accent, '--hyperframe-alt': preset.accentAlt, '--hyperframe-foreground': preset.foreground }} aria-label={`${asset.nameZh} 動態預覽`}>
+            <div className="hyperframe-asset-glow absolute -right-6 -top-8 h-28 w-28 rounded-full blur-2xl" style={{ backgroundColor: `${preset.accent}55` }} />
+            <div className="absolute right-3 top-2 z-10 rounded-full border border-white/10 bg-black/20 px-1.5 py-0.5 font-mono text-[6px] tracking-[0.12em] text-white/50">{catalogLabel}</div>
+            {asset.assetType === 'world-map' && renderWorldMap()}
+            {asset.assetType === 'world-flow' && renderWorldMap(true)}
+            {['data-chart', 'flowchart', 'release-roadmap'].includes(asset.assetType) && renderDiagram()}
+            {['console', 'code-diff', 'code-typing', 'neon-code'].includes(asset.assetType) && renderCodeWindow()}
+            {['app-showcase', 'device-reveal', 'liquid-glass'].includes(asset.assetType) && renderProduct()}
+            {['social-follow', 'news-ticker', 'caption-highlight'].includes(asset.assetType) && renderSocialOrText()}
+            <div className="absolute bottom-2 left-3 rounded bg-black/35 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">{asset.category}</div>
+        </div>
+    );
+}
+
 function TransitionMotionPreview({ preset, color }) {
     const accent = TRANSITION_COLOR_MAP[color] || TRANSITION_COLOR_MAP.rose;
+    const transitionLabel = {
+        fade: 'FADE',
+        'slide-left': 'PUSH',
+        'slide-right': 'REVEAL',
+        'zoom-in': 'ZOOM',
+        'wipe-up': 'WIPE'
+    }[preset] || 'CUT';
     return (
         <div
-            className={`transition-motion-preview transition-motion-preview--${preset} relative h-10 w-16 shrink-0 overflow-hidden rounded-md border border-white/10 bg-slate-950`}
+            className={`transition-motion-preview transition-motion-preview--${preset} relative h-14 w-24 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-slate-950`}
             style={{ '--transition-preview-accent': accent }}
             aria-label="過場動態預覽"
         >
-            <div className="absolute inset-0 bg-[linear-gradient(135deg,#172033_0%,#0f172a_52%,#243550_100%)]" />
-            <div className="absolute inset-y-0 left-[24%] w-px bg-white/10" />
-            <div className="absolute inset-y-0 right-[20%] w-px bg-white/10" />
-            <div className="absolute bottom-[18%] left-[14%] h-1 w-[38%] rounded-full bg-white/30" />
-            <div className="transition-preview-panel absolute inset-1 rounded-[3px] shadow-[0_4px_14px_rgba(0,0,0,0.38)]" />
+            <div className="absolute inset-0 bg-[linear-gradient(135deg,#101827_0%,#0b1220_52%,#23344e_100%)]" />
+            <div className="absolute left-2 top-2 z-10 text-[6px] font-bold tracking-[0.18em] text-white/45">SCENE A</div>
+            <div className="absolute bottom-2 left-2 z-10 h-1 w-8 rounded-full bg-white/25" />
+            <div className="absolute right-2 top-2 z-10 text-[6px] font-bold tracking-[0.18em]" style={{ color: accent }}>{transitionLabel}</div>
+            <div className="transition-preview-panel absolute inset-[7px] rounded-md shadow-[0_8px_20px_rgba(0,0,0,0.42)]" />
         </div>
     );
 }
@@ -1593,7 +1715,7 @@ function MediaLibraryPreview({ asset }) {
 
 function buildAutomationProjectSnapshot(projectState, activeSkillId, isRecording) {
     const tracks = Array.isArray(projectState?.tracks) ? projectState.tracks : [];
-    const duration = Math.max(0, ...tracks.flatMap(track => (track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0))), ...((projectState?.subtitles || []).map(item => Number(item?.endAt || 0))));
+    const duration = Math.max(0, ...tracks.flatMap(track => (track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0))), ...((projectState?.subtitles || []).map(item => Number(item?.endAt || 0))), ...((projectState?.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))));
     const activeSkill = getSkillById(activeSkillId);
     const markdown = String(projectState?.[activeSkill.markdownField] || '');
     return {
@@ -2286,8 +2408,11 @@ export default function App() {
         (projectState.subtitleTransitions || []).forEach(item => {
             if (item.startAt + item.duration > maxD) maxD = item.startAt + item.duration;
         });
+        (projectState.motionDesign?.manualCards || []).forEach(card => {
+            if (Number(card?.endAt) > maxD) maxD = Number(card.endAt);
+        });
         return maxD;
-    }, [projectState.tracks, projectState.videoTransitions, projectState.audioTracks, projectState.subtitles, projectState.subtitleTransitions]);
+    }, [projectState.tracks, projectState.videoTransitions, projectState.audioTracks, projectState.subtitles, projectState.subtitleTransitions, projectState.motionDesign?.manualCards]);
 
     const [currentTime, setCurrentTime] = useState(0);
     const [isPlaying, setIsPlaying] = useState(false);
@@ -2403,6 +2528,106 @@ export default function App() {
         }));
         setManualCardText('');
     }, [currentTime, manualCardText, motionDesign.cardDuration, motionDesign.creator, motionDesign.presetId, projectState.subtitles, setProjectState, totalDuration]);
+    const addHyperframeAsset = useCallback((asset) => {
+        const startAt = Math.max(0, Number(currentTime.toFixed(2)));
+        const duration = Math.max(0.8, Math.min(10, Number(asset.duration) || 4));
+        const endAt = Number(Math.max(startAt + 0.5, Math.min(totalDuration || startAt + duration, startAt + duration)).toFixed(2));
+        const newAssetLayer = {
+            id: `hyperframe_asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            text: asset.nameZh,
+            creator: 'HYPERFRAMES',
+            presetId: asset.presetId || motionDesign.presetId,
+            assetId: asset.id,
+            startAt,
+            endAt
+        };
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: [...(prev.motionDesign?.manualCards || []), newAssetLayer]
+            }
+        }));
+    }, [currentTime, motionDesign.presetId, setProjectState, totalDuration]);
+    const applyAutomaticContents = useCallback((briefOverride = '') => {
+        const context = [
+            briefOverride,
+            projectState.articleTopic,
+            projectState.tutorialDescription,
+            ...(projectState.automationScript?.steps || []).map(step => `${step.instruction || ''} ${step.expected || ''}`)
+        ].join(' ').toLowerCase();
+        const matchingRules = [
+            { assetId: 'hf-world-map', terms: ['global', 'world', 'region', '跨區', '全球', '地圖', '部署', '節點'], reason: '用地圖說明跨區範圍或節點關係' },
+            { assetId: 'hf-console', terms: ['console', 'terminal', 'cli', 'command', '指令', '終端機', '部署', 'health'], reason: '用終端機呈現可驗證的技術操作結果' },
+            { assetId: 'hf-code-diff', terms: ['diff', 'pr', 'release', '版本', '差異', '程式碼'], reason: '用差異視圖說明程式變更' },
+            { assetId: 'hf-data-chart', terms: ['metric', 'growth', 'data', 'chart', '數據', '成長', '圖表'], reason: '用圖表呈現可比較的數據' },
+            { assetId: 'hf-flowchart', terms: ['flow', 'process', 'workflow', '流程', '步驟'], reason: '用流程圖整理多步驟邏輯' },
+            { assetId: 'hf-device-reveal', terms: ['mobile', 'iphone', 'app', '手機', '行動'], reason: '用裝置畫面聚焦行動端操作' },
+            { assetId: 'hf-app-showcase', terms: ['product', 'dashboard', 'ui', '介面', '後台', '功能'], reason: '用產品畫面聚焦功能介面' }
+        ];
+        const selectedRules = matchingRules.filter(rule => rule.terms.some(term => context.includes(term))).slice(0, 2);
+        const selectedAssets = selectedRules
+            .map(rule => ({ ...rule, asset: HYPERFRAME_ASSETS.find(asset => asset.id === rule.assetId) }))
+            .filter(item => item.asset);
+        if (!selectedAssets.length) return [];
+
+        const safeDuration = Math.max(12, Number(totalDuration) || 24);
+        const generatedCards = selectedAssets.map(({ asset, reason }, index) => {
+            const duration = Math.max(0.8, Math.min(10, Number(asset.duration) || 4));
+            const desiredStart = safeDuration * (index === 0 ? 0.3 : 0.62);
+            const startAt = Number(Math.max(3, Math.min(Math.max(3, safeDuration - duration - 2), desiredStart)).toFixed(2));
+            return {
+                id: `auto_contents_${asset.id}`,
+                text: asset.nameZh,
+                creator: `CONTENTS · ${reason}`,
+                presetId: asset.presetId || motionDesign.presetId,
+                assetId: asset.id,
+                startAt,
+                endAt: Number(Math.min(safeDuration - 1, startAt + duration).toFixed(2)),
+                source: 'auto-contents'
+            };
+        });
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: [
+                    ...(prev.motionDesign?.manualCards || []).filter(card => card?.source !== 'auto-contents'),
+                    ...generatedCards
+                ]
+            }
+        }));
+        return generatedCards.map(card => ({ assetId: card.assetId, reason: card.creator.replace('CONTENTS · ', '') }));
+    }, [motionDesign.presetId, projectState.articleTopic, projectState.automationScript?.steps, projectState.tutorialDescription, setProjectState, totalDuration]);
+    const createDeploymentHyperframeDemo = useCallback(() => {
+        const demoCards = [
+            { id: 'demo_world_map', text: '全球節點與區域流向', creator: 'DEPLOYMENT / MAP', presetId: 'signal', assetId: 'hf-world-map', startAt: 3.0, endAt: 7.5 },
+            { id: 'demo_console', text: '部署指令與健康檢查', creator: 'DEPLOYMENT / CONSOLE', presetId: 'signal', assetId: 'hf-console', startAt: 7.8, endAt: 12.2 }
+        ];
+        setProjectState(prev => ({
+            ...prev,
+            articleTopic: '全球部署教學：從區域選擇到健康檢查',
+            tutorialDescription: '示範如何規劃跨區部署，確認服務節點，並透過終端機完成部署與健康檢查。',
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                enabled: false,
+                aiAutoEnabled: false,
+                hyperframeTemplateId: 'hf-dev-release',
+                presetId: 'signal',
+                title: '全球部署教學',
+                creator: 'OPEN VISCRIBE DEMO',
+                manualIntroEnabled: true,
+                manualOutroEnabled: false,
+                introDuration: 2.6,
+                manualCards: demoCards
+            }
+        }));
+        setCurrentTime(0);
+        setIsPlaying(false);
+    }, [setProjectState]);
     const removeManualLowerThird = useCallback((cardId) => {
         setProjectState(prev => ({
             ...prev,
@@ -3228,7 +3453,8 @@ export default function App() {
                 0,
                 ...projectStateRef.current.tracks.flat().map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
                 ...projectStateRef.current.audioTracks.flatMap(track => track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
-                ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0))
+                ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0)),
+                ...(projectStateRef.current.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))
             ),
             subtitles: projectStateRef.current.subtitles,
             fallbackTitle: projectStateRef.current.articleTopic || projectStateRef.current.tutorialDescription || 'Untitled Tutorial',
@@ -7917,7 +8143,7 @@ ${orderedFramesText}
         }
     };
 
-    const generateArticleFromSubtitles = async () => {
+    const generateArticleFromSubtitles = async (subtitleOverride = null) => {
         const isColumnTopicMode = activeSkillId === 'column-topic';
         const isCompositeTutorial = activeSkillId === 'composite-tutorial';
         const frameField = activeSkill.frameField || 'capturedFrames';
@@ -7932,13 +8158,17 @@ ${orderedFramesText}
                 ? compositeReport.segments
                 : (Array.isArray(projectState.compositeSubtitleAnalysis) ? projectState.compositeSubtitleAnalysis : []))
             : [];
+        const articleSubtitles = Array.isArray(subtitleOverride) && subtitleOverride.length > 0
+            ? subtitleOverride.map(normalizeSubtitle)
+            : highlightSubtitles;
+        const isScriptDerivedArticle = Array.isArray(subtitleOverride) && subtitleOverride.length > 0;
         if (articleProvider === 'azure' && !azureChatKey) return alert("請先在設定中輸入 Azure Chat API Key");
         if (articleProvider === 'gemini' && !settings.apiKey) return alert("請先在設定中輸入 Gemini API Key");
         if (articleProvider === 'lmstudio' && (!lmStudioEndpoint || !settings.lmStudioChatModel?.trim())) return alert("請先在設定中填入 LM Studio Base URL 與文字 / Chat 模型");
         if (articleProvider === 'ollama' && (!ollamaEndpoint || !settings.ollamaChatModel?.trim())) return alert("請先在設定中填入 Ollama Endpoint 與文字 / Chat 模型");
         if (isCompositeTutorial) {
             if (!compositeSegments.length) return alert("請先執行 AI 場景分析，建立綜合教學段落後再生成文章。");
-        } else if (!highlightSubtitles || highlightSubtitles.length === 0) {
+        } else if (!articleSubtitles || articleSubtitles.length === 0) {
             return alert("請先生成或編輯 S2 AI字幕，再生成文章。");
         }
         if (aiSubtitleTimelineWarning) {
@@ -7973,7 +8203,7 @@ ${orderedFramesText}
             ? compositeSegments
                 .map(segment => Number(segment?.time_start ?? segment?.startAt ?? 0))
                 .filter(Number.isFinite)
-            : highlightSubtitles
+            : articleSubtitles
                 .map(sub => Number(normalizeSubtitle(sub).startAt || 0))
                 .filter(Number.isFinite);
         const shouldRebuildArticleFrames = rebuildTargets.length > 0 && (!isColumnTopicMode || !activeFrames || activeFrames.length === 0);
@@ -8243,7 +8473,7 @@ ${orderedFramesText}
                     ? '正在根據綜合教學段落、主副畫面關係與文章步驟組裝多模態教學文件...'
                 : `正在使用 ${articleProviderLabel} (${articleModelLabel}) 根據字幕、介紹欄 brief 與參考資料組裝文章...`
         );
-        updateArticleStatus({ stepCount: isCompositeTutorial ? (highlightSubtitles.length || compositeSegments.length) : highlightSubtitles.length });
+        updateArticleStatus({ stepCount: isCompositeTutorial ? (articleSubtitles.length || compositeSegments.length) : articleSubtitles.length });
         try {
             if (isCompositeTutorial) {
                 const doc = compositeReport?.doc && typeof compositeReport.doc === 'object' ? compositeReport.doc : {};
@@ -8264,7 +8494,7 @@ ${orderedFramesText}
                     main_action: cleanAiText(segment?.main_action || ''),
                     pip_action: cleanAiText(segment?.pip_action || '')
                 }));
-                const currentCompositeSubtitles = highlightSubtitles
+                const currentCompositeSubtitles = articleSubtitles
                     .map(normalizeSubtitle)
                     .sort((a, b) => a.startAt - b.startAt);
                 const safeSegments = currentCompositeSubtitles.length > 0
@@ -8586,11 +8816,11 @@ ${JSON.stringify(compositeArticleInput)}
                 return;
             }
 
-            const allSubtitlesSorted = [...highlightSubtitles].sort((a, b) => a.startAt - b.startAt);
+            const allSubtitlesSorted = [...articleSubtitles].sort((a, b) => a.startAt - b.startAt);
             // For tutorial skill: only keep subtitles that coincide with a click event.
             // Non-action narration subtitles have no corresponding click and should be skipped.
             const isTutorialOnlyMode = activeSkillId === 'tutorial';
-            const subtitles = isTutorialOnlyMode
+            const subtitles = isTutorialOnlyMode && !isScriptDerivedArticle
                 ? allSubtitlesSorted.filter(sub => {
                     const id = sub.clickId || findNearestArticleClickId(Number(sub.startAt || 0));
                     return !!id;
@@ -9825,21 +10055,21 @@ ${JSON.stringify(subtitlePayload)}
         const markdownExtraImageExports = activeSkill.editorMode === 'tutorial' ? articleCandidateExports : [];
         const activeExportName = activeSkill.exportFileName || 'export.md';
         if (exportSettings.includeMarkdown) {
-            const saveMarkdownWithAssets = async (markdown, filename, frames, extraImageExports = []) => {
+            const saveMarkdownWithAssets = async (markdown, filename, frames, extraImageExports = [], inlineImageExports = []) => {
                 if (!markdown) return;
                 const mdBlob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
                 await saveBlobToUserPath(mdBlob, filename);
+                const saveFrameAsJpeg = async (frame, outputName) => {
+                    if (!frame?.hdData || !outputName) return;
+                    const byteString = atob(frame.hdData);
+                    const arrayBuffer = new ArrayBuffer(byteString.length);
+                    const int8Array = new Uint8Array(arrayBuffer);
+                    for (let i = 0; i < byteString.length; i++) int8Array[i] = byteString.charCodeAt(i);
+                    const blob = new Blob([int8Array], { type: 'image/jpeg' });
+                    await saveBlobToUserPath(blob, outputName);
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                };
                 if (frames.length > 0) {
-                    const saveFrameAsJpeg = async (frame, outputName) => {
-                        if (!frame?.hdData || !outputName) return;
-                        const byteString = atob(frame.hdData);
-                        const arrayBuffer = new ArrayBuffer(byteString.length);
-                        const int8Array = new Uint8Array(arrayBuffer);
-                        for (let i = 0; i < byteString.length; i++) int8Array[i] = byteString.charCodeAt(i);
-                        const blob = new Blob([int8Array], { type: 'image/jpeg' });
-                        await saveBlobToUserPath(blob, outputName);
-                        await new Promise(resolve => setTimeout(resolve, 0));
-                    };
                     const imageRegex = /!\[(.*?)\]\(\.\/([a-z0-9_-]+)_(\d+)\.jpg\)/gi;
                     let match;
                     while ((match = imageRegex.exec(markdown)) !== null) {
@@ -9869,6 +10099,61 @@ ${JSON.stringify(subtitlePayload)}
                         }
                     }
                 }
+                for (const imageExport of inlineImageExports) {
+                    const frame = imageExport?.frame;
+                    const outputName = String(imageExport?.fileName || '').trim();
+                    if (!frame?.hdData || !outputName) continue;
+                    try {
+                        await saveFrameAsJpeg(frame, outputName);
+                    } catch (e) {
+                        console.warn('inline markdown image export failed', { filename, outputName, error: e });
+                    }
+                }
+            };
+
+            const prepareTutorialMarkdownImages = async (markdown, frames) => {
+                const imagePattern = /!\[([^\]]*)\]\(\.\/([^\)]+\.jpg)\)/gi;
+                const references = [...String(markdown || '').matchAll(imagePattern)];
+                if (!references.length) return { markdown, inlineImageExports: [] };
+
+                const existingFrames = Array.isArray(frames) ? frames.filter(frame => frame?.hdData) : [];
+                const findFrameForReference = (reference) => {
+                    const legacyMatch = String(reference[2] || '').match(/_([0-9]+)\.jpg$/i);
+                    const legacyFrameId = legacyMatch ? Number(legacyMatch[1]) : 0;
+                    return legacyFrameId
+                        ? existingFrames.find(frame => Number(frame?.frameId) === legacyFrameId) || null
+                        : null;
+                };
+                const extractScreenshotTime = (reference) => {
+                    const match = String(reference[1] || '').match(/(?:screenshot\s+at|截圖(?:時間)?\s*(?:於|at)?)\s*(\d+(?:\.\d+)?)\s*s?/i);
+                    return match ? Number(match[1]) : NaN;
+                };
+                const missingTimes = references
+                    .filter(reference => !findFrameForReference(reference))
+                    .map(extractScreenshotTime)
+                    .filter(Number.isFinite);
+                const rebuiltFrames = missingTimes.length > 0
+                    ? await captureFramesFromTimelineTargets([...new Set(missingTimes)], {
+                        settledDelaySeconds: 0.35,
+                        includeClickRipple: false
+                    })
+                    : [];
+                const allFrames = [...existingFrames, ...rebuiltFrames.filter(frame => frame?.hdData)];
+                const inlineImageExports = [];
+                let imageIndex = 0;
+                const preparedMarkdown = String(markdown).replace(imagePattern, (fullMatch, altText, originalPath) => {
+                    const reference = references[imageIndex++];
+                    const targetTime = extractScreenshotTime(reference);
+                    const directFrame = findFrameForReference(reference);
+                    const frame = directFrame || allFrames
+                        .filter(candidate => Number.isFinite(Number(candidate?.relativeTime)))
+                        .sort((a, b) => Math.abs(Number(a.relativeTime) - targetTime) - Math.abs(Number(b.relativeTime) - targetTime))[0];
+                    if (!frame?.hdData) return fullMatch;
+                    const fileName = `article_step_${String(imageIndex).padStart(2, '0')}.jpg`;
+                    inlineImageExports.push({ frame, fileName });
+                    return `![${altText}](./${fileName})`;
+                });
+                return { markdown: preparedMarkdown, inlineImageExports };
             };
 
             if (activeSkillId === 'ui-debug') {
@@ -9882,7 +10167,16 @@ ${JSON.stringify(subtitlePayload)}
                     await saveMarkdownWithAssets(activeMarkdown, activeExportName, activeFrames);
                 }
             } else if (activeMarkdown) {
-                await saveMarkdownWithAssets(activeMarkdown, activeExportName, activeFrames, markdownExtraImageExports);
+                const preparedArticle = activeSkill.editorMode === 'tutorial'
+                    ? await prepareTutorialMarkdownImages(activeMarkdown, activeFrames)
+                    : { markdown: activeMarkdown, inlineImageExports: [] };
+                await saveMarkdownWithAssets(
+                    preparedArticle.markdown,
+                    activeExportName,
+                    activeFrames,
+                    markdownExtraImageExports,
+                    preparedArticle.inlineImageExports
+                );
             }
         }
 
@@ -10244,8 +10538,46 @@ ${JSON.stringify(subtitlePayload)}
         }
 
         if (command.action === 'article.generate') {
-            await generateArticleFromSubtitles();
-            return { status: 'completed', detail: 'Article generation finished.', result: getAutomationSnapshot() };
+            const existingAiSubtitles = (projectStateRef.current.subtitles || [])
+                .map(normalizeSubtitle)
+                .filter(subtitle => subtitle.trackIndex === 1 && String(subtitle.text || '').trim());
+            const scriptSteps = Array.isArray(projectStateRef.current.automationScript?.steps)
+                ? projectStateRef.current.automationScript.steps.filter(step => String(step?.instruction || '').trim())
+                : [];
+            const shouldUseScriptSteps = existingAiSubtitles.length === 0 && scriptSteps.length > 0;
+            const scriptSubtitles = shouldUseScriptSteps
+                ? scriptSteps.map((step, index) => {
+                    const videoDuration = Math.max(3, Number(totalDuration) || scriptSteps.length * 6);
+                    const slotDuration = Math.max(3, Math.min(12, videoDuration / scriptSteps.length));
+                    const startAt = Number(Math.min(videoDuration - 0.8, 1.2 + index * slotDuration).toFixed(2));
+                    const endAt = Number(Math.min(videoDuration, Math.max(startAt + 1.8, startAt + slotDuration - 0.8)).toFixed(2));
+                    const instruction = String(step.instruction || '').trim();
+                    const expected = String(step.expected || '').trim();
+                    return normalizeSubtitle({
+                        id: `sub_script_${Date.now()}_${index + 1}`,
+                        trackIndex: 1,
+                        startAt,
+                        endAt,
+                        text: expected ? `${instruction}（確認：${expected}）` : instruction,
+                        scriptDerived: true
+                    });
+                })
+                : null;
+
+            if (scriptSubtitles) {
+                setProjectState(prev => ({
+                    ...prev,
+                    subtitles: [...prev.subtitles.filter(sub => !normalizeSubtitle(sub).scriptDerived), ...scriptSubtitles]
+                }));
+            }
+            await generateArticleFromSubtitles(scriptSubtitles);
+            return {
+                status: 'completed',
+                detail: scriptSubtitles
+                    ? 'Article generation finished using the completed UI script because this recording has no speech track.'
+                    : 'Article generation finished.',
+                result: getAutomationSnapshot()
+            };
         }
 
         if (command.action === 'voice.generate') {
@@ -10253,8 +10585,43 @@ ${JSON.stringify(subtitlePayload)}
             return { status: 'completed', detail: 'Voice generation finished.', result: getAutomationSnapshot() };
         }
 
+        if (command.action === 'contents.apply') {
+            const appliedContents = applyAutomaticContents(String(input.brief || input.topic || ''));
+            return {
+                status: 'completed',
+                detail: appliedContents.length
+                    ? `Automatically added ${appliedContents.length} narrative Contents layer(s).`
+                    : 'No Contents layer was added because the brief did not require a supporting visual.',
+                result: { ...getAutomationSnapshot(), contents: appliedContents }
+            };
+        }
+
         if (command.action === 'design.apply') {
+            const requestedAsset = HYPERFRAME_ASSETS.find(asset => asset.id === input.assetId);
+            if (requestedAsset) {
+                const startAt = Math.max(0, Number.isFinite(Number(input.startAt)) ? Number(input.startAt) : Number(currentTime.toFixed(2)));
+                const duration = Math.max(0.8, Math.min(10, Number(input.duration) || requestedAsset.duration || 4));
+                const endAt = Number(Math.max(startAt + 0.5, Math.min(totalDuration || startAt + duration, startAt + duration)).toFixed(2));
+                setProjectState(prev => ({
+                    ...prev,
+                    motionDesign: {
+                        ...DEFAULT_MOTION_DESIGN,
+                        ...(prev.motionDesign || {}),
+                        manualCards: [...(prev.motionDesign?.manualCards || []), {
+                            id: `hyperframe_asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                            text: requestedAsset.nameZh,
+                            creator: 'HYPERFRAMES',
+                            presetId: input.presetId || requestedAsset.presetId,
+                            assetId: requestedAsset.id,
+                            startAt,
+                            endAt
+                        }]
+                    }
+                }));
+                return { status: 'completed', detail: `${requestedAsset.nameZh} was added to the timeline.`, result: { assetId: requestedAsset.id, startAt, endAt } };
+            }
             const preset = getMotionDesignPreset(input.presetId || projectStateRef.current.motionDesign?.presetId);
+            const template = getHyperframeTemplate(input.templateId || projectStateRef.current.motionDesign?.hyperframeTemplateId);
             const mode = input.mode === 'manual' ? 'manual' : 'ai';
             const nextDuration = (value, fallback) => Math.max(0.8, Math.min(10, Number(value) || fallback));
             setProjectState(prev => ({
@@ -10263,6 +10630,7 @@ ${JSON.stringify(subtitlePayload)}
                     ...DEFAULT_MOTION_DESIGN,
                     ...(prev.motionDesign || {}),
                     presetId: preset.id,
+                    hyperframeTemplateId: template.id,
                     enabled: mode === 'ai' ? true : prev.motionDesign?.enabled,
                     aiAutoEnabled: mode === 'ai',
                     includeIntro: input.includeIntro ?? prev.motionDesign?.includeIntro ?? true,
@@ -10275,7 +10643,7 @@ ${JSON.stringify(subtitlePayload)}
                     cardDuration: nextDuration(input.cardDuration, prev.motionDesign?.cardDuration || DEFAULT_MOTION_DESIGN.cardDuration)
                 }
             }));
-            return { status: 'completed', detail: `${preset.name} design pack was applied.`, result: { presetId: preset.id, mode } };
+            return { status: 'completed', detail: `${preset.name} / ${template.nameZh} design pack was applied.`, result: { presetId: preset.id, templateId: template.id, mode } };
         }
 
         if (command.action === 'export.start') {
@@ -10294,7 +10662,7 @@ ${JSON.stringify(subtitlePayload)}
         }
 
         throw new Error(`Unsupported automation action: ${command.action}`);
-    }, [automationProjectId, generateAiSubtitles, generateAiVoice, generateArticleFromSubtitles, getAutomationSnapshot, isRecording, resetProjectHistory, setProjectState, settings.includeAudio, stopRecording]);
+    }, [applyAutomaticContents, automationProjectId, currentTime, generateAiSubtitles, generateAiVoice, generateArticleFromSubtitles, getAutomationSnapshot, isRecording, resetProjectHistory, setProjectState, settings.includeAudio, stopRecording, totalDuration]);
 
     useEffect(() => {
         setAutomationCommandHandler(handleAutomationCommand);
@@ -11764,6 +12132,15 @@ ${JSON.stringify(subtitlePayload)}
                             const easedProgress = 1 - Math.pow(1 - Math.min(1, layer.progress || 0), 3);
                             const layerPreset = getMotionDesignPreset(layer.presetId || motionDesign.presetId);
                             const layerCreator = layer.creator || motionDesignCopy.creator;
+                            if (layer.kind === 'hyperframe-asset') {
+                                const asset = HYPERFRAME_ASSETS.find(item => item.id === layer.assetId);
+                                if (!asset) return null;
+                                return (
+                                    <div key={`motion_${layer.kind}_${layer.id}`} className="absolute inset-0 z-[1725] flex items-center justify-center px-[12%] py-[8%]" style={{ opacity: easedProgress * (1 - (layer.exitProgress || 0)), transform: `translateY(${(1 - easedProgress + (layer.exitProgress || 0)) * 32}px)` }}>
+                                        <HyperframeAssetPreview asset={asset} className="h-full w-full max-h-[66%] max-w-[76%] shadow-2xl" />
+                                    </div>
+                                );
+                            }
                             if (layer.kind === 'lower-third') {
                                 const offset = (1 - easedProgress + (layer.exitProgress || 0)) * 24;
                                 return (
@@ -11880,6 +12257,7 @@ ${JSON.stringify(subtitlePayload)}
                                 ['assets', '素材'],
                                 ['cards', 'Cards'],
                                 ['intro-outro', 'Intro / Outro'],
+                                ['hyperframes', 'Contents'],
                                 ['ai-design', 'AI 設計']
                             ].map(([key, label]) => (
                                 <button
@@ -12015,6 +12393,50 @@ ${JSON.stringify(subtitlePayload)}
                                 <input value={motionDesign.title} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), title: e.target.value } }))} placeholder={`片頭標題（預設：${motionDesignFallbackTitle.slice(0, 24)}）`} className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-xs text-white placeholder:text-gray-500 focus:border-amber-300 focus:outline-none" />
                                 <input value={motionDesign.creator} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), creator: e.target.value } }))} placeholder="頻道 / 創作者名稱" className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-xs text-white placeholder:text-gray-500 focus:border-amber-300 focus:outline-none" />
                             </>
+                        )}
+
+                        {libraryTab === 'hyperframes' && (
+                            <div className="space-y-3">
+                                <div className="rounded-2xl border border-violet-300/25 bg-gradient-to-br from-violet-500/15 via-slate-900 to-cyan-500/10 p-4">
+                                    <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2 text-sm font-semibold text-white"><Sparkles size={16} className="text-violet-200" /> Contents 動態素材庫</div><button type="button" onClick={createDeploymentHyperframeDemo} className="rounded-lg bg-violet-300 px-2 py-1.5 text-[10px] font-bold text-gray-950 hover:bg-violet-200">建立部署教學示範</button></div>
+                                    <p className="mt-1 text-[11px] leading-5 text-gray-300">每個內容素材都有清楚的敘事用途與動態預覽；可手動加入，也能依主題自動挑選最多兩個必要視覺。</p>
+                                    <button type="button" onClick={() => applyAutomaticContents()} className="mt-3 w-full rounded-xl border border-violet-200/45 bg-violet-300/10 px-3 py-2 text-left text-[11px] font-semibold text-violet-100 transition hover:bg-violet-300 hover:text-gray-950">依目前主題自動加入 Contents <span className="ml-1 font-normal opacity-80">只選有敘事理由的素材</span></button>
+                                </div>
+                                <div>
+                                    <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-violet-100"><span>動態 Contents</span><span className="rounded bg-violet-400/10 px-2 py-0.5 text-violet-200">{HYPERFRAME_ASSETS.length} 種</span></div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {HYPERFRAME_ASSETS.map(asset => (
+                                            <button key={asset.id} type="button" onClick={() => addHyperframeAsset(asset)} className="overflow-hidden rounded-xl border border-gray-700 bg-gray-950/55 p-2 text-left transition hover:border-violet-300 hover:bg-violet-500/10" title={`加入播放頭：${asset.description}`}>
+                                                <HyperframeAssetPreview asset={asset} className="h-32 w-full" />
+                                                <div className="mt-2 flex items-center justify-between gap-2"><span className="truncate text-[12px] font-semibold text-white">{asset.nameZh}</span><span className="shrink-0 rounded bg-violet-400/10 px-1.5 py-0.5 text-[9px] text-violet-100">{asset.category}</span></div>
+                                                <p className="mt-1 line-clamp-2 min-h-8 text-[10px] leading-4 text-gray-400">{asset.description}</p>
+                                                <div className="mt-2 flex items-center justify-between text-[9px]"><span className="font-mono text-gray-500">{asset.catalogId}</span><span className="font-semibold text-violet-200">加入 · {asset.duration.toFixed(1)}s</span></div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="border-t border-gray-700/80 pt-3 text-[11px] font-semibold text-gray-300">整套影片風格</div>
+                                {HYPERFRAME_TEMPLATES.map(template => {
+                                    const templatePreset = getMotionDesignPreset(template.presetId);
+                                    const selected = motionDesign.hyperframeTemplateId === template.id;
+                                    return (
+                                        <div key={template.id} className={`overflow-hidden rounded-2xl border p-2 ${selected ? 'border-violet-300 bg-violet-500/10' : 'border-gray-700 bg-gray-950/45'}`}>
+                                            <div className="flex gap-3">
+                                                <DesignMotionPreview preset={templatePreset} variant="lower-third" duration={template.defaults.cardDuration} compact="half" templateId={template.id} />
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="text-xs font-semibold text-white">{template.nameZh}</div>
+                                                    <div className="mt-1 text-[10px] leading-4 text-gray-400">{template.description}</div>
+                                                    <div className="mt-2 flex flex-wrap gap-1">{template.catalogBlocks.slice(0, 3).map(block => <span key={block} className="rounded bg-violet-400/10 px-1.5 py-0.5 font-mono text-[9px] text-violet-100">{block}</span>)}</div>
+                                                </div>
+                                            </div>
+                                            <div className="mt-2 flex gap-2">
+                                                <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), hyperframeTemplateId: template.id, presetId: template.presetId } }))} className="flex-1 rounded-lg border border-violet-300/40 px-2 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-400 hover:text-gray-950">選擇風格</button>
+                                                <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), hyperframeTemplateId: template.id, presetId: template.presetId, enabled: true, aiAutoEnabled: true, manualIntroEnabled: false, manualOutroEnabled: false, ...getHyperframeTemplateDefaults(template.id) } }))} className="flex-1 rounded-lg bg-violet-400 px-2 py-1.5 text-[10px] font-bold text-gray-950 hover:bg-violet-300">套用整套</button>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         )}
 
                         {libraryTab === 'ai-design' && (

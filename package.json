@@ -1,7 +1,8 @@
 {
   "name": "video-rec-editor",
-  "private": true,
-  "version": "2.0",
+    "private": true,
+    "version": "2.0",
+    "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -1,0 +1,17 @@
+[
+  {"id":"hf-world-map","nameZh":"全球服務地圖","catalogId":"world-map","assetType":"world-map","category":"地圖／資料","description":"以區域節點與單一路徑清楚交代服務覆蓋範圍。","duration":4.5,"presetId":"signal","narrativeReason":"只用於跨區、全球服務或節點部署。"},
+  {"id":"hf-world-flow","nameZh":"跨區資料流向","catalogId":"world-map","assetType":"world-flow","category":"地圖／資料","description":"以來源、目的地與弧線說明一條資料或部署路徑。","duration":4.5,"presetId":"signal","narrativeReason":"只用於資料傳輸、物流或跨國部署。"},
+  {"id":"hf-data-chart","nameZh":"成效資料圖","catalogId":"data-chart","assetType":"data-chart","category":"地圖／資料","description":"以一組數字、柱狀與趨勢線呈現可比較的成果。","duration":4.0,"presetId":"editorial","narrativeReason":"只用於有可比較數據的段落。"},
+  {"id":"hf-flowchart","nameZh":"操作流程圖","catalogId":"flowchart","assetType":"flowchart","category":"圖解","description":"將輸入、處理、驗證收斂為一條清楚的操作流程。","duration":4.0,"presetId":"signal","narrativeReason":"只用於多步驟邏輯或決策流程。"},
+  {"id":"hf-console","nameZh":"部署終端機","catalogId":"code-snippet-apple-terminal-pro","assetType":"console","category":"程式碼","description":"採 Apple Terminal 視窗與逐行輸出，保留可驗證的部署狀態。","duration":4.2,"presetId":"signal","narrativeReason":"只用於 CLI、部署或健康檢查。"},
+  {"id":"hf-code-diff","nameZh":"程式碼差異","catalogId":"code-diff","assetType":"code-diff","category":"程式碼","description":"以新增與移除欄位分開呈現 release note 與 PR 的變更。","duration":4.2,"presetId":"signal","narrativeReason":"只用於版本變更或 PR 導覽。"},
+  {"id":"hf-code-typing","nameZh":"程式碼打字","catalogId":"code-typing","assetType":"code-typing","category":"程式碼","description":"逐行打字並顯示游標，適合快速示範設定片段。","duration":3.8,"presetId":"creator"},
+  {"id":"hf-app-showcase","nameZh":"應用程式展示","catalogId":"app-showcase","assetType":"app-showcase","category":"產品","description":"浮動介面卡與焦點按鈕，適合新功能介紹。","duration":4.0,"presetId":"editorial"},
+  {"id":"hf-device-reveal","nameZh":"手機裝置展示","catalogId":"vfx-iphone-device","assetType":"device-reveal","category":"產品","description":"手機框架從側面浮入，適合 App 或行動端功能。","duration":4.0,"presetId":"creator"},
+  {"id":"hf-liquid-glass","nameZh":"Liquid Glass 面板","catalogId":"ios26-liquid-glass","assetType":"liquid-glass","category":"產品","description":"半透明玻璃面板與柔光，適合高級感產品重點。","duration":3.8,"presetId":"signal"},
+  {"id":"hf-social-follow","nameZh":"社群追蹤卡","catalogId":"yt-lower-third","assetType":"social-follow","category":"社群","description":"頻道名稱、訂閱按鈕與提示文字，適合 CTA。","duration":3.2,"presetId":"creator"},
+  {"id":"hf-news-ticker","nameZh":"新聞跑馬燈","catalogId":"news-ticker","assetType":"news-ticker","category":"文字","description":"底部資訊帶持續滑動，適合公告、網址與重要提示。","duration":4.0,"presetId":"editorial"},
+  {"id":"hf-caption-highlight","nameZh":"關鍵字字幕","catalogId":"caption-highlight","assetType":"caption-highlight","category":"文字","description":"一句關鍵訊息搭配高亮字，適合教學重點或結論。","duration":3.2,"presetId":"creator"},
+  {"id":"hf-neon-code","nameZh":"霓虹程式碼矩陣","catalogId":"caption-matrix-decode","assetType":"neon-code","category":"程式碼","description":"霓虹資料列與掃描光，適合資安與技術感段落。","duration":3.8,"presetId":"creator"},
+  {"id":"hf-release-roadmap","nameZh":"版本路線圖","catalogId":"flowchart-vertical","assetType":"release-roadmap","category":"圖解","description":"三個版本節點依序亮起，適合計畫、版本與里程碑。","duration":4.2,"presetId":"signal"}
+]
