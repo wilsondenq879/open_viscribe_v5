@@ -1,11 +1,8 @@
 import { DEFAULT_MOTION_DESIGN, MOTION_DESIGN_PRESETS } from '../constants/appConstants';
 
-const INTRO_DURATION = 2.6;
-const OUTRO_DURATION = 3.1;
-const LOWER_THIRD_MAX_DURATION = 3.4;
-
 const clamp = (value, min = 0, max = 1) => Math.min(max, Math.max(min, value));
 const easeOutCubic = (value) => 1 - Math.pow(1 - clamp(value), 3);
+const normalizeDuration = (value, fallback) => clamp(Number.isFinite(Number(value)) ? Number(value) : fallback, 0.8, 10);
 export function getMotionDesignSettings(value) {
     const raw = value || {};
     const presetId = MOTION_DESIGN_PRESETS.some(item => item.id === raw.presetId)
@@ -15,13 +12,31 @@ export function getMotionDesignSettings(value) {
         ...DEFAULT_MOTION_DESIGN,
         ...raw,
         enabled: Boolean(raw.enabled),
+        aiAutoEnabled: raw.aiAutoEnabled === undefined ? Boolean(raw.enabled) : Boolean(raw.aiAutoEnabled),
         presetId,
         includeIntro: raw.includeIntro !== false,
         includeOutro: raw.includeOutro !== false,
         includeLowerThird: raw.includeLowerThird !== false,
         title: String(raw.title || '').trim(),
         creator: String(raw.creator || '').trim(),
-        cta: String(raw.cta || DEFAULT_MOTION_DESIGN.cta).trim() || DEFAULT_MOTION_DESIGN.cta
+        cta: String(raw.cta || DEFAULT_MOTION_DESIGN.cta).trim() || DEFAULT_MOTION_DESIGN.cta,
+        manualIntroEnabled: Boolean(raw.manualIntroEnabled),
+        manualOutroEnabled: Boolean(raw.manualOutroEnabled),
+        introDuration: normalizeDuration(raw.introDuration, DEFAULT_MOTION_DESIGN.introDuration),
+        outroDuration: normalizeDuration(raw.outroDuration, DEFAULT_MOTION_DESIGN.outroDuration),
+        cardDuration: normalizeDuration(raw.cardDuration, DEFAULT_MOTION_DESIGN.cardDuration),
+        manualCards: Array.isArray(raw.manualCards)
+            ? raw.manualCards
+                .map((card, index) => ({
+                    id: String(card?.id || `card_${index}`),
+                    text: String(card?.text || '').trim().slice(0, 92),
+                    creator: String(card?.creator || '').trim().slice(0, 44),
+                    presetId: MOTION_DESIGN_PRESETS.some(item => item.id === card?.presetId) ? card.presetId : presetId,
+                    startAt: Math.max(0, Number(card?.startAt) || 0),
+                    endAt: Math.max(0, Number(card?.endAt) || 0)
+                }))
+                .filter(card => card.text && card.endAt > card.startAt)
+            : []
     };
 }
 
@@ -41,35 +56,58 @@ export function getMotionDesignCopy(design, { fallbackTitle = '', fallbackCreato
 
 export function getMotionDesignLayers({ design, time, duration, subtitles = [] }) {
     const settings = getMotionDesignSettings(design);
-    if (!settings.enabled || duration <= 0) return [];
+    const autoEnabled = settings.aiAutoEnabled;
+    const hasManualLayers = settings.manualIntroEnabled || settings.manualOutroEnabled || settings.manualCards.length > 0;
+    if ((!autoEnabled && !hasManualLayers) || duration <= 0) return [];
     const layers = [];
     const safeTime = Math.max(0, Number(time) || 0);
+    const introEnabled = (autoEnabled && settings.includeIntro) || settings.manualIntroEnabled;
+    const outroEnabled = (autoEnabled && settings.includeOutro) || settings.manualOutroEnabled;
+    const introDuration = Math.min(settings.introDuration, duration);
+    const outroDuration = Math.min(settings.outroDuration, duration);
 
-    if (settings.includeOutro && safeTime >= Math.max(0, duration - OUTRO_DURATION)) {
-        const startAt = Math.max(0, duration - OUTRO_DURATION);
-        layers.push({ kind: 'outro', progress: clamp((safeTime - startAt) / OUTRO_DURATION) });
+    if (outroEnabled && safeTime >= Math.max(0, duration - outroDuration)) {
+        const startAt = Math.max(0, duration - outroDuration);
+        layers.push({ kind: 'outro', progress: clamp((safeTime - startAt) / outroDuration), presetId: settings.presetId });
         return layers;
     }
-    if (settings.includeIntro && safeTime <= Math.min(INTRO_DURATION, duration)) {
-        layers.push({ kind: 'intro', progress: clamp(safeTime / Math.min(INTRO_DURATION, duration)) });
+    if (introEnabled && safeTime <= introDuration) {
+        layers.push({ kind: 'intro', progress: clamp(safeTime / introDuration), presetId: settings.presetId });
     }
-    if (settings.includeLowerThird && (!settings.includeIntro || safeTime > Math.min(INTRO_DURATION, duration))) {
+    if (autoEnabled && settings.includeLowerThird && (!introEnabled || safeTime > introDuration)) {
         const activeSubtitle = subtitles
             .filter(item => Number.isFinite(Number(item?.startAt)) && String(item?.text || '').trim())
             .sort((a, b) => Number(b.startAt) - Number(a.startAt))
-            .find(item => safeTime >= Number(item.startAt) && safeTime <= Math.min(Number(item.endAt) || Infinity, Number(item.startAt) + LOWER_THIRD_MAX_DURATION));
+            .find(item => safeTime >= Number(item.startAt) && safeTime <= Math.min(Number(item.endAt) || Infinity, Number(item.startAt) + settings.cardDuration));
         if (activeSubtitle) {
             const elapsed = safeTime - Number(activeSubtitle.startAt);
-            const visibleDuration = Math.max(0.2, Math.min(Number(activeSubtitle.endAt) || Infinity, Number(activeSubtitle.startAt) + LOWER_THIRD_MAX_DURATION) - Number(activeSubtitle.startAt));
+            const visibleDuration = Math.max(0.2, Math.min(Number(activeSubtitle.endAt) || Infinity, Number(activeSubtitle.startAt) + settings.cardDuration) - Number(activeSubtitle.startAt));
             const exitProgress = visibleDuration > 0.5 ? clamp((elapsed - (visibleDuration - 0.35)) / 0.35) : 0;
             layers.push({
                 kind: 'lower-third',
                 progress: clamp(elapsed / 0.38),
                 exitProgress,
-                text: String(activeSubtitle.text || '').trim().slice(0, 92)
+                text: String(activeSubtitle.text || '').trim().slice(0, 92),
+                presetId: settings.presetId
             });
         }
     }
+    settings.manualCards
+        .filter(card => safeTime >= card.startAt && safeTime <= card.endAt)
+        .forEach(card => {
+            const duration = Math.max(0.2, card.endAt - card.startAt);
+            const elapsed = safeTime - card.startAt;
+            layers.push({
+                kind: 'lower-third',
+                id: card.id,
+                progress: clamp(elapsed / 0.38),
+                exitProgress: duration > 0.5 ? clamp((elapsed - (duration - 0.35)) / 0.35) : 0,
+                text: card.text,
+                creator: card.creator,
+                presetId: card.presetId,
+                manual: true
+            });
+        });
     return layers;
 }
 
@@ -226,13 +264,14 @@ export function drawMotionDesignToCanvas(ctx, canvas, { design, time, duration, 
     const settings = getMotionDesignSettings(design);
     const layers = getMotionDesignLayers({ design: settings, time, duration, subtitles });
     if (!layers.length) return;
-    const preset = getMotionDesignPreset(settings.presetId);
     const copy = getMotionDesignCopy(settings, { fallbackTitle, fallbackCreator });
     layers.forEach(layer => {
-        if (layer.kind === 'intro') drawIntro(ctx, canvas, layer, preset, copy);
-        if (layer.kind === 'outro') drawOutro(ctx, canvas, layer, preset, copy);
-        if (layer.kind === 'lower-third') drawLowerThird(ctx, canvas, layer, preset, copy);
+        const preset = getMotionDesignPreset(layer.presetId || settings.presetId);
+        const layerCopy = layer.creator ? { ...copy, creator: layer.creator } : copy;
+        if (layer.kind === 'intro') drawIntro(ctx, canvas, layer, preset, layerCopy);
+        if (layer.kind === 'outro') drawOutro(ctx, canvas, layer, preset, layerCopy);
+        if (layer.kind === 'lower-third') drawLowerThird(ctx, canvas, layer, preset, layerCopy);
     });
 }
 
-export const MOTION_DESIGN_TIMINGS = { INTRO_DURATION, OUTRO_DURATION, LOWER_THIRD_MAX_DURATION };
+export const MOTION_DESIGN_TIMINGS = { minimumDuration: 0.8, maximumDuration: 10 };

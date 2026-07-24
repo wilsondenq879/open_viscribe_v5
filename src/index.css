@@ -12,3 +12,38 @@
 .animate-ping {
   animation: ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
 }
+
+@keyframes design-preview-glow {
+  0%, 100% { transform: scale(0.88) translate3d(5%, -4%, 0); opacity: 0.42; }
+  50% { transform: scale(1.12) translate3d(-8%, 5%, 0); opacity: 0.82; }
+}
+
+@keyframes design-preview-lower-third {
+  0%, 12% { transform: translateX(-130%); opacity: 0; }
+  26%, 72% { transform: translateX(0); opacity: 1; }
+  88%, 100% { transform: translateX(130%); opacity: 0; }
+}
+
+@keyframes design-preview-intro {
+  0%, 10% { transform: translateY(18px); opacity: 0; }
+  25%, 76% { transform: translateY(0); opacity: 1; }
+  100% { transform: translateY(-8px); opacity: 0; }
+}
+
+@keyframes design-preview-outro {
+  0%, 13% { transform: translate(-50%, calc(-50% + 22px)) scale(0.9); opacity: 0; }
+  28%, 75% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  100% { transform: translate(-50%, calc(-50% - 8px)) scale(1.02); opacity: 0; }
+}
+
+.design-preview-glow { animation: design-preview-glow var(--design-preview-duration, 4.2s) ease-in-out infinite; }
+.design-preview-lower-third { animation: design-preview-lower-third var(--design-preview-duration, 4.2s) cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+.design-preview-intro { animation: design-preview-intro var(--design-preview-duration, 4.2s) cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+.design-preview-outro { animation: design-preview-outro var(--design-preview-duration, 4.2s) cubic-bezier(0.22, 1, 0.36, 1) infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .design-preview-glow,
+  .design-preview-lower-third,
+  .design-preview-intro,
+  .design-preview-outro { animation: none; opacity: 1; }
+}

@@ -1511,6 +1511,46 @@ function normalizeServerModelOptions(items, preferredKeys = []) {
     return options.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
 }
 
+function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2 }) {
+    const title = variant === 'lower-third' ? '關鍵操作提示' : '快速完成設定';
+    return (
+        <div
+            className="design-motion-preview relative aspect-video overflow-hidden rounded-xl border border-white/10"
+            style={{
+                backgroundColor: preset.background,
+                color: preset.foreground,
+                '--design-preview-duration': `${Math.min(6, Math.max(1.2, Number(duration) || 4.2))}s`
+            }}
+            aria-label={`${preset.name} ${variant} 動態預覽`}
+        >
+            <div className="design-preview-glow absolute -right-[12%] -top-[45%] h-[120%] w-[62%] rounded-full blur-2xl" style={{ backgroundColor: `${preset.accent}66` }} />
+            <div className="absolute inset-0 opacity-20" style={{ backgroundImage: `linear-gradient(112deg, transparent 0%, transparent 45%, ${preset.foreground} 45.35%, transparent 45.7%, transparent 66%, ${preset.foreground} 66.35%, transparent 66.7%)` }} />
+            {variant === 'lower-third' ? (
+                <div className="design-preview-lower-third absolute bottom-[12%] left-[7%] w-[70%] overflow-hidden rounded-lg border border-white/10 shadow-xl" style={{ backgroundColor: `${preset.surface}f2`, borderLeft: `4px solid ${preset.accent}` }}>
+                    <div className="px-3 py-2">
+                        <div className="mb-1 h-0.5 w-7 rounded-full" style={{ backgroundColor: preset.accentAlt }} />
+                        <div className="text-[7px] font-bold tracking-[0.16em]" style={{ color: preset.accent }}>OPEN VISCRIBE</div>
+                        <div className="mt-0.5 text-[11px] font-bold leading-tight" style={{ color: preset.foreground }}>{title}</div>
+                    </div>
+                </div>
+            ) : variant === 'outro' ? (
+                <div className="design-preview-outro absolute left-1/2 top-1/2 w-[70%] -translate-x-1/2 -translate-y-1/2 rounded-xl border px-3 py-3 text-center shadow-xl" style={{ backgroundColor: `${preset.surface}ee`, borderColor: preset.accent }}>
+                    <div className="text-[7px] font-bold tracking-[0.16em]" style={{ color: preset.accent }}>THANKS FOR WATCHING</div>
+                    <div className="mt-1 text-sm font-extrabold" style={{ color: preset.foreground }}>OPEN VISCRIBE</div>
+                    <div className="mt-1 text-[7px]" style={{ color: preset.muted }}>訂閱更多實用教學</div>
+                </div>
+            ) : (
+                <div className="design-preview-intro absolute left-[10%] top-[28%] max-w-[76%]">
+                    <div className="mb-2 h-1 w-12 rounded-full" style={{ backgroundColor: preset.accent }} />
+                    <div className="text-[7px] font-bold tracking-[0.17em]" style={{ color: preset.accent }}>OPEN VISCRIBE / VIDEO</div>
+                    <div className="mt-1 text-lg font-extrabold leading-tight" style={{ color: preset.foreground }}>{title}</div>
+                    <div className="mt-2 text-[7px] tracking-[0.14em]" style={{ color: preset.muted }}>OPEN VISCRIBE</div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 export default function App() {
     const [activeSkillId, setActiveSkillId] = useState(() => {
         const saved = localStorage.getItem('openviscribe_active_skill');
@@ -2181,10 +2221,6 @@ export default function App() {
         () => getMotionDesignCopy(motionDesign, { fallbackTitle: motionDesignFallbackTitle, fallbackCreator: 'OPEN VISCRIBE' }),
         [motionDesign, motionDesignFallbackTitle]
     );
-    const motionDesignPreset = useMemo(
-        () => getMotionDesignPreset(motionDesign.presetId),
-        [motionDesign.presetId]
-    );
     const motionDesignLayers = useMemo(
         () => getMotionDesignLayers({ design: motionDesign, time: currentTime, duration: totalDuration, subtitles: projectState.subtitles }),
         [motionDesign, currentTime, totalDuration, projectState.subtitles]
@@ -2252,10 +2288,46 @@ export default function App() {
 
     const [isLibraryOpen, setIsLibraryOpen] = useState(true);
     const [leftPanelWidth, setLeftPanelWidth] = useState(288);
-    const [libraryWidth, setLibraryWidth] = useState(320);
+    const [libraryWidth, setLibraryWidth] = useState(460);
     const [isResizingLeftPanel, setIsResizingLeftPanel] = useState(false);
     const [isResizingLibrary, setIsResizingLibrary] = useState(false);
     const [libraryTab, setLibraryTab] = useState('transitions');
+    const [manualCardText, setManualCardText] = useState('');
+    const addManualLowerThird = useCallback((presetId = motionDesign.presetId) => {
+        const subtitleAtPlayhead = projectState.subtitles
+            .filter(item => currentTime >= Number(item?.startAt || 0) && currentTime <= Number(item?.endAt || 0))
+            .sort((a, b) => Number(b?.startAt || 0) - Number(a?.startAt || 0))[0];
+        const text = manualCardText.trim() || String(subtitleAtPlayhead?.text || '').trim() || '輸入這段影片的重點';
+        const startAt = Math.max(0, Number(currentTime.toFixed(2)));
+        const endAt = Number(Math.max(startAt + 0.5, Math.min(totalDuration || startAt + motionDesign.cardDuration, startAt + motionDesign.cardDuration)).toFixed(2));
+        const newCard = {
+            id: `manual_card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            text,
+            creator: motionDesign.creator,
+            presetId,
+            startAt,
+            endAt
+        };
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: [...(prev.motionDesign?.manualCards || []), newCard]
+            }
+        }));
+        setManualCardText('');
+    }, [currentTime, manualCardText, motionDesign.cardDuration, motionDesign.creator, motionDesign.presetId, projectState.subtitles, setProjectState, totalDuration]);
+    const removeManualLowerThird = useCallback((cardId) => {
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: (prev.motionDesign?.manualCards || []).filter(card => card.id !== cardId)
+            }
+        }));
+    }, [setProjectState]);
     const {
         aiLoading,
         setAiLoading,
@@ -10525,95 +10597,6 @@ ${JSON.stringify(subtitlePayload)}
                                         </div>
                                         )}
                                     </div>
-                                    <div className="rounded-2xl border border-fuchsia-400/25 bg-gradient-to-br from-fuchsia-500/10 via-slate-900/70 to-cyan-500/10 p-4 space-y-4">
-                                        <div className="flex items-start gap-3">
-                                            <div className="mt-0.5 rounded-xl bg-fuchsia-400/15 p-2 text-fuchsia-200"><Sparkles size={18} /></div>
-                                            <div>
-                                                <div className="text-sm font-semibold text-white">AI 影片設計</div>
-                                                <div className="mt-1 text-[11px] leading-5 text-gray-300">以影片主題與 AI 字幕自動加上片頭、片尾與 lower third；預覽與匯出會使用同一套設計。</div>
-                                            </div>
-                                        </div>
-
-                                        <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
-                                            <div className="pr-2">
-                                                <div className="flex items-center gap-2 text-sm font-semibold text-white"><Wand2 size={15} className="text-fuchsia-300" /> 啟用 AI 自動套用</div>
-                                                <div className="mt-1 text-[11px] leading-4 text-gray-400">自動帶入文章主題、影片名稱與每段 AI 字幕，不必逐一放置字卡。</div>
-                                            </div>
-                                            <input
-                                                type="checkbox"
-                                                checked={motionDesign.enabled}
-                                                onChange={(e) => setProjectState(prev => ({
-                                                    ...prev,
-                                                    motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), enabled: e.target.checked }
-                                                }))}
-                                                className="h-4 w-4 shrink-0 rounded accent-fuchsia-500"
-                                            />
-                                        </label>
-
-                                        <div>
-                                            <div className="mb-2 text-[11px] font-medium text-gray-400">設計風格</div>
-                                            <div className="space-y-2">
-                                                {MOTION_DESIGN_PRESETS.map((preset) => {
-                                                    const selected = motionDesign.presetId === preset.id;
-                                                    return (
-                                                        <button
-                                                            key={preset.id}
-                                                            type="button"
-                                                            onClick={() => setProjectState(prev => ({
-                                                                ...prev,
-                                                                motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id }
-                                                            }))}
-                                                            className={`w-full rounded-xl border px-3 py-2.5 text-left transition ${selected ? 'border-fuchsia-300/70 bg-white/10 shadow-[0_0_18px_rgba(217,70,239,0.12)]' : 'border-gray-700 bg-black/20 hover:border-gray-500'}`}
-                                                        >
-                                                            <div className="flex items-center gap-2">
-                                                                <span className="h-3 w-3 rounded-full shadow-[0_0_12px_currentColor]" style={{ backgroundColor: preset.swatch, color: preset.swatch }} />
-                                                                <span className="text-xs font-semibold text-white">{preset.name}</span>
-                                                                {selected && <span className="ml-auto text-[10px] font-semibold text-fuchsia-200">已選擇</span>}
-                                                            </div>
-                                                            <div className="mt-1 text-[10px] leading-4 text-gray-400">{preset.description}</div>
-                                                        </button>
-                                                    );
-                                                })}
-                                            </div>
-                                        </div>
-
-                                        <div className="grid grid-cols-3 gap-2 text-[11px]">
-                                            {[
-                                                ['includeIntro', '片頭'],
-                                                ['includeOutro', '片尾'],
-                                                ['includeLowerThird', 'Lower third']
-                                            ].map(([key, label]) => (
-                                                <label key={key} className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-gray-700 bg-black/20 px-2 py-2 text-gray-300">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={motionDesign[key] !== false}
-                                                        onChange={(e) => setProjectState(prev => ({
-                                                            ...prev,
-                                                            motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), [key]: e.target.checked }
-                                                        }))}
-                                                        className="h-3.5 w-3.5 rounded accent-fuchsia-500"
-                                                    />
-                                                    <span>{label}</span>
-                                                </label>
-                                            ))}
-                                        </div>
-
-                                        <div className="grid grid-cols-1 gap-2">
-                                            <input
-                                                value={motionDesign.title}
-                                                onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), title: e.target.value } }))}
-                                                placeholder={`片頭標題（留白會使用「${motionDesignFallbackTitle.slice(0, 24)}」）`}
-                                                className="w-full rounded-lg border border-gray-700 bg-gray-950/80 px-3 py-2 text-xs text-white placeholder:text-gray-500 focus:border-fuchsia-400 focus:outline-none"
-                                            />
-                                            <input
-                                                value={motionDesign.creator}
-                                                onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), creator: e.target.value } }))}
-                                                placeholder="頻道 / 創作者名稱（預設 OPEN VISCRIBE）"
-                                                className="w-full rounded-lg border border-gray-700 bg-gray-950/80 px-3 py-2 text-xs text-white placeholder:text-gray-500 focus:border-fuchsia-400 focus:outline-none"
-                                            />
-                                        </div>
-                                    </div>
-
                                     <div className="space-y-3">
                                         <label className="block text-xs text-gray-400 mb-2">2. AI 智慧生成</label>
                                         <button onClick={generateAiSubtitles} className="w-full p-3 bg-gray-700 hover:bg-purple-600 rounded-xl flex items-center space-x-3 transition shadow-sm">
@@ -11495,6 +11478,8 @@ ${JSON.stringify(subtitlePayload)}
 
                         {!isRecording && motionDesignLayers.map((layer) => {
                             const easedProgress = 1 - Math.pow(1 - Math.min(1, layer.progress || 0), 3);
+                            const layerPreset = getMotionDesignPreset(layer.presetId || motionDesign.presetId);
+                            const layerCreator = layer.creator || motionDesignCopy.creator;
                             if (layer.kind === 'lower-third') {
                                 const offset = (1 - easedProgress + (layer.exitProgress || 0)) * 24;
                                 return (
@@ -11502,16 +11487,16 @@ ${JSON.stringify(subtitlePayload)}
                                         key={`motion_${layer.kind}_${layer.text}`}
                                         className="absolute left-[6.5%] bottom-[11%] z-[1700] w-[53%] overflow-hidden rounded-xl border border-white/10 shadow-2xl"
                                         style={{
-                                            backgroundColor: `${motionDesignPreset.surface}ee`,
-                                            borderLeft: `6px solid ${motionDesignPreset.accent}`,
+                                            backgroundColor: `${layerPreset.surface}ee`,
+                                            borderLeft: `6px solid ${layerPreset.accent}`,
                                             opacity: easedProgress * (1 - (layer.exitProgress || 0)),
                                             transform: `translateX(${offset}%)`
                                         }}
                                     >
                                         <div className="px-5 py-3">
-                                            <div className="mb-1 h-1 w-12 rounded-full" style={{ backgroundColor: motionDesignPreset.accentAlt }} />
-                                            <div className="text-[10px] font-bold tracking-[0.16em]" style={{ color: motionDesignPreset.accent }}>{motionDesignCopy.creator.toUpperCase()}</div>
-                                            <div className="mt-1 text-base font-bold leading-snug" style={{ color: motionDesignPreset.foreground }}>{layer.text}</div>
+                                            <div className="mb-1 h-1 w-12 rounded-full" style={{ backgroundColor: layerPreset.accentAlt }} />
+                                            <div className="text-[10px] font-bold tracking-[0.16em]" style={{ color: layerPreset.accent }}>{layerCreator.toUpperCase()}</div>
+                                            <div className="mt-1 text-base font-bold leading-snug" style={{ color: layerPreset.foreground }}>{layer.text}</div>
                                         </div>
                                     </div>
                                 );
@@ -11523,22 +11508,22 @@ ${JSON.stringify(subtitlePayload)}
                                 <div
                                     key={`motion_${layer.kind}`}
                                     className="absolute inset-0 z-[1750] overflow-hidden"
-                                    style={{ backgroundColor: motionDesignPreset.background, opacity: isIntro && layer.progress > 0.84 ? Math.max(0.28, 1 - (layer.progress - 0.84) / 0.16) : 0.98 }}
+                                    style={{ backgroundColor: layerPreset.background, opacity: isIntro && layer.progress > 0.84 ? Math.max(0.28, 1 - (layer.progress - 0.84) / 0.16) : 0.98 }}
                                 >
-                                    <div className="absolute -right-[12%] -top-[32%] h-[86%] w-[56%] rounded-full blur-3xl" style={{ backgroundColor: `${motionDesignPreset.accent}55` }} />
-                                    <div className="absolute inset-0 opacity-15" style={{ backgroundImage: `linear-gradient(112deg, transparent 0%, transparent 45%, ${motionDesignPreset.foreground} 45.15%, transparent 45.3%, transparent 62%, ${motionDesignPreset.foreground} 62.15%, transparent 62.3%)` }} />
+                                    <div className="absolute -right-[12%] -top-[32%] h-[86%] w-[56%] rounded-full blur-3xl" style={{ backgroundColor: `${layerPreset.accent}55` }} />
+                                    <div className="absolute inset-0 opacity-15" style={{ backgroundImage: `linear-gradient(112deg, transparent 0%, transparent 45%, ${layerPreset.foreground} 45.15%, transparent 45.3%, transparent 62%, ${layerPreset.foreground} 62.15%, transparent 62.3%)` }} />
                                     {isIntro ? (
                                         <div className="absolute left-[10.5%] top-[33%] max-w-[74%]" style={{ transform: `translateY(${verticalOffset}px)`, opacity: easedProgress }}>
-                                            <div className="mb-5 h-1.5 w-24 rounded-full" style={{ backgroundColor: motionDesignPreset.accent }} />
-                                            <div className="text-[11px] font-bold tracking-[0.18em]" style={{ color: motionDesignPreset.accent }}>OPEN VISCRIBE / AI EDITED</div>
-                                            <div className="mt-3 text-4xl font-extrabold leading-tight" style={{ color: motionDesignPreset.foreground }}>{motionDesignCopy.title}</div>
-                                            <div className="mt-7 text-sm font-medium tracking-[0.14em]" style={{ color: motionDesignPreset.muted }}>{motionDesignCopy.creator.toUpperCase()}</div>
+                                            <div className="mb-5 h-1.5 w-24 rounded-full" style={{ backgroundColor: layerPreset.accent }} />
+                                            <div className="text-[11px] font-bold tracking-[0.18em]" style={{ color: layerPreset.accent }}>OPEN VISCRIBE / VIDEO DESIGN</div>
+                                            <div className="mt-3 text-4xl font-extrabold leading-tight" style={{ color: layerPreset.foreground }}>{motionDesignCopy.title}</div>
+                                            <div className="mt-7 text-sm font-medium tracking-[0.14em]" style={{ color: layerPreset.muted }}>{layerCreator.toUpperCase()}</div>
                                         </div>
                                     ) : (
-                                        <div className="absolute left-1/2 top-1/2 w-[66%] -translate-x-1/2 -translate-y-1/2 rounded-3xl border-2 px-8 py-9 text-center shadow-2xl" style={{ backgroundColor: `${motionDesignPreset.surface}ee`, borderColor: motionDesignPreset.accent, transform: `translate(-50%, calc(-50% + ${verticalOffset}px))`, opacity: easedProgress }}>
-                                            <div className="text-[11px] font-bold tracking-[0.18em]" style={{ color: motionDesignPreset.accent }}>THANKS FOR WATCHING</div>
-                                            <div className="mt-4 text-3xl font-extrabold" style={{ color: motionDesignPreset.foreground }}>{motionDesignCopy.creator}</div>
-                                            <div className="mt-4 text-sm" style={{ color: motionDesignPreset.muted }}>{motionDesignCopy.cta}</div>
+                                        <div className="absolute left-1/2 top-1/2 w-[66%] -translate-x-1/2 -translate-y-1/2 rounded-3xl border-2 px-8 py-9 text-center shadow-2xl" style={{ backgroundColor: `${layerPreset.surface}ee`, borderColor: layerPreset.accent, transform: `translate(-50%, calc(-50% + ${verticalOffset}px))`, opacity: easedProgress }}>
+                                            <div className="text-[11px] font-bold tracking-[0.18em]" style={{ color: layerPreset.accent }}>THANKS FOR WATCHING</div>
+                                            <div className="mt-4 text-3xl font-extrabold" style={{ color: layerPreset.foreground }}>{layerCreator}</div>
+                                            <div className="mt-4 text-sm" style={{ color: layerPreset.muted }}>{motionDesignCopy.cta}</div>
                                         </div>
                                     )}
                                 </div>
@@ -11588,7 +11573,10 @@ ${JSON.stringify(subtitlePayload)}
                     </button>
 
                     <div className="p-4 border-b border-gray-700 flex justify-between items-center w-full min-w-0">
-                        <h2 className="font-semibold text-sm">素材庫 Branding</h2>
+                        <div>
+                            <h2 className="font-semibold text-sm">素材庫</h2>
+                            <div className="mt-1 text-[10px] text-gray-500">素材、轉場與影片設計</div>
+                        </div>
 
                         <input type="file" ref={fileInputRef} style={{ display: 'none' }} multiple accept="video/*,image/*,audio/*" onChange={handleImportAssets} />
 
@@ -11602,26 +11590,28 @@ ${JSON.stringify(subtitlePayload)}
                     </div>
 
                     <div className="px-2 pt-2 w-full min-w-0">
-                        <div className="grid grid-cols-2 gap-2 rounded-xl bg-gray-900/80 p-1 border border-gray-700">
-                            <button
-                                type="button"
-                                onClick={() => setLibraryTab('transitions')}
-                                className={`rounded-lg px-3 py-2 text-xs font-medium transition ${libraryTab === 'transitions' ? 'bg-cyan-500 text-white shadow-sm' : 'text-gray-300 hover:bg-gray-800'}`}
-                            >
-                                過場
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setLibraryTab('assets')}
-                                className={`rounded-lg px-3 py-2 text-xs font-medium transition ${libraryTab === 'assets' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-300 hover:bg-gray-800'}`}
-                            >
-                                素材
-                            </button>
+                        <div className="flex flex-wrap gap-1 rounded-xl bg-gray-900/80 p-1 border border-gray-700">
+                            {[
+                                ['transitions', '過場'],
+                                ['assets', '素材'],
+                                ['cards', 'Cards'],
+                                ['intro-outro', 'Intro / Outro'],
+                                ['ai-design', 'AI 設計']
+                            ].map(([key, label]) => (
+                                <button
+                                    key={key}
+                                    type="button"
+                                    onClick={() => setLibraryTab(key)}
+                                    className={`rounded-lg px-2.5 py-2 text-[11px] font-medium transition ${libraryTab === key ? 'bg-fuchsia-600 text-white shadow-sm' : 'text-gray-300 hover:bg-gray-800'}`}
+                                >
+                                    {label}
+                                </button>
+                            ))}
                         </div>
                     </div>
 
-                    <div className="flex-1 p-2 space-y-2 overflow-y-auto w-full min-w-0">
-                        {(libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems).map((asset, i) => (
+                    <div className="flex-1 p-3 space-y-3 overflow-y-auto w-full min-w-0">
+                        {(libraryTab === 'transitions' || libraryTab === 'assets') && (libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems).map((asset, i) => (
                             <div
                                 key={i}
                                 draggable
@@ -11649,11 +11639,128 @@ ${JSON.stringify(subtitlePayload)}
                                 <GripVertical size={12} className="text-gray-500 ml-auto flex-shrink-0 opacity-50" />
                             </div>
                         ))}
-                        {(libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems).length === 0 && (
+                        {(libraryTab === 'transitions' || libraryTab === 'assets') && (libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems).length === 0 && (
                             <div className="text-center text-xs text-gray-500 mt-10 pointer-events-none">
                                 {libraryTab === 'transitions'
                                     ? <>暫無過場</>
                                     : <>暫無素材<br />點擊上方資料夾圖示匯入</>}
+                            </div>
+                        )}
+
+                        {libraryTab === 'cards' && (
+                            <>
+                                <div className="rounded-2xl border border-cyan-400/25 bg-cyan-500/10 p-4">
+                                    <div className="flex items-center gap-2 text-sm font-semibold text-white"><Type size={16} className="text-cyan-300" /> 手動 Lower Third</div>
+                                    <div className="mt-1 text-[11px] leading-5 text-gray-300">在目前播放頭加入一張可獨立保留、刪除的設計字卡，不需要啟用 AI。</div>
+                                    <textarea
+                                        value={manualCardText}
+                                        onChange={(e) => setManualCardText(e.target.value)}
+                                        placeholder="輸入字卡重點；留白時會使用目前字幕"
+                                        className="mt-3 h-20 w-full resize-none rounded-xl border border-gray-700 bg-gray-950/80 px-3 py-2 text-xs text-white placeholder:text-gray-500 focus:border-cyan-400 focus:outline-none"
+                                    />
+                                    <label className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-gray-700 bg-gray-950/60 px-3 py-2">
+                                        <span className="text-[11px] text-gray-300">新字卡持續秒數</span>
+                                        <span className="flex items-center gap-1 text-xs text-cyan-100"><input type="number" min="0.8" max="10" step="0.1" value={motionDesign.cardDuration} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), cardDuration: Number(e.target.value) } }))} className="w-14 rounded border border-gray-600 bg-gray-900 px-2 py-1 text-right text-xs text-white focus:border-cyan-300 focus:outline-none" /> 秒</span>
+                                    </label>
+                                    <div className="mt-3 grid grid-cols-1 gap-3">
+                                        {MOTION_DESIGN_PRESETS.map(preset => (
+                                            <button
+                                                key={preset.id}
+                                                type="button"
+                                                onClick={() => addManualLowerThird(preset.id)}
+                                                className="overflow-hidden rounded-xl border border-gray-600 bg-gray-900 p-2 text-left transition hover:border-cyan-300 hover:bg-gray-800"
+                                            >
+                                                <DesignMotionPreview preset={preset} variant="lower-third" duration={motionDesign.cardDuration} />
+                                                <div className="mt-2 flex items-center justify-between gap-2">
+                                                    <span className="text-xs font-semibold text-white"><span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ backgroundColor: preset.swatch }} />{preset.name}</span>
+                                                    <span className="text-[10px] text-cyan-200">加入播放頭</span>
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="space-y-2">
+                                    <div className="text-[11px] font-medium text-gray-400">已加入的 Cards</div>
+                                    {motionDesign.manualCards.length === 0 ? (
+                                        <div className="rounded-xl border border-dashed border-gray-700 px-3 py-6 text-center text-xs text-gray-500">尚未加入手動字卡</div>
+                                    ) : motionDesign.manualCards.map(card => (
+                                        <div key={card.id} className="rounded-xl border border-gray-700 bg-gray-900/70 p-3">
+                                            <div className="flex items-start gap-2">
+                                                <span className="mt-1 h-2.5 w-2.5 rounded-full" style={{ backgroundColor: getMotionDesignPreset(card.presetId).accent }} />
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="truncate text-xs font-semibold text-white">{card.text}</div>
+                                                    <label className="mt-1 flex items-center gap-1 text-[10px] text-gray-400">{card.startAt.toFixed(1)}s 起，持續 <input type="number" min="0.8" max="10" step="0.1" value={Number((card.endAt - card.startAt).toFixed(1))} onChange={(e) => { const nextDuration = Math.max(0.8, Math.min(10, Number(e.target.value) || motionDesign.cardDuration)); setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), manualCards: (prev.motionDesign?.manualCards || []).map(item => item.id === card.id ? { ...item, endAt: Number((item.startAt + nextDuration).toFixed(2)) } : item) } })); }} className="w-12 rounded border border-gray-600 bg-gray-950 px-1 py-0.5 text-right text-[10px] text-white focus:border-cyan-300 focus:outline-none" /> 秒</label>
+                                                </div>
+                                                <button type="button" onClick={() => removeManualLowerThird(card.id)} className="rounded px-2 py-1 text-[10px] text-gray-400 hover:bg-red-500/20 hover:text-red-200">移除</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </>
+                        )}
+
+                        {libraryTab === 'intro-outro' && (
+                            <>
+                                <div className="rounded-2xl border border-amber-400/25 bg-amber-500/10 p-4">
+                                    <div className="flex items-center gap-2 text-sm font-semibold text-white"><MonitorPlay size={16} className="text-amber-300" /> 手動 Intro / Outro</div>
+                                    <div className="mt-1 text-[11px] leading-5 text-gray-300">選一套設計後，直接把片頭或片尾加到影片首尾；不會開啟 AI 自動字卡。</div>
+                                    <div className="mt-3 grid grid-cols-2 gap-2">
+                                        <label className="rounded-xl border border-gray-700 bg-gray-950/60 px-3 py-2 text-[10px] text-gray-400">片頭秒數<input type="number" min="0.8" max="10" step="0.1" value={motionDesign.introDuration} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), introDuration: Number(e.target.value) } }))} className="mt-1 w-full rounded border border-gray-600 bg-gray-900 px-2 py-1 text-right text-xs text-white focus:border-amber-300 focus:outline-none" /></label>
+                                        <label className="rounded-xl border border-gray-700 bg-gray-950/60 px-3 py-2 text-[10px] text-gray-400">片尾秒數<input type="number" min="0.8" max="10" step="0.1" value={motionDesign.outroDuration} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), outroDuration: Number(e.target.value) } }))} className="mt-1 w-full rounded border border-gray-600 bg-gray-900 px-2 py-1 text-right text-xs text-white focus:border-amber-300 focus:outline-none" /></label>
+                                    </div>
+                                    <div className="mt-3 space-y-3">
+                                        {MOTION_DESIGN_PRESETS.map(preset => (
+                                            <div
+                                                key={preset.id}
+                                                className={`overflow-hidden rounded-xl border p-2 ${motionDesign.presetId === preset.id ? 'border-amber-300 bg-white/10' : 'border-gray-700 bg-gray-950/40'}`}
+                                            >
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <DesignMotionPreview preset={preset} variant="intro" duration={motionDesign.introDuration} />
+                                                    <DesignMotionPreview preset={preset} variant="outro" duration={motionDesign.outroDuration} />
+                                                </div>
+                                                <div className="mt-2 flex items-center gap-2">
+                                                    <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id } }))} className="min-w-0 flex-1 text-left">
+                                                        <span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: preset.swatch }} />
+                                                        <span className="text-xs font-semibold text-white">{preset.name}</span>
+                                                        <span className="mt-1 block text-[10px] leading-4 text-gray-400">{preset.description}</span>
+                                                    </button>
+                                                    <div className="flex shrink-0 gap-1.5">
+                                                        <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id, manualIntroEnabled: true } }))} className="rounded-md border border-amber-300/50 px-2 py-1.5 text-[10px] font-semibold text-amber-100 hover:bg-amber-400 hover:text-gray-950">加片頭</button>
+                                                        <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id, manualOutroEnabled: true } }))} className="rounded-md border border-amber-300/50 px-2 py-1.5 text-[10px] font-semibold text-amber-100 hover:bg-amber-400 hover:text-gray-950">加片尾</button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="mt-3 grid grid-cols-2 gap-2">
+                                        <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), manualIntroEnabled: !motionDesign.manualIntroEnabled } }))} className={`rounded-lg px-3 py-2 text-xs font-semibold ${motionDesign.manualIntroEnabled ? 'bg-amber-400 text-gray-950' : 'border border-amber-300/50 text-amber-100 hover:bg-amber-400/10'}`}>{motionDesign.manualIntroEnabled ? '移除已加入片頭' : '目前未加入片頭'}</button>
+                                        <button type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), manualOutroEnabled: !motionDesign.manualOutroEnabled } }))} className={`rounded-lg px-3 py-2 text-xs font-semibold ${motionDesign.manualOutroEnabled ? 'bg-amber-400 text-gray-950' : 'border border-amber-300/50 text-amber-100 hover:bg-amber-400/10'}`}>{motionDesign.manualOutroEnabled ? '移除已加入片尾' : '目前未加入片尾'}</button>
+                                    </div>
+                                </div>
+                                <input value={motionDesign.title} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), title: e.target.value } }))} placeholder={`片頭標題（預設：${motionDesignFallbackTitle.slice(0, 24)}）`} className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-xs text-white placeholder:text-gray-500 focus:border-amber-300 focus:outline-none" />
+                                <input value={motionDesign.creator} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), creator: e.target.value } }))} placeholder="頻道 / 創作者名稱" className="w-full rounded-xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-xs text-white placeholder:text-gray-500 focus:border-amber-300 focus:outline-none" />
+                            </>
+                        )}
+
+                        {libraryTab === 'ai-design' && (
+                            <div className="rounded-2xl border border-fuchsia-400/25 bg-gradient-to-br from-fuchsia-500/10 via-slate-900/70 to-cyan-500/10 p-4 space-y-4">
+                                <div className="flex items-start gap-3">
+                                    <div className="rounded-xl bg-fuchsia-400/15 p-2 text-fuchsia-200"><Sparkles size={18} /></div>
+                                    <div><div className="text-sm font-semibold text-white">AI 自動設計</div><div className="mt-1 text-[11px] leading-5 text-gray-300">讀取影片主題與 AI 字幕，自動套用片頭、片尾及每段 lower third。</div></div>
+                                </div>
+                                <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
+                                    <div><div className="flex items-center gap-2 text-sm font-semibold text-white"><Wand2 size={15} className="text-fuchsia-300" /> 啟用 AI 自動套用</div><div className="mt-1 text-[11px] text-gray-400">手動 Cards 與 Intro / Outro 不受此開關影響。</div></div>
+                                    <input type="checkbox" checked={motionDesign.aiAutoEnabled} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), enabled: e.target.checked, aiAutoEnabled: e.target.checked } }))} className="h-4 w-4 shrink-0 rounded accent-fuchsia-500" />
+                                </label>
+                                <div className="grid grid-cols-3 gap-2 text-[11px]">{[['includeIntro', '片頭'], ['includeOutro', '片尾'], ['includeLowerThird', '字卡']].map(([key, label]) => <label key={key} className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-gray-700 bg-black/20 px-2 py-2 text-gray-300"><input type="checkbox" checked={motionDesign[key] !== false} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), [key]: e.target.checked } }))} className="h-3.5 w-3.5 rounded accent-fuchsia-500" />{label}</label>)}</div>
+                                <div className="space-y-3">
+                                    {MOTION_DESIGN_PRESETS.map(preset => (
+                                        <button key={preset.id} type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id } }))} className={`w-full overflow-hidden rounded-xl border p-2 text-left ${motionDesign.presetId === preset.id ? 'border-fuchsia-300 bg-white/10' : 'border-gray-700 bg-black/20 hover:border-fuchsia-300/60'}`}>
+                                            <DesignMotionPreview preset={preset} variant="lower-third" duration={motionDesign.cardDuration} />
+                                            <div className="mt-2"><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: preset.swatch }} /><span className="text-xs font-semibold text-white">{preset.name}</span><span className="ml-2 text-[10px] text-gray-400">動態預覽</span></div>
+                                        </button>
+                                    ))}
+                                </div>
                             </div>
                         )}
                     </div>

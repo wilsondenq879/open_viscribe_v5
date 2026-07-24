@@ -60,7 +60,7 @@ export const RESERVED_EDITOR_HEIGHT = 200;
 export const MIN_LEFT_PANEL_WIDTH = 280;
 export const MAX_LEFT_PANEL_WIDTH = 520;
 export const MIN_LIBRARY_PANEL_WIDTH = 240;
-export const MAX_LIBRARY_PANEL_WIDTH = 520;
+export const MAX_LIBRARY_PANEL_WIDTH = 680;
 export const MIN_TIMELINE_ZOOM = 0.4;
 export const MAX_TIMELINE_ZOOM = 3;
 export const LOCAL_OLLAMA_ENDPOINT = 'http://localhost:11434';
@@ -128,10 +128,17 @@ export const MOTION_DESIGN_PRESETS = [
 
 export const DEFAULT_MOTION_DESIGN = {
     enabled: false,
+    aiAutoEnabled: false,
     presetId: 'signal',
     includeIntro: true,
     includeOutro: true,
     includeLowerThird: true,
+    manualIntroEnabled: false,
+    manualOutroEnabled: false,
+    manualCards: [],
+    introDuration: 2.6,
+    outroDuration: 3.1,
+    cardDuration: 3.5,
     title: '',
     creator: '',
     cta: '訂閱以取得更多教學'
