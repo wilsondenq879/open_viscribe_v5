@@ -1,6 +1,7 @@
 import {
     DEFAULT_CLIP_LAYOUT,
     DEFAULT_KEN_BURNS_VIEWPORT,
+    DEFAULT_MOTION_DESIGN,
     DEFAULT_UI_DEBUG_CHECKS,
     SUBTITLE_TRACKS
 } from '../constants/appConstants';
@@ -20,6 +21,7 @@ export function createEmptyProjectState() {
         articleTopic: '',
         articlePerspective: 'kol',
         articleIncludeClickHighlight: true,
+        motionDesign: { ...DEFAULT_MOTION_DESIGN },
         uxResearchFlowName: '',
         uxResearchGoal: '',
         uxResearchAudience: '',
@@ -271,6 +273,7 @@ export function normalizeProjectState(state) {
         subtitles: normalizedSubtitles,
         subtitleTransitions: normalizedSubtitleTransitions,
         assets: Array.isArray(safe.assets) ? safe.assets : [],
+        motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(safe.motionDesign || {}) },
         clickEventLog: Array.isArray(safe.clickEventLog) ? safe.clickEventLog : [],
         debugEventLog: Array.isArray(safe.debugEventLog) ? safe.debugEventLog : []
     };

@@ -85,6 +85,58 @@ export const DEFAULT_SUBTITLE_STYLE = {
     y: 88
 };
 
+// Motion-design packs are intentionally opinionated so an automatically styled
+// tutorial looks designed instead of like a generic subtitle overlay.
+export const MOTION_DESIGN_PRESETS = [
+    {
+        id: 'signal',
+        name: 'Signal Studio',
+        description: '深海藍、琥珀與細緻技術線條，適合產品教學與科技內容。',
+        swatch: '#ffad5a',
+        background: '#101a28',
+        surface: '#16263a',
+        foreground: '#f6f1e8',
+        muted: '#b6c6d5',
+        accent: '#ffad5a',
+        accentAlt: '#64d7ff'
+    },
+    {
+        id: 'editorial',
+        name: 'Editorial Warmth',
+        description: '暖白紙感、酒紅與墨黑，適合故事型教學與觀點影片。',
+        swatch: '#b23d35',
+        background: '#f4efe6',
+        surface: '#e9ddcb',
+        foreground: '#24201d',
+        muted: '#655d55',
+        accent: '#b23d35',
+        accentAlt: '#d78a42'
+    },
+    {
+        id: 'creator',
+        name: 'Creator Pulse',
+        description: '墨黑、酸萊姆與紫紅的節奏感，適合 Shorts 與創作者內容。',
+        swatch: '#d9ff5a',
+        background: '#15151b',
+        surface: '#23232d',
+        foreground: '#f6f4ee',
+        muted: '#bdbbc7',
+        accent: '#d9ff5a',
+        accentAlt: '#fa4f9a'
+    }
+];
+
+export const DEFAULT_MOTION_DESIGN = {
+    enabled: false,
+    presetId: 'signal',
+    includeIntro: true,
+    includeOutro: true,
+    includeLowerThird: true,
+    title: '',
+    creator: '',
+    cta: '訂閱以取得更多教學'
+};
+
 export const SUBTITLE_TRACKS = [
     { key: 'user', label: '用戶字幕 S1', shortLabel: 'S1', colorClass: 'text-cyan-300', emptyHint: '手動新增的字幕與旁白轉字幕結果會顯示在這一列，避免和 AI 字幕軌混在一起。' },
     { key: 'ai', label: 'AI字幕 S2', shortLabel: 'S2', colorClass: 'text-amber-300', emptyHint: 'AI字幕結果固定顯示在這一列。若要手動補字，建議加在 S1 用戶字幕軌。' }
