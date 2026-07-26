@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenViscribe",
-  "version": "2.0",
+  "version": "2.0.9",
   "description": "OpenViscribe browser extension.",
   "permissions": [
     "storage",
@@ -11,7 +11,19 @@
     "activeTab"
   ],
   "action": {
-    "default_title": "OpenViscribe"
+    "default_title": "OpenViscribe",
+    "default_icon": {
+      "16": "icons/openviscribe-16.png",
+      "32": "icons/openviscribe-32.png",
+      "48": "icons/openviscribe-48.png",
+      "128": "icons/openviscribe-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/openviscribe-16.png",
+    "32": "icons/openviscribe-32.png",
+    "48": "icons/openviscribe-48.png",
+    "128": "icons/openviscribe-128.png"
   },
   "background": {
     "service_worker": "background.js"

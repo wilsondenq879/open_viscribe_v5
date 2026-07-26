@@ -43,6 +43,39 @@ const actionTools = [
         inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'] }
     },
     {
+        name: 'openviscribe_apply_agent_content',
+        description: 'Apply copy and timed subtitles written by the calling agent directly into OpenViscribe. This does not call Azure, Gemini, or any Studio AI provider: generate the Traditional Chinese copy yourself, then send it here. It can replace or append subtitle cues and optionally set the project topic, tutorial brief, and finished Markdown article.',
+        action: 'agent.content.apply',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                subtitles: {
+                    type: 'array',
+                    description: 'Timed subtitle / narration cues authored by the agent. Every cue needs text, startAt, and endAt in seconds.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            text: { type: 'string' },
+                            startAt: { type: 'number', minimum: 0 },
+                            endAt: { type: 'number', minimum: 0 },
+                            trackIndex: { type: 'integer', minimum: 0, maximum: 2 },
+                            fontSize: { type: 'number' },
+                            x: { type: 'number' },
+                            y: { type: 'number' }
+                        },
+                        required: ['text', 'startAt', 'endAt']
+                    }
+                },
+                replaceSubtitles: { type: 'boolean', default: true, description: 'Replace all existing subtitle cues when subtitles is provided. Set false to append.' },
+                articleMarkdown: { type: 'string', description: 'Finished Markdown article written by the agent. OpenViscribe will export this text without calling an AI provider.' },
+                articleTopic: { type: 'string', description: 'Optional visible project/article title.' },
+                tutorialDescription: { type: 'string', description: 'Optional tutorial brief shown in Studio.' }
+            },
+            required: ['projectId']
+        }
+    },
+    {
         name: 'openviscribe_apply_design',
         description: 'Apply an AI or manual motion-design pack, including intro, outro and lower-third choices.',
         action: 'design.apply',
@@ -107,7 +140,7 @@ const tools = [
                 title: { type: 'string' },
                 topic: { type: 'string' },
                 brief: { type: 'string' },
-                skillId: { type: 'string', enum: ['tutorial', 'composite-tutorial', 'column-topic', 'ui-debug', 'ux-research'], default: 'tutorial' }
+                skillId: { type: 'string', enum: ['tutorial', 'shorts', 'long-form', 'product-launch', 'podcast', 'social-ad', 'blank-video', 'composite-tutorial', 'column-topic', 'ui-debug', 'ux-research'], default: 'tutorial' }
             },
             required: ['name']
         }
@@ -152,7 +185,8 @@ const tools = [
                 assetId: { type: 'string', enum: ['hf-world-map', 'hf-world-flow', 'hf-data-chart', 'hf-flowchart', 'hf-console', 'hf-code-diff', 'hf-code-typing', 'hf-app-showcase', 'hf-device-reveal', 'hf-liquid-glass', 'hf-social-follow', 'hf-news-ticker', 'hf-caption-highlight', 'hf-neon-code', 'hf-release-roadmap'] },
                 startAt: { type: 'number', minimum: 0 },
                 duration: { type: 'number', minimum: 0.8, maximum: 10 },
-                presetId: { type: 'string', enum: ['signal', 'editorial', 'creator'] }
+                presetId: { type: 'string', enum: ['signal', 'editorial', 'creator'] },
+                assetConfig: { type: 'object', description: 'Detailed asset content. For world maps use heading, status, nodes [{id,locationId,label}], and routes [{from,to}]. Other asset types expose matching text/data fields in Studio after adding.' }
             },
             required: ['projectId', 'assetId']
         }
@@ -203,6 +237,25 @@ const tools = [
         }
     },
     {
+        name: 'openviscribe_list_browser_tutorial_requests',
+        description: 'List pending Browser / Computer Use tutorial tasks created from the OpenViscribe AI dialogue. Use this to discover work explicitly delegated by a user.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    {
+        name: 'openviscribe_get_browser_tutorial_request',
+        description: 'Read a browser tutorial task, its normalized script, allowed domains, and required human-takeover safety boundaries before taking any Browser or Computer Use action.',
+        inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'] }
+    },
+    {
+        name: 'openviscribe_claim_browser_tutorial_request',
+        description: 'Claim a browser tutorial task immediately before operating the browser. This does not authorize credentials, CAPTCHAs, purchases, deletion, security changes, or high-impact submissions; hand those steps to the user.',
+        inputSchema: {
+            type: 'object',
+            properties: { projectId: { type: 'string' }, agent: { type: 'string', description: 'The Browser-capable agent claiming this task.' } },
+            required: ['projectId']
+        }
+    },
+    {
         name: 'openviscribe_start_tutorial_production',
         description: 'After all UI script steps are completed and recording has stopped, run subtitles, optional voice, narrative Contents selection, motion design, article, and export in order. Export still requires a user to choose an output folder.',
         inputSchema: {
@@ -216,6 +269,74 @@ const tools = [
                 export: { type: 'object' }
             },
             required: ['projectId']
+        }
+    },
+    {
+        name: 'openviscribe_start_agent_production',
+        description: 'Run the no-Azure agent production path after recording: apply agent-authored copy/subtitles/Markdown, add justified Contents, apply motion design, then request export. Do not use openviscribe_start_tutorial_production when avoiding Studio AI providers, because that workflow generates its own subtitles and article.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                content: {
+                    type: 'object',
+                    description: 'Agent-authored payload in the same format accepted by openviscribe_apply_agent_content: subtitles, replaceSubtitles, articleMarkdown, articleTopic, and tutorialDescription.'
+                },
+                autoContents: { type: 'boolean', default: true },
+                contentsBrief: { type: 'string' },
+                design: { type: 'object' },
+                export: { type: 'object' }
+            },
+            required: ['projectId', 'content']
+        }
+    },
+    {
+        name: 'openviscribe_list_agent_edit_requests',
+        description: 'Find OpenViscribe edit briefs waiting for this local agent. Call this first when working as an unattended Codex edit planner, then claim exactly one request before reading or proposing a plan.',
+        inputSchema: {
+            type: 'object',
+            properties: { agent: { type: 'string', default: 'Codex' } }
+        }
+    },
+    {
+        name: 'openviscribe_claim_agent_edit_request',
+        description: 'Atomically claim a pending OpenViscribe edit brief for this agent. After claiming, call openviscribe_get_agent_edit_request and return a reviewable plan with openviscribe_propose_agent_edit_plan.',
+        inputSchema: {
+            type: 'object',
+            properties: { projectId: { type: 'string' }, agent: { type: 'string', default: 'Codex' } },
+            required: ['projectId']
+        }
+    },
+    {
+        name: 'openviscribe_get_agent_edit_request',
+        description: 'Read the latest edit brief submitted from OpenViscribe Studio in Codex Agent mode, together with the current project snapshot. Use this to understand what the user wants before proposing an edit plan.',
+        inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'] }
+    },
+    {
+        name: 'openviscribe_propose_agent_edit_plan',
+        description: 'Send a Codex-authored edit plan back to OpenViscribe Studio. Studio opens it in the AI editor for user review; it does not alter the timeline until the user presses Apply. Include a complete timed narration/subtitle script in plan.subtitles, not only cards. Studio can use localTts to generate on-device macOS narration after the user applies the plan.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                projectId: { type: 'string' },
+                agent: { type: 'string', default: 'Codex' },
+                plan: {
+                    type: 'object',
+                    properties: {
+                        reply: { type: 'string' }, title: { type: 'string' }, brief: { type: 'string' },
+                        sequence: { type: 'array', items: { type: 'object', properties: { assetId: { type: 'string' }, duration: { type: 'number' } }, required: ['assetId'] } },
+                        presetId: { type: 'string', enum: ['signal', 'editorial', 'creator'] }, templateId: { type: 'string' },
+                        contentAssetIds: { type: 'array', items: { type: 'string' } },
+                        cards: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, position: { type: 'string' } }, required: ['text'] } },
+                        subtitles: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, startAt: { type: 'number' }, endAt: { type: 'number' } }, required: ['text', 'startAt', 'endAt'] } },
+                        generateSubtitles: { type: 'boolean' },
+                        localTts: { type: 'boolean' },
+                        voice: { type: 'object', properties: { voice: { type: 'string' }, rate: { type: 'number' } } }
+                    },
+                    required: ['reply']
+                }
+            },
+            required: ['projectId', 'plan']
         }
     },
     {
@@ -273,9 +394,32 @@ async function callTool(name, args = {}) {
         const { projectId, stepId, ...result } = args;
         return api(`/v1/projects/${encodeURIComponent(projectId)}/script/steps/${encodeURIComponent(stepId)}`, { method: 'POST', body: JSON.stringify(result) });
     }
+    if (name === 'openviscribe_list_browser_tutorial_requests') return api('/v1/browser-tutorial-requests');
+    if (name === 'openviscribe_get_browser_tutorial_request') return api(`/v1/projects/${encodeURIComponent(args.projectId)}/browser-tutorial-request`);
+    if (name === 'openviscribe_claim_browser_tutorial_request') {
+        const { projectId, ...claim } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/browser-tutorial-request/claim`, { method: 'POST', body: JSON.stringify(claim) });
+    }
     if (name === 'openviscribe_start_tutorial_production') {
         const { projectId, ...workflow } = args;
         return api(`/v1/projects/${encodeURIComponent(projectId)}/workflows/tutorial-production`, { method: 'POST', body: JSON.stringify(workflow) });
+    }
+    if (name === 'openviscribe_start_agent_production') {
+        const { projectId, ...workflow } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/workflows/agent-production`, { method: 'POST', body: JSON.stringify(workflow) });
+    }
+    if (name === 'openviscribe_list_agent_edit_requests') {
+        const agent = String(args.agent || 'Codex');
+        return api(`/v1/agent-edit-requests?agent=${encodeURIComponent(agent)}&status=pending`);
+    }
+    if (name === 'openviscribe_claim_agent_edit_request') {
+        const { projectId, ...claim } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/agent-edit-request/claim`, { method: 'POST', body: JSON.stringify(claim) });
+    }
+    if (name === 'openviscribe_get_agent_edit_request') return api(`/v1/projects/${encodeURIComponent(args.projectId)}/agent-edit-request`);
+    if (name === 'openviscribe_propose_agent_edit_plan') {
+        const { projectId, plan, agent = 'Codex' } = args;
+        return api(`/v1/projects/${encodeURIComponent(projectId)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'agent.edit.propose', input: { plan, agent } }) });
     }
     const actionTool = actionTools.find(tool => tool.name === name);
     if (!actionTool) throw new Error(`Unknown tool: ${name}`);

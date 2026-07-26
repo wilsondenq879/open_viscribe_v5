@@ -1,5 +1,6 @@
 export const compositeTutorialSkill = {
     id: 'composite-tutorial',
+    workflowCategory: 'video',
     name: '綜合教學影片',
     shortName: '綜合教學',
     description: '理解螢幕錄影、實拍片段、PIP 與疊層說明，將混合教學素材整理成段落、字幕與文章。',

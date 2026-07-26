@@ -246,6 +246,12 @@ export function normalizeKenBurnsEffect(effect) {
 export function normalizeClipItem(clip) {
     return {
         ...clip,
+        // AI rough cuts target a filled delivery frame. Keep user-imported
+        // clips conservative (contain), while restoring older AI clips to the
+        // same cover behavior as newly generated ones.
+        mediaFit: clip?.mediaFit === 'cover' || clip?.mediaFit === 'contain'
+            ? clip.mediaFit
+            : (clip?.source === 'ai-editor' ? 'cover' : 'contain'),
         layout: {
             x: Number.isFinite(Number(clip?.layout?.x)) ? Number(clip.layout.x) : DEFAULT_CLIP_LAYOUT.x,
             y: Number.isFinite(Number(clip?.layout?.y)) ? Number(clip.layout.y) : DEFAULT_CLIP_LAYOUT.y,

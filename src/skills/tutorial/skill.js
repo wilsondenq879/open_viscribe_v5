@@ -1,5 +1,6 @@
 export const tutorialSkill = {
     id: 'tutorial',
+    workflowCategory: 'video',
     name: '步驟教學影片',
     shortName: '步驟教學',
     description: '保留目前的 AI 字幕、文章與語音教學工作流。',

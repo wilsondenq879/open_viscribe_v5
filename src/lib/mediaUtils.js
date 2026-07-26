@@ -2,11 +2,20 @@ import { buildProjectExportMetadata, getMediaBlobId } from './projectState';
 
 const DB_NAME = 'WilsonEditorDB';
 const STORE_NAME = 'media_blobs';
+const FILE_HANDLE_STORE_NAME = 'media_file_handles';
+const DB_VERSION = 2;
 
 function openDB() {
     return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 1);
-        req.onupgradeneeded = (e) => e.target.result.createObjectStore(STORE_NAME);
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
+            // FileSystemFileHandle is structured-cloneable in Chromium.  Keeping the
+            // handle lets a large external media library stay on disk instead of
+            // copying many gigabytes into the extension's IndexedDB quota.
+            if (!db.objectStoreNames.contains(FILE_HANDLE_STORE_NAME)) db.createObjectStore(FILE_HANDLE_STORE_NAME);
+        };
         req.onsuccess = (e) => resolve(e.target.result);
         req.onerror = (e) => reject(e.target.error);
     });
@@ -27,17 +36,57 @@ export async function saveBlobToDB(id, blob) {
     }
 }
 
+export async function saveFileHandleToDB(id, handle) {
+    if (!id || !handle) return false;
+    try {
+        const db = await openDB();
+        const tx = db.transaction(FILE_HANDLE_STORE_NAME, 'readwrite');
+        tx.objectStore(FILE_HANDLE_STORE_NAME).put(handle, id);
+        return new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error);
+        });
+    } catch (e) {
+        console.warn('File handle save error', e);
+        return false;
+    }
+}
+
+async function getFileHandleFromDB(id) {
+    try {
+        const db = await openDB();
+        if (!db.objectStoreNames.contains(FILE_HANDLE_STORE_NAME)) return null;
+        const tx = db.transaction(FILE_HANDLE_STORE_NAME, 'readonly');
+        const req = tx.objectStore(FILE_HANDLE_STORE_NAME).get(id);
+        return new Promise((resolve, reject) => {
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
 export async function getBlobFromDB(id) {
     try {
         const db = await openDB();
         const tx = db.transaction(STORE_NAME, 'readonly');
         const req = tx.objectStore(STORE_NAME).get(id);
-        return new Promise((resolve, reject) => {
+        const blob = await new Promise((resolve, reject) => {
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
         });
+        if (blob) return blob;
+
+        const handle = await getFileHandleFromDB(id);
+        return handle ? await handle.getFile() : null;
     } catch (e) {
-        return null;
+        try {
+            const handle = await getFileHandleFromDB(id);
+            return handle ? await handle.getFile() : null;
+        } catch (handleError) {
+            return null;
+        }
     }
 }
 

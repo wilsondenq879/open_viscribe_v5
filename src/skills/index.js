@@ -3,8 +3,9 @@ import { compositeTutorialSkill } from './composite-tutorial/skill';
 import { columnTopicSkill } from './column-topic/skill';
 import { uiDebugSkill } from './ui-debug/skill';
 import { uxResearchSkill } from './ux-research/skill';
+import { videoWorkflowSkills } from './video-workflows/skills';
 
-export const SKILL_REGISTRY = [tutorialSkill, compositeTutorialSkill, columnTopicSkill, uiDebugSkill, uxResearchSkill];
+export const SKILL_REGISTRY = [tutorialSkill, ...videoWorkflowSkills, compositeTutorialSkill, columnTopicSkill, uiDebugSkill, uxResearchSkill];
 
 export const DEFAULT_SKILL_ID = 'tutorial';
 

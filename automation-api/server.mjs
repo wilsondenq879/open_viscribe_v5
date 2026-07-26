@@ -1,6 +1,9 @@
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { closeSync, existsSync, openSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import hyperframeTemplates from '../src/data/hyperframeTemplates.json' with { type: 'json' };
@@ -12,12 +15,25 @@ const port = Number(process.env.OPEN_VISCRIBE_API_PORT || 4318);
 const host = process.env.OPEN_VISCRIBE_API_HOST || '127.0.0.1';
 const storagePath = resolve(projectDirectory, '.openviscribe-automation', 'state.json');
 const apiToken = process.env.OPEN_VISCRIBE_API_TOKEN || randomBytes(24).toString('base64url');
+const execFileAsync = (file, args, options) => new Promise((resolvePromise, rejectPromise) => {
+    execFile(file, args, options, (error, stdout, stderr) => {
+        if (error) {
+            error.stdout = stdout;
+            error.stderr = stderr;
+            rejectPromise(error);
+            return;
+        }
+        resolvePromise({ stdout, stderr });
+    });
+});
 const supportedActions = new Set([
     'project.initialize',
     'capture.start',
     'capture.stop',
     'subtitles.generate',
     'article.generate',
+    'agent.content.apply',
+    'agent.edit.propose',
     'voice.generate',
     'contents.apply',
     'design.apply',
@@ -32,6 +48,7 @@ let store = {
     commands: {},
     clients: {}
 };
+let persistQueue = Promise.resolve();
 
 function now() {
     return new Date().toISOString();
@@ -49,11 +66,22 @@ function publicJob(job) {
     return publicValue;
 }
 
-async function persist() {
-    await mkdir(dirname(storagePath), { recursive: true });
-    const temporaryPath = `${storagePath}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(store, null, 2));
-    await rename(temporaryPath, storagePath);
+function persist() {
+    // Requests can arrive concurrently from the Studio and an MCP client.  A
+    // shared `state.json.tmp` lets one request rename the file while another is
+    // still writing it, causing ENOENT.  Queue writes and give every atomic
+    // replacement its own temporary file.
+    const serializedStore = JSON.stringify(store, null, 2);
+    const temporaryPath = `${storagePath}.${randomUUID()}.tmp`;
+    const nextPersist = persistQueue
+        .catch(() => undefined)
+        .then(async () => {
+            await mkdir(dirname(storagePath), { recursive: true });
+            await writeFile(temporaryPath, serializedStore);
+            await rename(temporaryPath, storagePath);
+        });
+    persistQueue = nextPersist;
+    return nextPersist;
 }
 
 async function loadStore() {
@@ -122,14 +150,104 @@ function createProject(input = {}) {
         skillId: String(input.skillId || 'tutorial'),
         createdAt: now(),
         updatedAt: now(),
-        status: 'created',
-        snapshot: null,
+        status: input.snapshot && typeof input.snapshot === 'object' ? String(input.snapshot.phase || 'ready') : 'created',
+        snapshot: input.snapshot && typeof input.snapshot === 'object' ? input.snapshot : null,
         script: null,
         workflow: null,
+        agentEditRequest: null,
+        browserTutorialRequest: null,
         jobIds: []
     };
     store.projects[id] = project;
     return project;
+}
+
+function dispatchCodexEditPlanner(project) {
+    const request = project?.agentEditRequest;
+    if (!request || String(request.requestedAgent || 'Codex').toLowerCase() !== 'codex') return;
+
+    // The Codex task is deliberately limited to producing a proposal. The
+    // Studio remains the only place where a user can apply it to the timeline.
+    request.dispatchStatus = 'starting';
+    request.dispatchError = null;
+    request.updatedAt = now();
+    const projectId = project.id;
+    const prompt = [
+        'You are the local OpenViscribe Codex edit planner.',
+        'Use only the OpenViscribe MCP tools; do not use shell commands or edit files.',
+        `Process the single requested project: ${projectId}.`,
+        'Call openviscribe_get_agent_edit_request. If its status is pending, call openviscribe_claim_agent_edit_request with agent Codex; if it is already claimed by Codex, continue.',
+        'Read the current project snapshot, then call openviscribe_propose_agent_edit_plan with a conservative, reviewable Traditional Chinese plan.',
+        'The plan MUST include a complete timed narration/subtitle script in plan.subtitles: an array of {text,startAt,endAt}. It is not enough to return title cards. Write natural, spoken Traditional Chinese that matches the requested goal; use consecutive timing from 0 seconds and cover the full proposed edit. Honor an explicit duration: for a one-minute request, provide roughly 55–65 seconds across 12–18 readable cues; never return a few short cues for a longer requested video. Set plan.localTts to true unless the user explicitly asks for no voice.',
+        'For a narration-led edit, subtitles are the primary on-screen copy: do not create a card for every subtitle, leave cards empty unless a single non-overlapping moment is essential, and choose at most one Contents asset. Intro and outro are exclusive title moments and must not overlap captions or other overlays.',
+        'Do not apply any plan, change the timeline, record, browse, generate media, or export. If media is absent, say so clearly and propose only a structure that becomes executable after import.'
+    ].join(' ');
+    try {
+        // launchd intentionally has a minimal PATH. Codex Desktop bundles the
+        // CLI in its app resources on this Mac; keep Homebrew and PATH as
+        // fallbacks for other local installations.
+        const codexCandidates = [
+            process.env.OPEN_VISCRIBE_CODEX_BIN,
+            '/Applications/ChatGPT.app/Contents/Resources/codex',
+            '/opt/homebrew/bin/codex',
+            '/usr/local/bin/codex'
+        ].filter(Boolean);
+        const codexExecutable = codexCandidates.find(candidate => existsSync(candidate)) || 'codex';
+        const agentHome = process.env.HOME || homedir();
+        const plannerLogFd = openSync('/tmp/openviscribe-codex-planner.log', 'a');
+        let plannerLogClosed = false;
+        const closePlannerLog = () => {
+            if (plannerLogClosed) return;
+            plannerLogClosed = true;
+            closeSync(plannerLogFd);
+        };
+        const child = spawn(codexExecutable, [
+            'exec', '--ephemeral', '--sandbox', 'read-only', '--skip-git-repo-check', '-C', projectDirectory, prompt
+        ], {
+            cwd: projectDirectory,
+            // Codex is a short-lived CLI task. Keep it attached to the local
+            // service process: detached launchd children can lose the session
+            // context that Codex uses for its authenticated MCP connection.
+            detached: false,
+            stdio: ['ignore', plannerLogFd, plannerLogFd],
+            env: {
+                ...process.env,
+                HOME: agentHome,
+                USER: process.env.USER || 'wilsondenq879',
+                CODEX_HOME: process.env.CODEX_HOME || `${agentHome}/.codex`,
+                PATH: process.env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+            }
+        });
+        child.once('spawn', () => {
+            if (request.status === 'pending') {
+                request.dispatchStatus = 'running';
+                request.updatedAt = now();
+                void persist();
+            }
+        });
+        child.once('error', error => {
+            if (request.status === 'pending') {
+                request.dispatchStatus = 'failed';
+                request.dispatchError = String(error?.message || 'Unable to start Codex CLI.').slice(0, 500);
+                request.updatedAt = now();
+                void persist();
+            }
+        });
+        child.once('exit', (code, signal) => {
+            closePlannerLog();
+            if (request.status !== 'proposed') {
+                request.dispatchStatus = 'failed';
+                request.dispatchError = `Codex planner exited without returning a plan${signal ? ` (${signal})` : ` (code ${code})`}.`;
+                request.updatedAt = now();
+                void persist();
+            }
+        });
+        child.once('error', closePlannerLog);
+    } catch (error) {
+        request.dispatchStatus = 'failed';
+        request.dispatchError = String(error?.message || 'Unable to start Codex CLI.').slice(0, 500);
+        request.updatedAt = now();
+    }
 }
 
 function findHyperframeTemplate(templateId) {
@@ -235,6 +353,60 @@ function updateScriptStatus(script) {
     return 'ready';
 }
 
+function normalizeAllowedDomains(values, startUrl = '') {
+    const domains = Array.isArray(values) ? values : String(values || '').split(/[\s,]+/);
+    const normalized = domains.map(value => String(value || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')).filter(Boolean);
+    try {
+        const hostname = new URL(startUrl).hostname.toLowerCase();
+        if (hostname && !normalized.includes(hostname)) normalized.unshift(hostname);
+    } catch { /* The agent will ask for a valid start URL before navigation. */ }
+    return [...new Set(normalized)].slice(0, 30);
+}
+
+function publicBrowserTutorialRequest(request) {
+    if (!request) return null;
+    return {
+        id: request.id,
+        projectId: request.projectId,
+        agent: request.agent,
+        status: request.status,
+        startUrl: request.startUrl,
+        allowedDomains: request.allowedDomains,
+        title: request.title,
+        goal: request.goal,
+        createdAt: request.createdAt,
+        updatedAt: request.updatedAt,
+        claimedBy: request.claimedBy || null,
+        safety: request.safety
+    };
+}
+
+function createBrowserTutorialRequest(project, input = {}) {
+    const script = normalizeScript(input.script || input, { title: input.title || project.name, goal: input.goal || project.brief, startUrl: input.startUrl });
+    project.script = script;
+    const request = {
+        id: `browser_tutorial_${randomUUID()}`,
+        projectId: project.id,
+        agent: String(input.agent || 'Codex').slice(0, 80),
+        title: script.title,
+        goal: script.goal,
+        startUrl: script.startUrl,
+        allowedDomains: normalizeAllowedDomains(input.allowedDomains, script.startUrl),
+        status: 'pending',
+        claimedBy: null,
+        createdAt: now(),
+        updatedAt: now(),
+        safety: {
+            requiresUserTakeover: ['login or password entry', 'CAPTCHA', 'payment or purchase', 'permanent deletion', 'security or permission changes', 'form submission with external impact'],
+            rule: 'Do not navigate outside allowedDomains. Stop and ask the user to take over for any protected action.'
+        }
+    };
+    project.browserTutorialRequest = request;
+    project.updatedAt = now();
+    const job = queueAction(project, 'script.prepare', { script });
+    return { request, script, job };
+}
+
 function queueWorkflowStep(project) {
     const workflow = project?.workflow;
     if (!workflow || workflow.status !== 'running') return null;
@@ -271,6 +443,35 @@ function startTutorialWorkflow(project, input = {}) {
             ...(input.autoContents === false ? [] : [{ action: 'contents.apply', input: { brief: String(input.contentsBrief || project.brief || project.topic || project.name) } }]),
             { action: 'design.apply', input: input.design || { mode: 'ai', presetId: 'signal', includeIntro: true, includeOutro: true, includeLowerThird: true } },
             { action: 'article.generate', input: {} },
+            { action: 'export.start', input: input.export || { renderVideo: true, includeMarkdown: true, includeSubtitles: true, projectJson: true } }
+        ]
+    };
+    project.workflow = workflow;
+    return { workflow, job: queueWorkflowStep(project) };
+}
+
+function startAgentProductionWorkflow(project, input = {}) {
+    if (project.workflow?.status === 'running') throw new Error('A production workflow is already running for this project.');
+    if (project.script && project.script.status !== 'completed') throw new Error('Complete every UI script step before starting agent production.');
+    const content = input.content && typeof input.content === 'object' ? input.content : null;
+    const hasSubtitles = Array.isArray(content?.subtitles) && content.subtitles.length > 0;
+    const hasArticle = String(content?.articleMarkdown || '').trim().length > 0;
+    if (!content || (!hasSubtitles && !hasArticle)) {
+        throw new Error('Agent production needs agent-authored subtitles or a finished Markdown article in content.');
+    }
+    const workflow = {
+        id: `workflow_${randomUUID()}`,
+        kind: 'agent-production',
+        status: 'running',
+        createdAt: now(),
+        updatedAt: now(),
+        currentIndex: 0,
+        currentJobId: null,
+        jobIds: [],
+        steps: [
+            { action: 'agent.content.apply', input: content },
+            ...(input.autoContents === false ? [] : [{ action: 'contents.apply', input: { brief: String(input.contentsBrief || content.tutorialDescription || project.brief || project.topic || project.name) } }]),
+            { action: 'design.apply', input: input.design || { mode: 'ai', presetId: 'signal', includeIntro: true, includeOutro: true, includeLowerThird: true } },
             { action: 'export.start', input: input.export || { renderVideo: true, includeMarkdown: true, includeSubtitles: true, projectJson: true } }
         ]
     };
@@ -342,10 +543,14 @@ function openApiDocument() {
         paths: {
             '/v1/projects': { get: { summary: 'List projects' }, post: { summary: 'Create a project and queue studio initialization' } },
             '/v1/projects/{projectId}': { get: { summary: 'Get project, jobs and latest studio snapshot' } },
-            '/v1/projects/{projectId}/actions': { post: { summary: 'Queue an action for OpenViscribe Studio' } },
+            '/v1/projects/{projectId}/actions': { post: { summary: 'Queue an action for OpenViscribe Studio, including agent-authored copy and timed subtitles' } },
             '/v1/projects/{projectId}/script': { get: { summary: 'Read a UI tutorial script' }, post: { summary: 'Prepare a UI script for Computer Use recording' } },
             '/v1/projects/{projectId}/script/steps/{stepId}': { post: { summary: 'Report a Computer Use script step result' } },
+            '/v1/browser-tutorial-requests': { get: { summary: 'List browser tutorial tasks waiting for an agent' } },
+            '/v1/projects/{projectId}/browser-tutorial-request': { get: { summary: 'Read a browser tutorial task' }, post: { summary: 'Create a browser tutorial task from a user script' } },
+            '/v1/projects/{projectId}/browser-tutorial-request/claim': { post: { summary: 'Claim a browser tutorial task before using a Browser or Computer Use tool' } },
             '/v1/projects/{projectId}/workflows/tutorial-production': { post: { summary: 'Run subtitles, narrative Contents, design, article and export in sequence' } },
+            '/v1/projects/{projectId}/workflows/agent-production': { post: { summary: 'Apply agent-authored copy and subtitles, then Contents, design and export without a Studio AI provider' } },
             '/v1/hyperframes/templates': { get: { summary: 'List curated HyperFrames template recipes and preview descriptions' } },
             '/v1/hyperframes/assets': { get: { summary: 'List built-in animated HyperFrames assets such as maps, charts, console and code' } },
             '/v1/projects/{projectId}/hyperframes-template': { post: { summary: 'Apply a curated HyperFrames template recipe in Studio' } },
@@ -408,12 +613,48 @@ async function handleBridge(request, response, method, pathname, searchParams) {
     return sendError(response, 404, 'Bridge route was not found.', 'not_found');
 }
 
-async function handleApi(request, response, method, pathname) {
+async function handleApi(request, response, method, pathname, searchParams = new URLSearchParams()) {
     if (method === 'GET' && pathname === '/v1/health') {
         return sendJson(response, 200, { status: 'ok', connectedStudios: Object.keys(store.clients).length, time: now() });
     }
     if (method === 'GET' && pathname === '/v1/openapi.json') return sendJson(response, 200, openApiDocument());
     if (!isAuthorized(request)) return sendError(response, 401, 'A valid OpenViscribe API token is required.', 'unauthorized');
+
+    // Uses the macOS speech engine on the same machine as the local API. Audio
+    // stays on-device and is returned directly to the extension as WAV data.
+    if (method === 'POST' && pathname === '/v1/local-tts') {
+        const body = await readJson(request);
+        const text = String(body.text || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+        if (!text) return sendError(response, 400, 'Text is required for local TTS.', 'missing_tts_text');
+        const requestedVoice = String(body.voice || 'Ting-Ting').replace(/[^A-Za-z0-9_\- ]/g, '').trim();
+        const voice = requestedVoice || 'Ting-Ting';
+        const requestedRate = Number(body.rate);
+        const rate = Number.isFinite(requestedRate) ? Math.max(110, Math.min(260, Math.round(requestedRate))) : 185;
+        const temporaryDirectory = await mkdtemp(resolve(tmpdir(), 'openviscribe-tts-'));
+        const outputPath = resolve(temporaryDirectory, 'speech.wav');
+        try {
+            await execFileAsync('/usr/bin/say', [
+                '-v', voice,
+                '-r', String(rate),
+                '-o', outputPath,
+                '--file-format=WAVE',
+                '--data-format=LEI16@22050',
+                text
+            ], { timeout: 30_000, maxBuffer: 128 * 1024 });
+            const audio = await readFile(outputPath);
+            if (!audio.length) throw new Error('macOS speech engine returned an empty audio file.');
+            return sendJson(response, 200, {
+                audioBase64: audio.toString('base64'),
+                mimeType: 'audio/wav',
+                voice,
+                rate
+            });
+        } catch (error) {
+            return sendError(response, 500, `Local macOS TTS failed: ${String(error?.message || error).slice(0, 500)}`, 'local_tts_failed');
+        } finally {
+            await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+        }
+    }
 
     if (method === 'GET' && pathname === '/v1/hyperframes/templates') {
         return sendJson(response, 200, { templates: hyperframeTemplates.map(publicHyperframeTemplate) });
@@ -428,12 +669,14 @@ async function handleApi(request, response, method, pathname) {
     if (method === 'POST' && pathname === '/v1/projects') {
         const body = await readJson(request);
         const project = createProject(body);
-        const initializationJob = queueAction(project, 'project.initialize', {
-            skillId: project.skillId,
-            title: body.title || project.name,
-            topic: body.topic || '',
-            brief: body.brief || ''
-        });
+        const initializationJob = body.initialize === false
+            ? null
+            : queueAction(project, 'project.initialize', {
+                skillId: project.skillId,
+                title: body.title || project.name,
+                topic: body.topic || '',
+                brief: body.brief || ''
+            });
         await persist();
         return sendJson(response, 201, { project: publicProject(project), initializationJob: publicJob(initializationJob) });
     }
@@ -474,6 +717,41 @@ async function handleApi(request, response, method, pathname) {
         return sendJson(response, 200, { script: project.script });
     }
 
+    if (method === 'GET' && pathname === '/v1/browser-tutorial-requests') {
+        const requests = Object.values(store.projects)
+            .map(project => publicBrowserTutorialRequest(project.browserTutorialRequest))
+            .filter(request => request && ['pending', 'claimed', 'running'].includes(request.status));
+        return sendJson(response, 200, { requests });
+    }
+
+    const browserTutorialMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/browser-tutorial-request$/);
+    if (browserTutorialMatch) {
+        const project = getProject(browserTutorialMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        if (method === 'GET') return sendJson(response, 200, { request: project.browserTutorialRequest, script: project.script, project: publicProject(project) });
+        if (method === 'POST') {
+            const body = await readJson(request);
+            const { request: browserRequest, script, job } = createBrowserTutorialRequest(project, body);
+            await persist();
+            return sendJson(response, 202, { request: browserRequest, script, job: publicJob(job) });
+        }
+    }
+
+    const browserTutorialClaimMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/browser-tutorial-request\/claim$/);
+    if (method === 'POST' && browserTutorialClaimMatch) {
+        const project = getProject(browserTutorialClaimMatch[1]);
+        const browserRequest = project?.browserTutorialRequest;
+        if (!browserRequest) return sendError(response, 404, 'Browser tutorial request was not found.', 'browser_tutorial_not_found');
+        if (browserRequest.status === 'completed' || browserRequest.status === 'cancelled') return sendError(response, 409, 'Browser tutorial request has already finished.', 'browser_tutorial_finished');
+        const body = await readJson(request);
+        browserRequest.status = 'claimed';
+        browserRequest.claimedBy = String(body.agent || browserRequest.agent || 'Browser Agent').slice(0, 120);
+        browserRequest.updatedAt = now();
+        project.updatedAt = now();
+        await persist();
+        return sendJson(response, 200, { request: browserRequest, script: project.script });
+    }
+
     const workflowMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/workflows\/tutorial-production$/);
     if (method === 'POST' && workflowMatch) {
         const project = getProject(workflowMatch[1]);
@@ -482,6 +760,83 @@ async function handleApi(request, response, method, pathname) {
         const { workflow, job } = startTutorialWorkflow(project, body);
         await persist();
         return sendJson(response, 202, { workflow, job: publicJob(job) });
+    }
+
+    const agentWorkflowMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/workflows\/agent-production$/);
+    if (method === 'POST' && agentWorkflowMatch) {
+        const project = getProject(agentWorkflowMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        const body = await readJson(request);
+        const { workflow, job } = startAgentProductionWorkflow(project, body);
+        await persist();
+        return sendJson(response, 202, { workflow, job: publicJob(job) });
+    }
+
+    const projectSnapshotMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/snapshot$/);
+    if (method === 'POST' && projectSnapshotMatch) {
+        const project = getProject(projectSnapshotMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        const body = await readJson(request);
+        if (!body.snapshot || typeof body.snapshot !== 'object') return sendError(response, 400, 'A project snapshot is required.', 'missing_snapshot');
+        updateProjectFromSnapshot(project, body.snapshot);
+        await persist();
+        return sendJson(response, 200, { project: publicProject(project) });
+    }
+
+    const agentEditRequestMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/agent-edit-request$/);
+    if (agentEditRequestMatch) {
+        const project = getProject(agentEditRequestMatch[1]);
+        if (!project) return sendError(response, 404, 'Project was not found.', 'project_not_found');
+        if (method === 'GET') return sendJson(response, 200, { request: project.agentEditRequest, project: publicProject(project) });
+        if (method === 'POST') {
+            const body = await readJson(request);
+            const prompt = String(body.prompt || '').trim().slice(0, 6000);
+            if (!prompt) return sendError(response, 400, 'An edit prompt is required.', 'missing_edit_prompt');
+            project.agentEditRequest = {
+                id: `agent_edit_${randomUUID()}`,
+                prompt,
+                status: 'pending',
+                createdAt: now(),
+                updatedAt: now(),
+                requestedBy: String(body.requestedBy || 'OpenViscribe Studio').slice(0, 160),
+                requestedAgent: String(body.agent || 'Codex').slice(0, 120)
+            };
+            project.updatedAt = now();
+            await persist();
+            dispatchCodexEditPlanner(project);
+            await persist();
+            return sendJson(response, 201, { request: project.agentEditRequest, project: publicProject(project) });
+        }
+    }
+
+    // A local agent needs a discoverable queue rather than a project ID copied
+    // manually from the Studio. Only pending requests are returned by default.
+    if (method === 'GET' && pathname === '/v1/agent-edit-requests') {
+        const requestedAgent = String(searchParams.get('agent') || '').trim().toLowerCase();
+        const status = String(searchParams.get('status') || 'pending').trim().toLowerCase();
+        const requests = Object.values(store.projects)
+            .map(project => ({ projectId: project.id, projectName: project.name, request: project.agentEditRequest }))
+            .filter(item => item.request && (!status || item.request.status === status))
+            .filter(item => !requestedAgent || String(item.request.requestedAgent || 'Codex').toLowerCase() === requestedAgent)
+            .sort((a, b) => String(a.request.createdAt).localeCompare(String(b.request.createdAt)));
+        return sendJson(response, 200, { requests });
+    }
+
+    const agentEditClaimMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/agent-edit-request\/claim$/);
+    if (method === 'POST' && agentEditClaimMatch) {
+        const project = getProject(agentEditClaimMatch[1]);
+        const agentRequest = project?.agentEditRequest;
+        if (!agentRequest) return sendError(response, 404, 'Agent edit request was not found.', 'agent_edit_not_found');
+        if (agentRequest.status !== 'pending') return sendError(response, 409, 'Agent edit request has already been claimed or finished.', 'agent_edit_unavailable');
+        const body = await readJson(request);
+        const agent = String(body.agent || 'Codex').slice(0, 120);
+        agentRequest.status = 'claimed';
+        agentRequest.claimedBy = agent;
+        agentRequest.claimedAt = now();
+        agentRequest.updatedAt = now();
+        project.updatedAt = now();
+        await persist();
+        return sendJson(response, 200, { project: publicProject(project), request: agentRequest });
     }
 
     const templateMatch = pathname.match(/^\/v1\/projects\/([^/]+)\/hyperframes-template$/);
@@ -519,7 +874,8 @@ async function handleApi(request, response, method, pathname) {
             assetId: asset.id,
             presetId: body.presetId || asset.presetId,
             startAt: Number.isFinite(Number(body.startAt)) ? Number(body.startAt) : undefined,
-            duration: Number.isFinite(Number(body.duration)) ? Number(body.duration) : asset.duration
+            duration: Number.isFinite(Number(body.duration)) ? Number(body.duration) : asset.duration,
+            assetConfig: body.assetConfig && typeof body.assetConfig === 'object' ? body.assetConfig : undefined
         });
         await persist();
         return sendJson(response, 202, { asset: publicHyperframeAsset(asset), job: publicJob(job) });
@@ -539,6 +895,16 @@ async function handleApi(request, response, method, pathname) {
         const body = await readJson(request);
         const action = String(body.action || '');
         if (!supportedActions.has(action) || action === 'project.initialize') return sendError(response, 400, 'Unsupported automation action.', 'invalid_action');
+        if (action === 'agent.edit.propose' && project.agentEditRequest) {
+            project.agentEditRequest = {
+                ...project.agentEditRequest,
+                status: 'proposed',
+                proposedBy: String(body?.input?.agent || project.agentEditRequest.claimedBy || project.agentEditRequest.requestedAgent || 'Agent').slice(0, 120),
+                dispatchStatus: 'completed',
+                dispatchError: null,
+                updatedAt: now()
+            };
+        }
         const job = queueAction(project, action, body.input || {});
         await persist();
         return sendJson(response, 202, { job: publicJob(job) });
@@ -575,7 +941,7 @@ const server = createServer(async (request, response) => {
         if (request.method === 'OPTIONS') return sendJson(response, 204, {});
         const url = new URL(request.url || '/', `http://${request.headers.host || `${host}:${port}`}`);
         if (url.pathname.startsWith('/v1/bridge/')) return await handleBridge(request, response, request.method, url.pathname, url.searchParams);
-        return await handleApi(request, response, request.method, url.pathname);
+        return await handleApi(request, response, request.method, url.pathname, url.searchParams);
     } catch (error) {
         console.error('Automation API error:', error);
         return sendError(response, 500, error?.message || 'Unexpected automation API error.', 'internal_error');

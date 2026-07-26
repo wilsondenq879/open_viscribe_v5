@@ -210,7 +210,17 @@ export function drawMediaWithKenBurns(ctx, el, clip, time, box) {
     let drawX = box.x;
     let drawY = box.y;
 
-    if (elAspect > boxAspect) {
+    if (clip?.mediaFit === 'cover') {
+        if (elAspect > boxAspect) {
+            drawH = box.h;
+            drawW = drawH * elAspect;
+            drawX = box.x + (box.w - drawW) / 2;
+        } else {
+            drawW = box.w;
+            drawH = drawW / elAspect;
+            drawY = box.y + (box.h - drawH) / 2;
+        }
+    } else if (elAspect > boxAspect) {
         drawH = box.w / elAspect;
         drawY = box.y + (box.h - drawH) / 2;
     } else {
@@ -249,11 +259,56 @@ export function hexToRgba(hex, alpha = 1) {
     return `rgba(${r}, ${g}, ${b}, ${clamp(alpha, 0, 1)})`;
 }
 
+function wrapSubtitleParagraph(ctx, paragraph, maxWidth) {
+    const source = String(paragraph || '').trim();
+    if (!source) return [];
+    if (ctx.measureText(source).width <= maxWidth) return [source];
+
+    // Keep Latin words together while allowing Chinese/Japanese characters to
+    // fill the full safe width before wrapping. Explicit newlines are handled
+    // by the caller and always remain hard breaks.
+    const tokens = source.match(/[\u3400-\u9fff\u3040-\u30ff]|[^\s\u3400-\u9fff\u3040-\u30ff]+|\s+/g) || [source];
+    const lines = [];
+    let line = '';
+    const pushLine = () => {
+        const clean = line.trim();
+        if (clean) lines.push(clean);
+        line = '';
+    };
+
+    tokens.forEach(token => {
+        const candidate = `${line}${token}`;
+        if (!line || ctx.measureText(candidate.trim()).width <= maxWidth) {
+            line = candidate;
+            return;
+        }
+        pushLine();
+        if (ctx.measureText(token.trim()).width <= maxWidth) {
+            line = token.trimStart();
+            return;
+        }
+        // A single URL or unbroken identifier can still exceed the safe area.
+        [...token].forEach(character => {
+            const characterCandidate = `${line}${character}`;
+            if (line && ctx.measureText(characterCandidate).width > maxWidth) pushLine();
+            line += character;
+        });
+    });
+    pushLine();
+    return lines;
+}
+
+function getWrappedSubtitleLines(ctx, canvas, subtitle) {
+    const sub = normalizeSubtitle(subtitle);
+    const paddingX = Math.max(28, Math.round(sub.fontSize * 0.9));
+    const maxTextWidth = Math.max(80, canvas.width * 0.92 - paddingX);
+    return String(sub.text || '')
+        .split('\n')
+        .flatMap(paragraph => wrapSubtitleParagraph(ctx, paragraph, maxTextWidth));
+}
+
 export function drawSubtitleOnCanvas(ctx, canvas, subtitle) {
     const sub = normalizeSubtitle(subtitle);
-    const lines = String(sub.text || '').split('\n').filter(Boolean);
-    if (lines.length === 0) return;
-
     const fontSize = sub.fontSize;
     const lineHeight = Math.round(fontSize * 1.25);
     const paddingX = Math.max(28, Math.round(fontSize * 0.9));
@@ -264,6 +319,9 @@ export function drawSubtitleOnCanvas(ctx, canvas, subtitle) {
     ctx.font = `bold ${fontSize}px ${sub.fontFamily}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
+
+    const lines = getWrappedSubtitleLines(ctx, canvas, sub);
+    if (lines.length === 0) return;
 
     const textWidths = lines.map(line => ctx.measureText(line).width);
     const textBlockWidth = Math.max(...textWidths, 0);
@@ -297,8 +355,6 @@ export function drawSubtitleOnCanvas(ctx, canvas, subtitle) {
 
 export function getSubtitleCanvasBounds(ctx, canvas, subtitle) {
     const sub = normalizeSubtitle(subtitle);
-    const lines = String(sub.text || '').split('\n').filter(Boolean);
-    const safeLines = lines.length > 0 ? lines : [' '];
     const fontSize = sub.fontSize;
     const lineHeight = Math.round(fontSize * 1.25);
     const paddingX = Math.max(28, Math.round(fontSize * 0.9));
@@ -308,6 +364,8 @@ export function getSubtitleCanvasBounds(ctx, canvas, subtitle) {
 
     ctx.save();
     ctx.font = `bold ${fontSize}px ${sub.fontFamily}`;
+    const lines = getWrappedSubtitleLines(ctx, canvas, sub);
+    const safeLines = lines.length > 0 ? lines : [' '];
     const textWidths = safeLines.map(line => ctx.measureText(line).width);
     ctx.restore();
 

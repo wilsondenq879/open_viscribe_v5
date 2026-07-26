@@ -547,6 +547,7 @@ export default function SettingsModal({
                                     <select value={settings.aspectRatio} onChange={(e) => setSettings({ ...settings, aspectRatio: e.target.value })} className="w-full bg-gray-900 border border-gray-600 rounded-xl px-3 py-2.5 text-sm focus:border-blue-500 focus:outline-none">
                                         <option value="16:9">16:9</option>
                                         <option value="9:16">9:16</option>
+                                        <option value="1:1">1:1</option>
                                     </select>
                                 </div>
                             </div>

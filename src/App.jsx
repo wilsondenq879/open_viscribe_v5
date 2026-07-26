@@ -4,7 +4,7 @@ import {
     Type, Mic, Download, Trash2, FolderOpen, Save, FileVideo,
     Image as ImageIcon, GripVertical, ChevronRight, ChevronLeft,
     MousePointerClick, AlertCircle, Upload, Music, Eye, EyeOff, Volume2, VolumeX, FastForward,
-    Undo2, Redo2, Minus, Plus, Bug, Sparkles, Wand2
+    Undo2, Redo2, Minus, Plus, Bug, Sparkles, Wand2, MessageCircle, Send, FolderSearch
 } from 'lucide-react';
 import SettingsModal from './components/modals/SettingsModal';
 import ArticleScreenshotReview from './components/ArticleScreenshotReview';
@@ -102,6 +102,7 @@ import {
 } from './lib/motionDesignUtils';
 import { HYPERFRAME_TEMPLATES, getHyperframeTemplate, getHyperframeTemplateDefaults } from './lib/hyperframeTemplates';
 import { HYPERFRAME_ASSETS } from './lib/hyperframeAssets';
+import { getHyperframeAssetConfig, getMapNodePosition, MAP_LOCATIONS } from './lib/hyperframeAssetConfig';
 import {
     buildCompositeSubtitleText,
     clamp,
@@ -119,7 +120,8 @@ import {
     pickBestScreenshotFrame,
     rehydrateProjectMedia,
     relinkProjectFromDirectory,
-    saveBlobToDB
+    saveBlobToDB,
+    saveFileHandleToDB
 } from './lib/mediaUtils';
 import {
     appendMarkdownTable,
@@ -184,6 +186,148 @@ function normalizeAiSummaryList(items) {
 }
 
 const ARTICLE_CLICK_CANDIDATE_OFFSETS = [-2.0, -1.6, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0];
+
+const ASPECT_RATIO_SPECS = {
+    '16:9': { width: 16, height: 9 },
+    '9:16': { width: 9, height: 16 },
+    '1:1': { width: 1, height: 1 }
+};
+
+function getCanvasDimensions(resolution = '1080p', aspectRatio = '16:9') {
+    const spec = ASPECT_RATIO_SPECS[aspectRatio] || ASPECT_RATIO_SPECS['16:9'];
+    const longEdge = resolution === '720p' ? 1280 : 1920;
+    const landscape = spec.width >= spec.height;
+    const scale = longEdge / (landscape ? spec.width : spec.height);
+    const even = (value) => Math.max(2, Math.round(value / 2) * 2);
+    return {
+        width: even(spec.width * scale),
+        height: even(spec.height * scale),
+        cssAspectRatio: `${spec.width} / ${spec.height}`,
+        isPortrait: spec.height > spec.width,
+        isSquare: spec.width === spec.height
+    };
+}
+
+function getScaledCanvasDimensions(width, height, maxLongEdge = 1280) {
+    const safeWidth = Math.max(2, Number(width) || 1920);
+    const safeHeight = Math.max(2, Number(height) || 1080);
+    const scale = Math.min(1, maxLongEdge / Math.max(safeWidth, safeHeight));
+    const even = (value) => Math.max(2, Math.round(value / 2) * 2);
+    return { width: even(safeWidth * scale), height: even(safeHeight * scale) };
+}
+
+function drawMediaContain(ctx, canvas, media) {
+    if (!ctx || !canvas || !media) return;
+    const sourceWidth = media.videoWidth || media.naturalWidth || 0;
+    const sourceHeight = media.videoHeight || media.naturalHeight || 0;
+    if (!sourceWidth || !sourceHeight) return;
+    const scale = Math.min(canvas.width / sourceWidth, canvas.height / sourceHeight);
+    const width = sourceWidth * scale;
+    const height = sourceHeight * scale;
+    ctx.drawImage(media, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+}
+
+function getImportedMediaType(file) {
+    const mimeType = String(file?.type || '').toLowerCase();
+    const name = String(file?.name || '').toLowerCase();
+    if (mimeType.startsWith('video/') || /\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(name)) return 'video';
+    if (mimeType.startsWith('image/') || /\.(png|jpe?g|webp|gif|avif)$/i.test(name)) return 'image';
+    if (mimeType.startsWith('audio/') || /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(name)) return 'audio';
+    return 'unknown';
+}
+
+function buildFallbackNarrationScript(title, language = 'zh-TW', duration = 28) {
+    const safeTitle = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 54) || '這個重點主題';
+    const lines = language === 'zh-TW'
+        ? [
+            `這支影片帶你快速了解：${safeTitle}。`,
+            '先抓住今天最重要的目標，避免一開始就被細節卡住。',
+            '接著依照畫面中的步驟操作，確認每一個關鍵設定。',
+            '完成後回頭檢查結果，確保流程真的能順利執行。',
+            '最後整理這次的重點，你就可以把同樣的方法套用到自己的專案。'
+        ]
+        : [
+            `In this video, we will quickly cover: ${safeTitle}.`,
+            'Start with the main goal so the important decision is clear.',
+            'Then follow the on-screen steps and verify each key setting.',
+            'Check the result to make sure the workflow completes correctly.',
+            'Finally, take the key idea and apply the same approach to your own project.'
+        ];
+    const cueDuration = Math.max(3.2, Math.min(6.4, duration / lines.length));
+    return lines.map((text, index) => ({
+        text,
+        startAt: Number((index * cueDuration).toFixed(2)),
+        endAt: Number(Math.min(duration, (index + 1) * cueDuration - 0.15).toFixed(2))
+    }));
+}
+
+function normalizeEditorNarration(rawSubtitles, fallbackTitle, language = 'zh-TW', maxDuration = 90) {
+    const raw = Array.isArray(rawSubtitles) ? rawSubtitles : [];
+    const normalized = raw
+        .map((item, index) => {
+            const text = String(item?.text || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+            if (!text) return null;
+            const startCandidate = Number(item?.startAt);
+            const endCandidate = Number(item?.endAt);
+            const startAt = Number.isFinite(startCandidate) && startCandidate >= 0 ? startCandidate : index * 4;
+            const endAt = Number.isFinite(endCandidate) && endCandidate > startAt ? endCandidate : startAt + 3.8;
+            return { text, startAt: Number(startAt.toFixed(2)), endAt: Number(endAt.toFixed(2)) };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.startAt - b.startAt)
+        .slice(0, 80);
+    const safe = normalized.filter(item => item.endAt > item.startAt + 0.2 && item.startAt < maxDuration);
+    const timeline = (safe.length ? safe : buildFallbackNarrationScript(fallbackTitle, language, Math.min(maxDuration, 28)))
+        .map((item, index) => ({
+            ...item,
+            startAt: Number(Math.max(0, Math.min(maxDuration - 0.25, item.startAt)).toFixed(2)),
+            endAt: Number(Math.max(item.startAt + 0.35, Math.min(maxDuration, item.endAt)).toFixed(2)),
+            index
+        }))
+        .filter(item => item.endAt > item.startAt + 0.2);
+    const finalEnd = Number(timeline.at(-1)?.endAt) || 0;
+    if (timeline.length && finalEnd > 0 && finalEnd < maxDuration - 0.5) {
+        const scale = maxDuration / finalEnd;
+        return timeline.map((item, index) => ({
+            ...item,
+            startAt: Number((item.startAt * scale).toFixed(2)),
+            endAt: Number((index === timeline.length - 1 ? maxDuration : item.endAt * scale).toFixed(2)),
+            index
+        }));
+    }
+    return timeline;
+}
+
+function buildLocalEditorPlan({ prompt, assets, language = 'zh-TW' }) {
+    const context = String(prompt || '').toLowerCase();
+    const media = (assets || []).filter(asset => asset?.type === 'video' || asset?.type === 'image');
+    const prefersCreator = /short|reel|tiktok|社群|直式|快節奏/.test(context);
+    const prefersEditorial = /訪談|podcast|故事|品牌|溫暖/.test(context);
+    const contentAssetIds = [
+        /全球|地圖|world|region|跨區|部署/.test(context) ? 'hf-world-map' : '',
+        /console|terminal|cli|指令|終端/.test(context) ? 'hf-console' : '',
+        /流程|flow|步驟|workflow/.test(context) ? 'hf-flowchart' : '',
+        /數據|data|chart|成長/.test(context) ? 'hf-data-chart' : ''
+    ].filter(Boolean);
+    const title = String(prompt || '').trim().slice(0, 48) || (language === 'zh-TW' ? 'AI 自動剪輯影片' : 'AI Edited Video');
+    return {
+        reply: media.length
+            ? `我已讀到 ${media.length} 個可剪輯素材。先建立一版保守的粗剪：依檔案順序串接、保留完整畫面比例，再加上字幕、重點字卡與符合主題的 Contents。你可以在套用後繼續對我說「節奏更快」、「刪掉第二段」或「改成產品發表感」。`
+            : '目前還沒有可剪輯的影片或圖片。先按「掃描工作資料夾」匯入素材；我會在素材進來後建立粗剪、字幕與字卡方案。',
+        title,
+        brief: String(prompt || '').trim(),
+        sequence: media.map(asset => ({ assetId: asset.id })),
+        presetId: prefersCreator ? 'creator' : prefersEditorial ? 'editorial' : 'signal',
+        templateId: prefersCreator ? 'hf-creator-cta' : prefersEditorial ? 'hf-editorial-story' : 'hf-clean-product',
+        contentAssetIds,
+        cards: media.length ? [{ text: title, position: 'opening' }] : [],
+        subtitles: buildFallbackNarrationScript(title, language, Math.max(24, Math.min(45, media.length * 5 || 28))),
+        generateSubtitles: media.some(asset => asset.type === 'video'),
+        localTts: true,
+        voice: { voice: 'Ting-Ting', rate: 185 },
+        source: 'local-editorial-fallback'
+    };
+}
 
 function formatArticleCandidateOffsetLabel(offsetSeconds = 0) {
     const safeOffset = Number.isFinite(Number(offsetSeconds)) ? Number(offsetSeconds) : 0;
@@ -955,6 +1099,38 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 60000, externalSi
     }
 }
 
+// Local models vary in how strictly they follow JSON mode. Keep the editor
+// compatible with Qwen, Gemma, Llama and other Ollama families by accepting a
+// clean JSON object even when the model adds a short prose prefix or fence.
+function parseModelJsonObject(rawText) {
+    const text = String(rawText || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+    try {
+        return JSON.parse(text);
+    } catch (originalError) {
+        const start = text.indexOf('{');
+        if (start < 0) throw originalError;
+        let depth = 0;
+        let quoted = false;
+        let escaped = false;
+        for (let index = start; index < text.length; index++) {
+            const character = text[index];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (character === '\\') escaped = true;
+                else if (character === '"') quoted = false;
+                continue;
+            }
+            if (character === '"') quoted = true;
+            else if (character === '{') depth += 1;
+            else if (character === '}') {
+                depth -= 1;
+                if (depth === 0) return JSON.parse(text.slice(start, index + 1));
+            }
+        }
+        throw originalError;
+    }
+}
+
 async function extractHttpErrorMessage(response) {
     const fallback = `HTTP 錯誤 ${response?.status || ''}`.trim();
     if (!response) return fallback;
@@ -1072,46 +1248,97 @@ async function callLmStudioChat({
     throw new Error(`無法連線到 LM Studio 模型「${model}」。${String(lastError?.message || '未知錯誤')}。請確認 LM Studio Server 已啟動，且可從瀏覽器直接存取 ${endpoint}。`);
 }
 
-async function callOllamaChat({ endpoint, model, prompt, images = [], temperature = 0, format = 'json', numPredict, timeoutMs = 180000, signal }) {
+async function callOllamaChat({ endpoint, model, prompt, images = [], temperature = 0, format = 'json', numPredict, think, timeoutMs = 180000, signal, onProgress }) {
     const options = { temperature };
     if (Number.isFinite(numPredict) && numPredict > 0) options.num_predict = Math.round(numPredict);
     const requestPayload = {
         model,
-        stream: false,
+        stream: typeof onProgress === 'function',
         format,
         options
     };
     const retryDelays = [1200, 2500];
     let lastError = null;
 
-    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-        try {
-            throwIfAborted(signal);
-            const response = await fetchWithTimeout(buildOllamaApiUrl(endpoint, '/api/chat'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ...requestPayload,
-                    messages: [
-                        {
-                            role: 'user',
-                            content: prompt,
-                            images
-                        }
-                    ]
-                })
-            }, timeoutMs, signal);
-
-            if (!response.ok) {
-                const errText = await response.text().catch(() => '');
-                const errHint = errText ? `: ${errText.slice(0, 400)}` : '';
-                throw new Error(`Ollama /api/chat HTTP 錯誤 ${response.status}${errHint}`);
-            }
-
+    const readOllamaResponse = async (response) => {
+        if (typeof onProgress !== 'function') {
             const data = await response.json();
             const rawText = data?.message?.content || data?.response || '';
-            if (!rawText) throw new Error('Ollama /api/chat 沒有回傳可解析內容。');
+            if (!rawText) throw new Error('Ollama 沒有回傳可解析內容。');
             return rawText;
+        }
+        const reader = response.body?.getReader?.();
+        if (!reader) throw new Error('Ollama 串流回應無法讀取。');
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let rawText = '';
+        let done = false;
+        const readLine = (line) => {
+            const trimmed = line.trim();
+            if (!trimmed) return;
+            const data = JSON.parse(trimmed);
+            rawText += data?.message?.content || data?.response || '';
+            if (data?.done) done = true;
+            onProgress({
+                characters: rawText.length,
+                done: Boolean(data?.done),
+                evalCount: Number(data?.eval_count) || 0
+            });
+        };
+        while (!done) {
+            throwIfAborted(signal);
+            const { value, done: streamDone } = await reader.read();
+            buffer += decoder.decode(value || new Uint8Array(), { stream: !streamDone });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            lines.forEach(readLine);
+            if (streamDone) break;
+        }
+        if (buffer.trim()) readLine(buffer);
+        if (!rawText) throw new Error('Ollama 串流沒有回傳可解析內容。');
+        return rawText;
+    };
+
+    const invokeEndpoint = async (path, createBody) => {
+        // Qwen thinking models need `think: false` to keep their final JSON in
+        // `message.content`. Some Gemma/Llama adapters reject that field, so
+        // retry exactly once without it instead of making a model unavailable.
+        const thinkVariants = typeof think === 'boolean' ? [true, false] : [false];
+        let endpointError = null;
+        for (let variantIndex = 0; variantIndex < thinkVariants.length; variantIndex++) {
+            const includeThink = thinkVariants[variantIndex];
+            try {
+                throwIfAborted(signal);
+                const response = await fetchWithTimeout(buildOllamaApiUrl(endpoint, path), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(createBody(includeThink))
+                }, timeoutMs, signal);
+                if (!response.ok) {
+                    const errText = await response.text().catch(() => '');
+                    const errHint = errText ? `: ${errText.slice(0, 400)}` : '';
+                    throw new Error(`Ollama ${path} HTTP 錯誤 ${response.status}${errHint}`);
+                }
+                return await readOllamaResponse(response);
+            } catch (error) {
+                endpointError = error;
+                if (isAiTaskCancelledError(error)) throw error;
+                const message = String(error?.message || '');
+                const canRetryWithoutThink = includeThink && /HTTP 錯誤 400|think|unknown field|invalid parameter/i.test(message);
+                if (canRetryWithoutThink && variantIndex < thinkVariants.length - 1) continue;
+                throw error;
+            }
+        }
+        throw endpointError || new Error(`Ollama ${path} 沒有回傳內容。`);
+    };
+
+    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+        try {
+            return await invokeEndpoint('/api/chat', (includeThink) => ({
+                ...requestPayload,
+                ...(includeThink ? { think } : {}),
+                messages: [{ role: 'user', content: prompt, images }]
+            }));
         } catch (error) {
             lastError = error;
             if (isAiTaskCancelledError(error)) throw error;
@@ -1124,32 +1351,17 @@ async function callOllamaChat({ endpoint, model, prompt, images = [], temperatur
     }
 
     try {
-            throwIfAborted(signal);
-            const response = await fetchWithTimeout(buildOllamaApiUrl(endpoint, '/api/generate'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                ...requestPayload,
-                prompt,
-                images
-            })
-        }, timeoutMs, signal);
-
-        if (!response.ok) {
-            const errText = await response.text().catch(() => '');
-            const errHint = errText ? `: ${errText.slice(0, 400)}` : '';
-            throw new Error(`Ollama /api/generate HTTP 錯誤 ${response.status}${errHint}`);
-        }
-
-        const data = await response.json();
-        const rawText = data?.response || data?.message?.content || '';
-        if (!rawText) throw new Error('Ollama /api/generate 沒有回傳可解析內容。');
-        return rawText;
+        return await invokeEndpoint('/api/generate', (includeThink) => ({
+            ...requestPayload,
+            ...(includeThink ? { think } : {}),
+            prompt,
+            images
+        }));
     } catch (fallbackError) {
         const originalMessage = String(lastError?.message || '').trim();
         const fallbackMessage = String(fallbackError?.message || '').trim();
         if (originalMessage || fallbackMessage) {
-            throw new Error(`無法連線到 Ollama 文章模型「${model}」。chat: ${originalMessage || '未知錯誤'}；generate: ${fallbackMessage || '未知錯誤'}。請確認 Ollama 服務仍在線、模型已下載完成，並且 endpoint 可直接從瀏覽器存取。`);
+            throw new Error(`無法連線到 Ollama 模型「${model}」。chat: ${originalMessage || '未知錯誤'}；generate: ${fallbackMessage || '未知錯誤'}。請確認 Ollama 服務仍在線、模型已下載完成，並且 endpoint 可直接從瀏覽器存取。`);
         }
         throw fallbackError;
     }
@@ -1567,15 +1779,17 @@ function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, 
     );
 }
 
-function HyperframeAssetPreview({ asset, className = '' }) {
+function HyperframeAssetPreview({ asset, config: suppliedConfig, className = '' }) {
     const preset = getMotionDesignPreset(asset.presetId);
+    const config = getHyperframeAssetConfig(asset, suppliedConfig);
     const accent = preset.accent;
     const alt = preset.accentAlt;
     const foreground = preset.foreground;
     const previewId = useId().replace(/:/g, '');
     const catalogLabel = String(asset.catalogId || '').replace(/^code-snippet-/, '').toUpperCase();
     const renderWorldMap = (showFlow = false) => {
-        const nodes = [[132, 80, 'US'], [171, 75, 'EU'], [210, 101, 'APAC']];
+        const nodes = config.nodes.map(node => ({ ...getMapNodePosition(node), id: node.id }));
+        const nodeById = new Map(nodes.map(node => [node.id, node]));
         return (
             <svg viewBox="0 0 320 160" className="absolute inset-0 h-full w-full" aria-hidden="true">
                 <defs>
@@ -1596,8 +1810,8 @@ function HyperframeAssetPreview({ asset, className = '' }) {
                     <filter id={`map-shadow-${previewId}`} x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="4" /></filter>
                     <clipPath id={`map-globe-clip-${previewId}`}><circle cx="170" cy="92" r="62" /></clipPath>
                 </defs>
-                <text x="18" y="19" fill={foreground} opacity="0.92" fontSize="8" fontWeight="700" letterSpacing="1.45">{showFlow ? 'GLOBAL ROUTING' : 'GLOBAL INFRASTRUCTURE'}</text>
-                <text x="18" y="31" fill={foreground} opacity="0.43" fontSize="6" letterSpacing="0.9">{showFlow ? 'LIVE PATH / MULTI-REGION' : 'LIVE COVERAGE / 03 REGIONS'}</text>
+                <text x="18" y="19" fill={foreground} opacity="0.92" fontSize="8" fontWeight="700" letterSpacing="1.1">{config.heading.toUpperCase()}</text>
+                <text x="18" y="31" fill={foreground} opacity="0.43" fontSize="6" letterSpacing="0.9">{showFlow ? 'LIVE PATH / MULTI-REGION' : `LIVE COVERAGE / ${String(nodes.length).padStart(2, '0')} NODES`}</text>
                 <g transform="translate(0 1)">
                     <circle cx="170" cy="94" r="66" fill={accent} opacity="0.18" filter={`url(#map-shadow-${previewId})`} />
                     <circle cx="170" cy="92" r="64" fill={`url(#map-ocean-${previewId})`} stroke={`${foreground}44`} strokeWidth="1" />
@@ -1621,11 +1835,10 @@ function HyperframeAssetPreview({ asset, className = '' }) {
                     <circle cx="170" cy="92" r="64" fill="none" stroke={`${foreground}26`} strokeWidth="1.25" />
                     <path d="M108 92 H232" stroke={`${foreground}1c`} />
                     <path d="M170 28 V156" stroke={`${foreground}16`} />
-                    {showFlow && <g className="hyperframe-preview-flow" fill="none" stroke={`url(#map-route-${previewId})`} strokeWidth="2.1"><path d="M132 80 Q151 42 171 75" /><path d="M171 75 Q204 51 210 101" /></g>}
-                    {!showFlow && <g fill="none" stroke={`${alt}5e`} strokeWidth="0.9" opacity="0.7"><path d="M132 80 Q151 59 171 75" /><path d="M171 75 Q193 70 210 101" /></g>}
-                    {nodes.map(([cx, cy, label], index) => <g key={label} className="hyperframe-preview-node" style={{ '--node-delay': `${index * -0.34}s` }}><circle cx={cx} cy={cy} r="9" fill="none" stroke={index === 2 ? alt : accent} strokeWidth="0.8" opacity="0.55" /><circle cx={cx} cy={cy} r="4.1" fill={index === 2 ? alt : accent} stroke={preset.background} strokeWidth="1.5" /><text x={cx + 7} y={cy - 6} fill={foreground} opacity="0.9" fontSize="5.5" fontFamily="monospace" fontWeight="700">{label}</text></g>)}
+                    <g className={showFlow ? 'hyperframe-preview-flow' : ''} fill="none" stroke={showFlow ? `url(#map-route-${previewId})` : `${alt}5e`} strokeWidth={showFlow ? '2.1' : '0.9'} opacity={showFlow ? 1 : 0.7}>{config.routes.map(route => { const from = nodeById.get(route.from); const to = nodeById.get(route.to); if (!from || !to) return null; const ax = 108 + from.x * 1.24; const ay = 28 + from.y * 1.28; const bx = 108 + to.x * 1.24; const by = 28 + to.y * 1.28; return <path key={route.id} d={`M${ax} ${ay} Q${(ax + bx) / 2} ${Math.min(ay, by) - 22} ${bx} ${by}`} />; })}</g>
+                    {nodes.map((node, index) => { const cx = 108 + node.x * 1.24; const cy = 28 + node.y * 1.28; return <g key={node.id} className="hyperframe-preview-node" style={{ '--node-delay': `${index * -0.34}s` }}><circle cx={cx} cy={cy} r="9" fill="none" stroke={index === nodes.length - 1 ? alt : accent} strokeWidth="0.8" opacity="0.55" /><circle cx={cx} cy={cy} r="4.1" fill={index === nodes.length - 1 ? alt : accent} stroke={preset.background} strokeWidth="1.5" /><text x={cx + 7} y={cy - 6} fill={foreground} opacity="0.9" fontSize="5.5" fontFamily="monospace" fontWeight="700">{node.label}</text></g>; })}
                 </g>
-                <g transform="translate(18 133)"><rect width="86" height="12" rx="6" fill={`${preset.surface}d9`} stroke={`${foreground}24`} /><circle cx="9" cy="6" r="2.2" fill={accent} /><text x="15" y="8.2" fill={foreground} opacity="0.74" fontSize="5.5" fontWeight="700" letterSpacing="0.45">NETWORK ONLINE</text></g>
+                <g transform="translate(18 133)"><rect width="112" height="12" rx="6" fill={`${preset.surface}d9`} stroke={`${foreground}24`} /><circle cx="9" cy="6" r="2.2" fill={accent} /><text x="15" y="8.2" fill={foreground} opacity="0.74" fontSize="5.5" fontWeight="700" letterSpacing="0.45">{config.status.toUpperCase()}</text></g>
                 <text x="270" y="143" fill={foreground} opacity="0.42" fontSize="5.5" textAnchor="end" letterSpacing="0.8">UTC · LIVE</text>
             </svg>
         );
@@ -1635,8 +1848,8 @@ function HyperframeAssetPreview({ asset, className = '' }) {
         const isConsole = asset.assetType === 'console';
         const isTyping = asset.assetType === 'code-typing';
         return <div className="absolute inset-[9%] rounded-xl border border-white/15 bg-[#071019] p-3 shadow-inner shadow-black/40">
-            <div className="mb-3 flex items-center gap-1.5">{[accent, alt, foreground].map((color, index) => <span key={index} className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />)}<span className="ml-2 font-mono text-[7px] text-white/45">{isConsole ? 'deploy@global:~' : isDiff ? 'release.diff' : 'deploy.config.ts'}</span></div>
-            {isDiff ? <div className="grid grid-cols-2 gap-2"><div className="rounded-lg border border-rose-300/20 bg-rose-400/10 p-2"><span className="font-mono text-[8px] text-rose-200">− region: legacy</span><span className="mt-2 block h-1.5 w-4/5 rounded bg-rose-300/60" /><span className="mt-1.5 block h-1.5 w-3/5 rounded bg-rose-300/35" /></div><div className="rounded-lg border border-emerald-300/20 bg-emerald-400/10 p-2"><span className="font-mono text-[8px] text-emerald-200">+ region: apac</span><span className="mt-2 block h-1.5 w-4/5 rounded bg-emerald-300/60" /><span className="mt-1.5 block h-1.5 w-3/5 rounded bg-emerald-300/35" /></div></div> : <div className="space-y-2 font-mono text-[9px]">{isConsole && <div className="text-white/85"><span className="text-emerald-300">user@studio %</span> deploy --region apac</div>}{[0, 1, 2].map(index => <div key={index} className="hyperframe-preview-code-line flex gap-2" style={{ '--line-delay': `${index * -0.28}s` }}><span style={{ color: alt }}>{isConsole ? '✓' : `${index + 1}`}</span><span className="h-1.5 rounded" style={{ width: `${52 + index * 13}%`, backgroundColor: index % 2 ? alt : accent }} /></div>)}{isTyping && <span className="hyperframe-preview-cursor inline-block h-3 w-1.5" style={{ backgroundColor: foreground }} />}</div>}
+            <div className="mb-3 flex items-center gap-1.5">{[accent, alt, foreground].map((color, index) => <span key={index} className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />)}<span className="ml-2 font-mono text-[7px] text-white/45">{isConsole ? config.windowTitle : isDiff ? 'release.diff' : config.fileName}</span></div>
+            {isDiff ? <div className="grid grid-cols-2 gap-2"><div className="rounded-lg border border-rose-300/20 bg-rose-400/10 p-2"><span className="font-mono text-[8px] text-rose-200">− {config.beforeTitle}</span><span className="mt-2 block line-clamp-2 whitespace-pre-wrap font-mono text-[7px] text-rose-100/80">{config.beforeCode}</span></div><div className="rounded-lg border border-emerald-300/20 bg-emerald-400/10 p-2"><span className="font-mono text-[8px] text-emerald-200">+ {config.afterTitle}</span><span className="mt-2 block line-clamp-2 whitespace-pre-wrap font-mono text-[7px] text-emerald-100/80">{config.afterCode}</span></div></div> : <div className="space-y-2 font-mono text-[9px]">{isConsole && <div className="text-white/85"><span className="text-emerald-300">user@studio %</span> {config.command}</div>}{(isConsole ? config.lines : config.code.split('\n')).slice(0, 3).map((line, index) => <div key={index} className="hyperframe-preview-code-line flex gap-2" style={{ '--line-delay': `${index * -0.28}s` }}><span style={{ color: alt }}>{isConsole ? '✓' : `${index + 1}`}</span><span className="truncate text-white/75">{line}</span></div>)}{isTyping && <span className="hyperframe-preview-cursor inline-block h-3 w-1.5" style={{ backgroundColor: foreground }} />}</div>}
         </div>;
     };
     const renderProduct = () => {
@@ -1644,18 +1857,19 @@ function HyperframeAssetPreview({ asset, className = '' }) {
         const isGlass = asset.assetType === 'liquid-glass';
         return <div className={`hyperframe-preview-product absolute ${isDevice ? 'left-[37%] top-[8%] h-[84%] w-[26%] rounded-[18px]' : 'inset-[15%] rounded-xl'} border shadow-2xl`} style={{ backgroundColor: isGlass ? `${foreground}18` : `${preset.surface}ee`, borderColor: `${accent}bb`, backdropFilter: isGlass ? 'blur(9px)' : undefined }}>
             <div className="mx-auto mt-[9%] h-2 w-1/3 rounded-full bg-white/25" />
-            <div className="mx-[12%] mt-[11%] rounded-lg border border-white/10 p-2" style={{ backgroundColor: `${alt}66` }}><div className="flex items-center justify-between"><div className="h-2 w-2/5 rounded bg-white/80" /><div className="h-2 w-2 rounded-full" style={{ backgroundColor: accent }} /></div><div className="mt-3 grid grid-cols-3 gap-1"><span className="h-6 rounded bg-white/18" /><span className="h-6 rounded bg-white/10" /><span className="h-6 rounded bg-white/14" /></div><div className="mt-2 h-1.5 w-full rounded bg-white/45" /><div className="mt-1.5 h-1.5 w-4/5 rounded bg-white/30" /></div>
+            <div className="mx-[12%] mt-[11%] rounded-lg border border-white/10 p-2" style={{ backgroundColor: `${alt}66` }}><div className="flex items-center justify-between"><div className="truncate text-[8px] font-bold text-white/90">{config.productName}</div><div className="h-2 w-2 rounded-full" style={{ backgroundColor: accent }} /></div><div className="mt-2 truncate text-[8px] text-white/70">{config.headline}</div><div className="mt-3 grid grid-cols-3 gap-1"><span className="h-6 rounded bg-white/18" /><span className="h-6 rounded bg-white/10" /><span className="h-6 rounded bg-white/14" /></div><div className="mt-2 text-[7px] font-bold" style={{ color: accent }}>{config.metric}</div></div>
         </div>;
     };
     const renderDiagram = () => {
-        if (asset.assetType === 'data-chart') return <svg viewBox="0 0 320 160" className="absolute inset-0 h-full w-full" aria-hidden="true"><text x="35" y="24" fill={foreground} opacity="0.85" fontSize="8" fontWeight="700">ADOPTION RATE</text><path d="M35 130 H290 M35 30 V130" stroke={`${foreground}4a`} strokeWidth="2" />{[0.32, 0.58, 0.43, 0.76, 0.92].map((bar, index) => <rect key={index} className="hyperframe-preview-bar" x={58 + index * 43} y={130 - bar * 88} width="22" height={bar * 88} rx="5" fill={index === 4 ? accent : `${alt}bb`} style={{ '--bar-delay': `${index * -0.16}s` }} />)}<path className="hyperframe-preview-chart-line" d="M69 94 L112 66 L155 80 L198 45 L241 36" fill="none" stroke={foreground} strokeWidth="3" /></svg>;
+        if (asset.assetType === 'data-chart') { const values = config.values; const points = values.map((item, index) => `${58 + index * (205 / Math.max(1, values.length - 1))} ${130 - item.value * 0.88}`).join(' L'); return <svg viewBox="0 0 320 160" className="absolute inset-0 h-full w-full" aria-hidden="true"><text x="35" y="24" fill={foreground} opacity="0.85" fontSize="8" fontWeight="700">{config.heading.toUpperCase()}</text><path d="M35 130 H290 M35 30 V130" stroke={`${foreground}4a`} strokeWidth="2" />{values.map((item, index) => { const x = 52 + index * (215 / values.length); const h = item.value * 0.88; return <g key={item.label}><rect className="hyperframe-preview-bar" x={x} y={130 - h} width={Math.min(26, 155 / values.length)} height={h} rx="5" fill={index === values.length - 1 ? accent : `${alt}bb`} style={{ '--bar-delay': `${index * -0.16}s` }} /><text x={x} y="145" fill={foreground} opacity=".65" fontSize="5">{item.label}</text></g>; })}<path className="hyperframe-preview-chart-line" d={`M${points}`} fill="none" stroke={foreground} strokeWidth="3" /></svg>; }
         const roadmap = asset.assetType === 'release-roadmap';
-        return <div className="absolute inset-x-[9%] top-[26%] flex items-center justify-between"><div className="absolute left-[8%] right-[8%] top-1/2 h-0.5 -translate-y-1/2 bg-white/20" />{(roadmap ? ['v1.0', 'v1.5', 'v2.0'] : ['設定', '部署', '驗證']).map((label, index) => <div key={label} className="hyperframe-preview-step relative z-10 flex h-12 w-[27%] flex-col items-center justify-center rounded-lg border text-[8px] font-bold" style={{ backgroundColor: `${preset.surface}f2`, borderColor: index === 2 ? accent : `${foreground}55`, color: index === 2 ? accent : foreground, '--step-delay': `${index * -0.25}s` }}>{label}<span className="mt-1 h-1 w-5 rounded" style={{ backgroundColor: index === 2 ? accent : alt }} /></div>)}</div>;
+        const labels = roadmap ? config.milestones : config.steps;
+        return <div className="absolute inset-x-[9%] top-[26%] flex items-center justify-between"><div className="absolute left-[8%] right-[8%] top-1/2 h-0.5 -translate-y-1/2 bg-white/20" />{labels.map((label, index) => <div key={`${label}-${index}`} className="hyperframe-preview-step relative z-10 flex h-12 w-[27%] flex-col items-center justify-center rounded-lg border text-[8px] font-bold" style={{ backgroundColor: `${preset.surface}f2`, borderColor: index === labels.length - 1 ? accent : `${foreground}55`, color: index === labels.length - 1 ? accent : foreground, '--step-delay': `${index * -0.25}s` }}>{label}<span className="mt-1 h-1 w-5 rounded" style={{ backgroundColor: index === labels.length - 1 ? accent : alt }} /></div>)}</div>;
     };
     const renderSocialOrText = () => {
-        if (asset.assetType === 'news-ticker') return <div className="hyperframe-preview-ticker absolute inset-x-0 bottom-[18%] flex h-9 items-center whitespace-nowrap px-4 text-[9px] font-extrabold" style={{ backgroundColor: accent, color: preset.background }}>BREAKING · 部署狀態已更新 · 服務健康檢查完成 ·</div>;
-        if (asset.assetType === 'caption-highlight') return <div className="absolute inset-0 flex flex-col items-center justify-center px-4 text-center font-extrabold leading-tight"><span className="text-sm" style={{ color: foreground }}>三步完成</span><span className="mt-1 text-base" style={{ color: accent }}>全球部署</span></div>;
-        return <div className="absolute inset-x-[14%] top-[25%] rounded-xl border p-3" style={{ backgroundColor: `${preset.surface}ee`, borderColor: `${accent}99` }}><div className="flex items-center gap-2"><span className="h-8 w-8 rounded-full" style={{ backgroundColor: alt }} /><div><div className="text-[9px] font-extrabold" style={{ color: foreground }}>OPEN VISCRIBE</div><div className="mt-1 h-1.5 w-16 rounded bg-white/30" /></div></div><span className="mt-3 block w-full rounded py-1 text-center text-[8px] font-bold" style={{ backgroundColor: accent, color: preset.background }}>FOLLOW / 訂閱</span></div>;
+        if (asset.assetType === 'news-ticker') return <div className="hyperframe-preview-ticker absolute inset-x-0 bottom-[18%] flex h-9 items-center whitespace-nowrap px-4 text-[9px] font-extrabold" style={{ backgroundColor: accent, color: preset.background }}>{config.prefix} · {config.message} ·</div>;
+        if (asset.assetType === 'caption-highlight') return <div className="absolute inset-0 flex flex-col items-center justify-center px-4 text-center font-extrabold leading-tight"><span className="text-sm" style={{ color: foreground }}>{config.line}</span><span className="mt-1 text-base" style={{ color: accent }}>{config.highlight}</span></div>;
+        return <div className="absolute inset-x-[14%] top-[25%] rounded-xl border p-3" style={{ backgroundColor: `${preset.surface}ee`, borderColor: `${accent}99` }}><div className="flex items-center gap-2"><span className="h-8 w-8 rounded-full" style={{ backgroundColor: alt }} /><div><div className="text-[9px] font-extrabold" style={{ color: foreground }}>{config.handle}</div><div className="mt-1 h-1.5 w-16 rounded bg-white/30" /></div></div><span className="mt-3 block w-full rounded py-1 text-center text-[8px] font-bold" style={{ backgroundColor: accent, color: preset.background }}>{config.cta}</span></div>;
     };
     return (
         <div className={`hyperframe-asset-preview relative overflow-hidden rounded-xl border border-white/10 ${className}`} style={{ backgroundColor: preset.background, '--hyperframe-accent': preset.accent, '--hyperframe-alt': preset.accentAlt, '--hyperframe-foreground': preset.foreground }} aria-label={`${asset.nameZh} 動態預覽`}>
@@ -1670,6 +1884,34 @@ function HyperframeAssetPreview({ asset, className = '' }) {
             <div className="absolute bottom-2 left-3 rounded bg-black/35 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">{asset.category}</div>
         </div>
     );
+}
+
+function HyperframeAssetParameterEditor({ asset, value, onChange }) {
+    const config = getHyperframeAssetConfig(asset, value);
+    const set = (patch) => onChange(getHyperframeAssetConfig(asset, { ...config, ...patch }));
+    const inputClass = 'mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white placeholder:text-gray-600 focus:border-violet-300 focus:outline-none';
+    const label = (caption, control) => <label className="block text-[10px] text-gray-400">{caption}{control}</label>;
+    const type = asset.assetType;
+    if (type === 'world-map' || type === 'world-flow') {
+        const updateNode = (index, patch) => set({ nodes: config.nodes.map((node, itemIndex) => itemIndex === index ? { ...node, ...patch } : node) });
+        const updateRoute = (index, patch) => set({ routes: config.routes.map((route, itemIndex) => itemIndex === index ? { ...route, ...patch } : route) });
+        return <div className="space-y-3 border-t border-violet-200/15 pt-3">
+            <div className="flex items-center justify-between"><div className="text-[11px] font-bold text-violet-100">地圖內容</div><button type="button" onClick={() => onChange(getHyperframeAssetConfig(asset, null))} className="text-[10px] text-violet-200 hover:text-white">重設範例</button></div>
+            <div className="grid grid-cols-2 gap-2">{label('地圖標題', <input value={config.heading} onChange={(event) => set({ heading: event.target.value })} className={inputClass} />)}{label('狀態標籤', <input value={config.status} onChange={(event) => set({ status: event.target.value })} className={inputClass} />)}</div>
+            <div className="rounded-xl border border-white/10 bg-black/20 p-2 space-y-2"><div className="flex items-center justify-between text-[10px] font-semibold text-gray-200"><span>節點／國家</span><button type="button" disabled={config.nodes.length >= 6} onClick={() => set({ nodes: [...config.nodes, { id: `node-${Date.now()}`, locationId: 'japan', label: 'JAPAN' }] })} className="text-violet-200 disabled:text-gray-600">＋ 新增</button></div>{config.nodes.map((node, index) => <div key={node.id} className="grid grid-cols-[1fr_1fr_auto] gap-1"><select value={node.locationId} onChange={(event) => { const location = MAP_LOCATIONS.find(item => item.id === event.target.value); updateNode(index, { locationId: event.target.value, label: location?.label || node.label }); }} className="rounded border border-gray-700 bg-gray-950 px-1.5 py-1 text-[10px] text-white">{MAP_LOCATIONS.map(location => <option key={location.id} value={location.id}>{location.country} · {location.label}</option>)}</select><input value={node.label} onChange={(event) => updateNode(index, { label: event.target.value })} aria-label="節點標籤" className="rounded border border-gray-700 bg-gray-950 px-1.5 py-1 text-[10px] text-white" /> <button type="button" disabled={config.nodes.length <= 2} onClick={() => { const nextNodes = config.nodes.filter((_, itemIndex) => itemIndex !== index); set({ nodes: nextNodes, routes: config.routes.filter(route => route.from !== node.id && route.to !== node.id) }); }} className="rounded border border-rose-300/20 px-1 text-[10px] text-rose-200 disabled:text-gray-600">×</button></div>)}</div>
+            <div className="rounded-xl border border-white/10 bg-black/20 p-2 space-y-2"><div className="flex items-center justify-between text-[10px] font-semibold text-gray-200"><span>連線</span><button type="button" disabled={config.nodes.length < 2 || config.routes.length >= 8} onClick={() => set({ routes: [...config.routes, { id: `route-${Date.now()}`, from: config.nodes[0]?.id, to: config.nodes.at(-1)?.id }] })} className="text-violet-200 disabled:text-gray-600">＋ 新增</button></div>{config.routes.length === 0 && <div className="text-[10px] text-gray-500">尚未設定連線。</div>}{config.routes.map((route, index) => <div key={route.id} className="grid grid-cols-[1fr_1fr_auto] gap-1"><select value={route.from} onChange={(event) => updateRoute(index, { from: event.target.value })} className="rounded border border-gray-700 bg-gray-950 px-1.5 py-1 text-[10px] text-white">{config.nodes.map(node => <option key={node.id} value={node.id}>{node.label}</option>)}</select><select value={route.to} onChange={(event) => updateRoute(index, { to: event.target.value })} className="rounded border border-gray-700 bg-gray-950 px-1.5 py-1 text-[10px] text-white">{config.nodes.map(node => <option key={node.id} value={node.id}>{node.label}</option>)}</select><button type="button" onClick={() => set({ routes: config.routes.filter((_, itemIndex) => itemIndex !== index) })} className="rounded border border-rose-300/20 px-1 text-[10px] text-rose-200">×</button></div>)}</div>
+        </div>;
+    }
+    if (type === 'data-chart') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">圖表資料</div><div className="grid grid-cols-2 gap-2">{label('圖表標題', <input value={config.heading} onChange={(event) => set({ heading: event.target.value })} className={inputClass} />)}{label('數值單位', <input value={config.unit} onChange={(event) => set({ unit: event.target.value })} className={inputClass} />)}</div>{config.values.map((item, index) => <div key={index} className="grid grid-cols-[1fr_70px] gap-2">{label(`項目 ${index + 1}`, <input value={item.label} onChange={(event) => set({ values: config.values.map((value, itemIndex) => itemIndex === index ? { ...value, label: event.target.value } : value) })} className={inputClass} />)}{label('數值', <input type="number" min="0" max="100" value={item.value} onChange={(event) => set({ values: config.values.map((value, itemIndex) => itemIndex === index ? { ...value, value: Number(event.target.value) } : value) })} className={inputClass} />)}</div>)}</div>;
+    if (type === 'flowchart' || type === 'release-roadmap') { const key = type === 'flowchart' ? 'steps' : 'milestones'; const heading = type === 'flowchart' ? '流程圖內容' : '路線圖內容'; return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">{heading}</div>{label('標題', <input value={config.heading} onChange={(event) => set({ heading: event.target.value })} className={inputClass} />)}{config[key].map((item, index) => label(`${type === 'flowchart' ? '步驟' : '里程碑'} ${index + 1}`, <input key={index} value={item} onChange={(event) => set({ [key]: config[key].map((value, itemIndex) => itemIndex === index ? event.target.value : value) })} className={inputClass} />))}</div>; }
+    if (type === 'console') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">終端機內容</div>{label('視窗名稱', <input value={config.windowTitle} onChange={(event) => set({ windowTitle: event.target.value })} className={inputClass} />)}{label('指令', <input value={config.command} onChange={(event) => set({ command: event.target.value })} className={inputClass} />)}{label('輸出（每行一則）', <textarea value={config.lines.join('\n')} onChange={(event) => set({ lines: event.target.value.split('\n') })} className={`${inputClass} h-20 resize-y`} />)}</div>;
+    if (type === 'code-diff') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">程式碼差異</div><div className="grid grid-cols-2 gap-2">{label('前版本標題', <input value={config.beforeTitle} onChange={(event) => set({ beforeTitle: event.target.value })} className={inputClass} />)}{label('後版本標題', <input value={config.afterTitle} onChange={(event) => set({ afterTitle: event.target.value })} className={inputClass} />)}</div>{label('移除／舊程式碼', <textarea value={config.beforeCode} onChange={(event) => set({ beforeCode: event.target.value })} className={`${inputClass} h-16 resize-y font-mono`} />)}{label('新增／新程式碼', <textarea value={config.afterCode} onChange={(event) => set({ afterCode: event.target.value })} className={`${inputClass} h-16 resize-y font-mono`} />)}</div>;
+    if (type === 'code-typing' || type === 'neon-code') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">程式碼內容</div>{label('檔名', <input value={config.fileName} onChange={(event) => set({ fileName: event.target.value })} className={inputClass} />)}{label('程式碼', <textarea value={config.code} onChange={(event) => set({ code: event.target.value })} className={`${inputClass} h-20 resize-y font-mono`} />)}</div>;
+    if (['app-showcase', 'device-reveal', 'liquid-glass'].includes(type)) return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">產品內容</div>{label('產品名稱', <input value={config.productName} onChange={(event) => set({ productName: event.target.value })} className={inputClass} />)}{label('主標', <input value={config.headline} onChange={(event) => set({ headline: event.target.value })} className={inputClass} />)}{label('指標／提示', <input value={config.metric} onChange={(event) => set({ metric: event.target.value })} className={inputClass} />)}</div>;
+    if (type === 'social-follow') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">社群卡內容</div>{label('帳號', <input value={config.handle} onChange={(event) => set({ handle: event.target.value })} className={inputClass} />)}{label('按鈕文字', <input value={config.cta} onChange={(event) => set({ cta: event.target.value })} className={inputClass} />)}</div>;
+    if (type === 'news-ticker') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">跑馬燈內容</div>{label('前綴', <input value={config.prefix} onChange={(event) => set({ prefix: event.target.value })} className={inputClass} />)}{label('訊息', <textarea value={config.message} onChange={(event) => set({ message: event.target.value })} className={`${inputClass} h-16 resize-y`} />)}</div>;
+    if (type === 'caption-highlight') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">字幕內容</div>{label('一般文字', <input value={config.line} onChange={(event) => set({ line: event.target.value })} className={inputClass} />)}{label('高亮文字', <input value={config.highlight} onChange={(event) => set({ highlight: event.target.value })} className={inputClass} />)}</div>;
+    return null;
 }
 
 function TransitionMotionPreview({ preset, color }) {
@@ -1715,6 +1957,16 @@ function MediaLibraryPreview({ asset }) {
 
 function buildAutomationProjectSnapshot(projectState, activeSkillId, isRecording) {
     const tracks = Array.isArray(projectState?.tracks) ? projectState.tracks : [];
+    const availableMedia = (Array.isArray(projectState?.assets) ? projectState.assets : [])
+        .filter(asset => asset && ['video', 'image', 'audio'].includes(asset.type))
+        .map(asset => ({
+            id: String(asset.id || ''),
+            name: String(asset.name || '未命名素材').slice(0, 240),
+            type: asset.type,
+            duration: Number.isFinite(Number(asset.duration)) ? Number(Number(asset.duration).toFixed(2)) : null,
+            fileSize: Number.isFinite(Number(asset.fileSize)) ? Number(asset.fileSize) : null,
+            sourceKind: String(asset.sourceKind || 'local')
+        }));
     const duration = Math.max(0, ...tracks.flatMap(track => (track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0))), ...((projectState?.subtitles || []).map(item => Number(item?.endAt || 0))), ...((projectState?.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))));
     const activeSkill = getSkillById(activeSkillId);
     const markdown = String(projectState?.[activeSkill.markdownField] || '');
@@ -1723,7 +1975,12 @@ function buildAutomationProjectSnapshot(projectState, activeSkillId, isRecording
         skillId: activeSkillId,
         title: projectState?.articleTopic || projectState?.tutorialDescription || '',
         duration: Number(duration.toFixed(2)),
-        mediaCount: tracks.flat().length,
+        // `mediaCount` is the source library that an agent can choose from;
+        // timelineClipCount remains separate so an empty timeline is not
+        // mistaken for an empty working folder.
+        mediaCount: availableMedia.length,
+        timelineClipCount: tracks.flat().length,
+        availableMedia,
         subtitleCount: Array.isArray(projectState?.subtitles) ? projectState.subtitles.length : 0,
         capturedFrameCount: Array.isArray(projectState?.[activeSkill.frameField]) ? projectState[activeSkill.frameField].length : 0,
         hasArticle: Boolean(markdown.trim()),
@@ -1739,6 +1996,28 @@ function buildAutomationProjectSnapshot(projectState, activeSkillId, isRecording
             : null,
         updatedAt: new Date().toISOString()
     };
+}
+
+function describeAgentEditRequestStatus(request, language = 'zh-TW') {
+    const status = String(request?.status || '').toLowerCase();
+    const isCodexDispatching = String(request?.requestedAgent || '').toLowerCase() === 'codex' && ['starting', 'running'].includes(String(request?.dispatchStatus || '').toLowerCase());
+    const codexDispatchError = String(request?.dispatchError || '').trim();
+    if (language !== 'zh-TW') {
+        if (status === 'pending' && codexDispatchError) return { label: 'Codex did not start', detail: codexDispatchError, tone: 'rose' };
+        if (status === 'pending' && isCodexDispatching) return { label: 'Starting Codex', detail: 'OpenViscribe is launching the local Codex planner. It will claim the task and return a reviewable plan shortly.', tone: 'cyan' };
+        if (status === 'pending') return { label: 'Waiting for an MCP agent', detail: 'The local MCP queue has the request, but no connected agent has claimed it yet.', tone: 'amber' };
+        if (status === 'claimed' || status === 'running') return { label: 'Agent is working', detail: 'A connected agent has claimed the request and is preparing the edit plan.', tone: 'cyan' };
+        if (status === 'proposed') return { label: 'Plan returned', detail: 'The agent sent an edit plan to Studio. Review it above before applying it to the timeline.', tone: 'emerald' };
+        if (status === 'failed') return { label: 'Agent task failed', detail: 'The agent reported a failure. Send the request again after checking its MCP connection.', tone: 'rose' };
+        return { label: 'No active MCP request', detail: 'Send an edit direction to create a local MCP task.', tone: 'slate' };
+    }
+    if (status === 'pending' && codexDispatchError) return { label: 'Codex 未能啟動', detail: codexDispatchError, tone: 'rose' };
+    if (status === 'pending' && isCodexDispatching) return { label: '正在啟動 Codex', detail: 'OpenViscribe 正在啟動本機 Codex 規劃員；它會領取任務並將剪輯方案送回這裡。', tone: 'cyan' };
+    if (status === 'pending') return { label: '等待 MCP Agent 領取', detail: '任務已進入本機 MCP 佇列，但目前沒有 Agent 讀取它。它不會自動傳到此 Codex 對話。', tone: 'amber' };
+    if (status === 'claimed' || status === 'running') return { label: 'Agent 正在規劃', detail: '已有連線的 Agent 領取任務，正在建立剪輯方案。', tone: 'cyan' };
+    if (status === 'proposed') return { label: '剪輯方案已送回', detail: 'Agent 已送回方案；請在上方「待套用剪輯方案」檢視後再套用。', tone: 'emerald' };
+    if (status === 'failed') return { label: 'Agent 任務失敗', detail: 'Agent 回報失敗，請確認該 Agent 的 OpenViscribe MCP 連線後再送一次。', tone: 'rose' };
+    return { label: '尚未建立 MCP 任務', detail: '送出剪輯方向後，這裡會顯示任務是否正在等待、被領取或已回傳方案。', tone: 'slate' };
 }
 
 export default function App() {
@@ -1772,6 +2051,42 @@ export default function App() {
         }
         return parsed;
     });
+    const canvasDimensions = useMemo(
+        () => getCanvasDimensions(settings.resolution, settings.aspectRatio),
+        [settings.resolution, settings.aspectRatio]
+    );
+    // A vertical edit needs a fundamentally different workspace: keeping a tall
+    // monitor in the middle starves the timeline.  Shorts therefore uses the
+    // left monitor + centre asset browser arrangement instead of the long-form
+    // centre-preview arrangement.
+    const isShortsEditingWorkspace = activeSkillId === 'shorts' && canvasDimensions.isPortrait;
+    const previewCanvasStyle = useMemo(() => {
+        if (isShortsEditingWorkspace) {
+            return {
+                aspectRatio: canvasDimensions.cssAspectRatio,
+                height: 'min(100%, 680px)',
+                width: 'auto',
+                maxWidth: '100%'
+            };
+        }
+        if (canvasDimensions.isPortrait) {
+            return {
+                aspectRatio: canvasDimensions.cssAspectRatio,
+                height: 'min(68vh, 760px)',
+                width: 'auto',
+                maxWidth: '100%'
+            };
+        }
+        if (canvasDimensions.isSquare) {
+            return {
+                aspectRatio: canvasDimensions.cssAspectRatio,
+                height: 'min(62vh, 720px)',
+                width: 'auto',
+                maxWidth: '100%'
+            };
+        }
+        return { aspectRatio: canvasDimensions.cssAspectRatio };
+    }, [canvasDimensions, isShortsEditingWorkspace]);
     const [automationProjectId, setAutomationProjectId] = useState('');
     const pendingAutomationApprovalRef = useRef(null);
     const pendingAutomationRenderRef = useRef(null);
@@ -1794,9 +2109,40 @@ export default function App() {
                 : false
     );
     const [showHelp, setShowHelp] = useState(false);
+    const [showAiEditor, setShowAiEditor] = useState(false);
+    const [aiEditorSource, setAiEditorSource] = useState(() => localStorage.getItem('openviscribe_ai_editor_source') || (settings.automationApiEnabled ? 'mcp' : 'provider'));
+    const [aiEditorAgent, setAiEditorAgent] = useState(() => localStorage.getItem('openviscribe_ai_editor_agent') || 'Codex');
+    const [aiEditorMcpMode, setAiEditorMcpMode] = useState(() => localStorage.getItem('openviscribe_ai_editor_mcp_mode') || 'edit');
+    const [browserTutorialStartUrl, setBrowserTutorialStartUrl] = useState('');
+    const [browserTutorialStatus, setBrowserTutorialStatus] = useState('');
+    const [agentEditRequestStatus, setAgentEditRequestStatus] = useState(null);
+    const [aiEditorPrompt, setAiEditorPrompt] = useState('');
+    const [aiEditorListening, setAiEditorListening] = useState(false);
+    const [aiEditorVoiceStatus, setAiEditorVoiceStatus] = useState('');
+    const [aiEditorProviderStatus, setAiEditorProviderStatus] = useState({
+        phase: 'idle',
+        provider: '',
+        model: '',
+        detail: '',
+        startedAt: null
+    });
+    const aiEditorRecognitionRef = useRef(null);
+    const aiEditorVoiceBaseRef = useRef('');
+    const aiEditorPlanAbortRef = useRef(null);
+    const [aiEditorElapsedSeconds, setAiEditorElapsedSeconds] = useState(0);
+    const [aiEditorMessages, setAiEditorMessages] = useState(() => [{
+        role: 'assistant',
+        text: '我是你的 AI 剪輯總監。告訴我影片用途、受眾、風格與長度；我會先提出可檢視的剪輯方案，再幫你套用到時間軸。'
+    }]);
+    const [aiEditorPlan, setAiEditorPlan] = useState(null);
+    const [aiEditorBusy, setAiEditorBusy] = useState(false);
+    const [workspaceScanStatus, setWorkspaceScanStatus] = useState('');
     const [pendingScreenshotReview, setPendingScreenshotReview] = useState(null);
     const [lmStudioModelCatalog, setLmStudioModelCatalog] = useState(() => createModelCatalogState('尚未讀取 LM Studio 已安裝模型。'));
     const [ollamaModelCatalog, setOllamaModelCatalog] = useState(() => createModelCatalogState('尚未讀取 Ollama 已安裝模型。'));
+    useEffect(() => { localStorage.setItem('openviscribe_ai_editor_source', aiEditorSource); }, [aiEditorSource]);
+    useEffect(() => { localStorage.setItem('openviscribe_ai_editor_agent', aiEditorAgent); }, [aiEditorAgent]);
+    useEffect(() => { localStorage.setItem('openviscribe_ai_editor_mcp_mode', aiEditorMcpMode); }, [aiEditorMcpMode]);
     const azureVisionEndpoint = (settings.azureVisionEndpoint || settings.azureEndpoint || '').trim();
     const azureChatEndpoint = (settings.azureChatEndpoint || settings.azureEndpoint || settings.azureVisionEndpoint || '').trim();
     const azureTtsEndpoint = (settings.azureTtsEndpoint || settings.azureVisionEndpoint || settings.azureEndpoint || '').trim();
@@ -2268,7 +2614,7 @@ export default function App() {
             if (screenVideo) {
                 try {
                     if (screenVideo.paused) void screenVideo.play().catch(() => { });
-                    ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+                    drawMediaContain(ctx, canvas, screenVideo);
                 } catch (err) { }
             }
             if (webcamVideo) {
@@ -2350,6 +2696,10 @@ export default function App() {
             const previousSnapshot = cloneProjectSnapshot(prev);
             const next = typeof updater === 'function' ? updater(prev) : updater;
             if (next === prev) return prev;
+            // Keep automation reads in step with async imports. React may defer
+            // rendering a large external-folder batch, while Codex can be asked
+            // for a plan immediately after the scan reports completion.
+            projectStateRef.current = next;
             if (recordHistory) {
                 undoStackRef.current.push(previousSnapshot);
                 if (undoStackRef.current.length > HISTORY_LIMIT) {
@@ -2361,6 +2711,29 @@ export default function App() {
             return next;
         });
     }, [syncHistoryAvailability]);
+    const activateWorkflow = useCallback((workflowId) => {
+        const workflow = getSkillById(workflowId);
+        const defaults = workflow.workflowDefaults;
+        setActiveSkillId(workflow.id);
+        if (!defaults) return;
+        setSettings(prev => ({
+            ...prev,
+            aspectRatio: defaults.aspectRatio || prev.aspectRatio,
+            resolution: defaults.resolution || prev.resolution
+        }));
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                presetId: defaults.presetId || prev.motionDesign?.presetId || DEFAULT_MOTION_DESIGN.presetId,
+                hyperframeTemplateId: defaults.templateId || prev.motionDesign?.hyperframeTemplateId || DEFAULT_MOTION_DESIGN.hyperframeTemplateId,
+                cardDuration: defaults.cardDuration || prev.motionDesign?.cardDuration || DEFAULT_MOTION_DESIGN.cardDuration,
+                enabled: defaults.designEnabled === false ? false : prev.motionDesign?.enabled,
+                aiAutoEnabled: defaults.designEnabled === false ? false : prev.motionDesign?.aiAutoEnabled
+            }
+        }));
+    }, [setProjectState]);
     const resetProjectHistory = useCallback(() => {
         undoStackRef.current = [];
         redoStackRef.current = [];
@@ -2416,6 +2789,16 @@ export default function App() {
 
     const [currentTime, setCurrentTime] = useState(0);
     const [isPlaying, setIsPlaying] = useState(false);
+    const [trackState, setTrackState] = useState({
+        subtitleHidden: [false, false],
+        audioMuted: false,
+        bgmMuted: false,
+        videoHidden: [false, false, false],
+        designHidden: false
+    });
+
+    const trackStateRef = useRef(trackState);
+    useEffect(() => { trackStateRef.current = trackState; }, [trackState]);
 
     const motionDesign = useMemo(
         () => getMotionDesignSettings(projectState.motionDesign),
@@ -2432,8 +2815,8 @@ export default function App() {
         [motionDesign, motionDesignFallbackTitle]
     );
     const motionDesignLayers = useMemo(
-        () => getMotionDesignLayers({ design: motionDesign, time: currentTime, duration: totalDuration, subtitles: projectState.subtitles }),
-        [motionDesign, currentTime, totalDuration, projectState.subtitles]
+        () => trackState.designHidden ? [] : getMotionDesignLayers({ design: motionDesign, time: currentTime, duration: totalDuration, subtitles: projectState.subtitles }),
+        [motionDesign, currentTime, totalDuration, projectState.subtitles, trackState.designHidden]
     );
 
     const [selectedIds, setSelectedIds] = useState([]);
@@ -2480,6 +2863,71 @@ export default function App() {
         () => SUBTITLE_TRACKS.map((_, trackIndex) => (projectState.subtitleTransitions || []).filter(item => (Number.isInteger(item?.trackIndex) ? item.trackIndex : 1) === trackIndex)),
         [projectState.subtitleTransitions]
     );
+    const designTimelineItems = useMemo(() => {
+        const items = [];
+        const autoEnabled = motionDesign.aiAutoEnabled;
+        const narrationLedEdit = projectState.subtitles.some(sub => {
+            const normalized = normalizeSubtitle(sub);
+            return Boolean(normalized?.narration) || normalized.trackIndex === 1;
+        });
+        const introEnabled = (autoEnabled && motionDesign.includeIntro) || motionDesign.manualIntroEnabled;
+        const outroEnabled = (autoEnabled && motionDesign.includeOutro) || motionDesign.manualOutroEnabled;
+        const introDuration = Math.min(totalDuration, motionDesign.introDuration);
+        const outroDuration = Math.min(totalDuration, motionDesign.outroDuration);
+
+        if (introEnabled && introDuration > 0) {
+            items.push({ id: 'design-intro', kind: 'intro', startAt: 0, endAt: introDuration, label: '片頭 · Intro' });
+        }
+        if (outroEnabled && outroDuration > 0) {
+            items.push({ id: 'design-outro', kind: 'outro', startAt: Math.max(0, totalDuration - outroDuration), endAt: totalDuration, label: '片尾 · Outro' });
+        }
+        if (autoEnabled && motionDesign.includeLowerThird && !narrationLedEdit) {
+            projectState.subtitles
+                .map(normalizeSubtitle)
+                .filter(sub => sub.startAt >= introDuration && sub.endAt > sub.startAt)
+                .forEach(sub => items.push({
+                    id: `design-auto-card-${sub.id}`,
+                    kind: 'auto-card',
+                    startAt: sub.startAt,
+                    endAt: Math.min(sub.endAt, sub.startAt + motionDesign.cardDuration),
+                    label: `AI 字卡 · ${sub.text}`
+                }));
+        }
+        motionDesign.manualCards.forEach(card => {
+            if (narrationLedEdit && card.source === 'ai-editor' && !card.assetId) return;
+            const asset = card.assetId ? HYPERFRAME_ASSETS.find(item => item.id === card.assetId) : null;
+            items.push({
+                id: card.id,
+                kind: asset ? 'content' : 'card',
+                startAt: card.startAt,
+                endAt: card.endAt,
+                label: asset ? `Contents · ${asset.nameZh}` : `字卡 · ${card.text}`
+            });
+        });
+        return items
+            .filter(item => Number.isFinite(item.startAt) && Number.isFinite(item.endAt) && item.endAt > item.startAt)
+            .sort((a, b) => a.startAt - b.startAt || a.endAt - b.endAt);
+    }, [motionDesign, projectState.subtitles, totalDuration]);
+    const selectedDesignTimelineItem = useMemo(
+        () => designTimelineItems.find(item => selectedIds.includes(item.id)) || null,
+        [designTimelineItems, selectedIds]
+    );
+    const selectedManualDesignCard = useMemo(
+        () => selectedDesignTimelineItem ? motionDesign.manualCards.find(card => card.id === selectedDesignTimelineItem.id) || null : null,
+        [motionDesign.manualCards, selectedDesignTimelineItem]
+    );
+    const updateManualDesignCard = useCallback((cardId, patch) => {
+        setProjectState(prev => ({
+            ...prev,
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: (prev.motionDesign?.manualCards || []).map(card => card.id === cardId
+                    ? { ...card, ...(typeof patch === 'function' ? patch(card) : patch) }
+                    : card)
+            }
+        }));
+    }, [setProjectState]);
     const areAllSubtitlesSelectedByTrack = useMemo(
         () => SUBTITLE_TRACKS.map((_, trackIndex) => {
             const ids = (subtitlesByTrack[trackIndex] || []).map(sub => sub.id);
@@ -2501,7 +2949,14 @@ export default function App() {
     const [libraryWidth, setLibraryWidth] = useState(460);
     const [isResizingLeftPanel, setIsResizingLeftPanel] = useState(false);
     const [isResizingLibrary, setIsResizingLibrary] = useState(false);
-    const [libraryTab, setLibraryTab] = useState('transitions');
+    const workspaceInspectorStyle = {
+        width: `${isShortsEditingWorkspace ? Math.min(leftPanelWidth, 340) : leftPanelWidth}px`
+    };
+    const workspaceInspectorClass = isShortsEditingWorkspace
+        ? 'order-3 shrink-0 bg-gray-800 border-l border-gray-700 flex flex-col z-10 shadow-xl'
+        : 'shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl';
+    const [libraryTab, setLibraryTab] = useState('hyperframes');
+    const [mediaLibraryVisibleCount, setMediaLibraryVisibleCount] = useState(80);
     const [manualCardText, setManualCardText] = useState('');
     const addManualLowerThird = useCallback((presetId = motionDesign.presetId) => {
         const subtitleAtPlayhead = projectState.subtitles
@@ -2516,7 +2971,8 @@ export default function App() {
             creator: motionDesign.creator,
             presetId,
             startAt,
-            endAt
+            endAt,
+            layout: { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 }
         };
         setProjectState(prev => ({
             ...prev,
@@ -2539,7 +2995,8 @@ export default function App() {
             presetId: asset.presetId || motionDesign.presetId,
             assetId: asset.id,
             startAt,
-            endAt
+            endAt,
+            layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
         };
         setProjectState(prev => ({
             ...prev,
@@ -2585,7 +3042,8 @@ export default function App() {
                 assetId: asset.id,
                 startAt,
                 endAt: Number(Math.min(safeDuration - 1, startAt + duration).toFixed(2)),
-                source: 'auto-contents'
+                source: 'auto-contents',
+                layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
             };
         });
         setProjectState(prev => ({
@@ -2603,8 +3061,8 @@ export default function App() {
     }, [motionDesign.presetId, projectState.articleTopic, projectState.automationScript?.steps, projectState.tutorialDescription, setProjectState, totalDuration]);
     const createDeploymentHyperframeDemo = useCallback(() => {
         const demoCards = [
-            { id: 'demo_world_map', text: '全球節點與區域流向', creator: 'DEPLOYMENT / MAP', presetId: 'signal', assetId: 'hf-world-map', startAt: 3.0, endAt: 7.5 },
-            { id: 'demo_console', text: '部署指令與健康檢查', creator: 'DEPLOYMENT / CONSOLE', presetId: 'signal', assetId: 'hf-console', startAt: 7.8, endAt: 12.2 }
+            { id: 'demo_world_map', text: '全球節點與區域流向', creator: 'DEPLOYMENT / MAP', presetId: 'signal', assetId: 'hf-world-map', startAt: 3.0, endAt: 7.5, layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 } },
+            { id: 'demo_console', text: '部署指令與健康檢查', creator: 'DEPLOYMENT / CONSOLE', presetId: 'signal', assetId: 'hf-console', startAt: 7.8, endAt: 12.2, layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 } }
         ];
         setProjectState(prev => ({
             ...prev,
@@ -2704,16 +3162,6 @@ export default function App() {
     const [selectionBox, setSelectionBox] = useState(null);
     const dragRef = useRef(null);
 
-    const [trackState, setTrackState] = useState({
-        subtitleHidden: [false, false],
-        audioMuted: false,
-        bgmMuted: false,
-        videoHidden: [false, false, false]
-    });
-
-    const trackStateRef = useRef(trackState);
-    useEffect(() => { trackStateRef.current = trackState; }, [trackState]);
-
     const [showExportModal, setShowExportModal] = useState(false);
     const [showRecordingModal, setShowRecordingModal] = useState(false);
     const [recordingOptions, setRecordingOptions] = useState({
@@ -2748,6 +3196,7 @@ export default function App() {
     const audioPreviewStateRef = useRef({});
     const isPlayingRef = useRef(false);
     const isScrubbingRef = useRef(isScrubbing);
+    const currentTimeRef = useRef(currentTime);
     const previewContainerRef = useRef(null);
     const [canvasDrag, setCanvasDrag] = useState(null);
 
@@ -2755,10 +3204,20 @@ export default function App() {
     const [timelineZoom, setTimelineZoom] = useState(1);
     const [isResizingTimeline, setIsResizingTimeline] = useState(false);
 
+    useEffect(() => {
+        if (!isShortsEditingWorkspace || typeof window === 'undefined') return;
+        // Keep enough vertical room to read captions, graphics, picture and
+        // voice tracks together whenever the Shorts workspace is selected.
+        const available = Math.max(MIN_TIMELINE_HEIGHT, window.innerHeight - RESERVED_EDITOR_HEIGHT);
+        const preferred = Math.min(available, Math.max(360, Math.round(window.innerHeight * 0.44)));
+        setTimelineHeight(current => Math.max(current, preferred));
+    }, [isShortsEditingWorkspace]);
+
     const animationRef = useRef(null);
 
     useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
     useEffect(() => { isScrubbingRef.current = isScrubbing; }, [isScrubbing]);
+    useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
 
     const timelineRef = useRef(null);
     const timelineLeftPanelRef = useRef(null);
@@ -2933,8 +3392,8 @@ export default function App() {
                 video: {
                     displaySurface: 'browser',
                     cursor: 'never',
-                    width: settings.resolution === '1080p' ? 1920 : 1280,
-                    height: settings.resolution === '1080p' ? 1080 : 720,
+                    width: canvasDimensions.width,
+                    height: canvasDimensions.height,
                     frameRate: { ideal: RENDER_FPS, max: RENDER_FPS }
                 },
                 audio: includeAudio
@@ -2948,20 +3407,24 @@ export default function App() {
                 }
                 alert("預覽環境受限，無法真實錄影。\n已啟動「模擬錄影」模式！");
                 const canvas = document.createElement('canvas');
-                canvas.width = settings.resolution === '1080p' ? 1920 : 1280;
-                canvas.height = settings.resolution === '1080p' ? 1080 : 720;
+                canvas.width = canvasDimensions.width;
+                canvas.height = canvasDimensions.height;
                 const ctx = canvas.getContext('2d');
                 let frame = 0;
                 const drawMock = () => {
                     ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    ctx.fillStyle = '#334155'; ctx.fillRect(0, 0, canvas.width, 60);
-                    ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 40px sans-serif';
-                    ctx.fillText('模擬操作畫面 (Mock Recording)', canvas.width / 2 - 300, canvas.height / 2 - 50);
-                    const mouseX = canvas.width / 2 + Math.sin(frame / 20) * 250;
-                    const mouseY = canvas.height / 2 + Math.cos(frame / 30) * 150 + 50;
+                    const scale = Math.min(canvas.width, canvas.height) / 720;
+                    ctx.fillStyle = '#334155'; ctx.fillRect(0, 0, canvas.width, Math.round(60 * scale));
+                    ctx.fillStyle = '#e2e8f0'; ctx.font = `bold ${Math.round(40 * scale)}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.fillText('模擬操作畫面', canvas.width / 2, canvas.height / 2 - Math.round(50 * scale));
+                    const travel = Math.min(canvas.width, canvas.height) * 0.32;
+                    const mouseX = canvas.width / 2 + Math.sin(frame / 20) * travel;
+                    const mouseY = canvas.height / 2 + Math.cos(frame / 30) * travel * 0.6 + Math.round(50 * scale);
                     ctx.fillStyle = 'white'; ctx.beginPath(); ctx.moveTo(mouseX, mouseY);
-                    ctx.lineTo(mouseX + 15, mouseY + 40); ctx.lineTo(mouseX + 25, mouseY + 25);
-                    ctx.lineTo(mouseX + 45, mouseY + 30); ctx.closePath(); ctx.fill();
+                    ctx.lineTo(mouseX + 15 * scale, mouseY + 40 * scale); ctx.lineTo(mouseX + 25 * scale, mouseY + 25 * scale);
+                    ctx.lineTo(mouseX + 45 * scale, mouseY + 30 * scale); ctx.closePath(); ctx.fill();
+                    ctx.textAlign = 'start';
                     frame++; stream.mockAnimationId = requestAnimationFrame(drawMock);
                 };
                 stream = canvas.captureStream(30); drawMock();
@@ -3446,26 +3909,46 @@ export default function App() {
             }
         });
 
-        drawMotionDesignToCanvas(ctx, canvas, {
-            design: projectStateRef.current.motionDesign,
-            time,
-            duration: Math.max(
-                0,
-                ...projectStateRef.current.tracks.flat().map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
-                ...projectStateRef.current.audioTracks.flatMap(track => track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
-                ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0)),
-                ...(projectStateRef.current.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))
-            ),
-            subtitles: projectStateRef.current.subtitles,
-            fallbackTitle: projectStateRef.current.articleTopic || projectStateRef.current.tutorialDescription || 'Untitled Tutorial',
-            fallbackCreator: 'OPEN VISCRIBE'
-        });
+        if (!trackStateRef.current.designHidden) {
+            drawMotionDesignToCanvas(ctx, canvas, {
+                design: projectStateRef.current.motionDesign,
+                time,
+                duration: Math.max(
+                    0,
+                    ...projectStateRef.current.tracks.flat().map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
+                    ...projectStateRef.current.audioTracks.flatMap(track => track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
+                    ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0)),
+                    ...(projectStateRef.current.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))
+                ),
+                subtitles: projectStateRef.current.subtitles,
+                fallbackTitle: projectStateRef.current.articleTopic || projectStateRef.current.tutorialDescription || 'Untitled Tutorial',
+                fallbackCreator: 'OPEN VISCRIBE'
+            });
+        }
     }, []);
 
     const syncPlaybackElementsForTime = useCallback((targetTime, options = {}) => {
         const safeTime = Number.isFinite(Number(targetTime)) ? Number(targetTime) : 0;
         const forceHardSync = Boolean(options.forceHardSync);
         const shouldPlayMedia = isPlayingRef.current || isRenderingRef.current;
+        // Only the top-most visible video at the playhead owns source audio.
+        // This restores imported camera sound without letting overlapping V1,
+        // V2 and V3 clips all play at once. Clips with a linked A1 item stay
+        // muted here because their audio is already represented separately.
+        let audibleVideoClipId = null;
+        for (let trackIdx = projectStateRef.current.tracks.length - 1; trackIdx >= 0; trackIdx -= 1) {
+            if (trackStateRef.current.videoHidden[trackIdx]) continue;
+            const activeClip = [...(projectStateRef.current.tracks[trackIdx] || [])]
+                .reverse()
+                .find(clip => clip?.type === 'video'
+                    && !clip.linkedAudioId
+                    && safeTime >= Number(clip.startAt || 0)
+                    && safeTime < Number(clip.startAt || 0) + Number(clip.duration || 0));
+            if (activeClip) {
+                audibleVideoClipId = activeClip.id;
+                break;
+            }
+        }
 
         projectStateRef.current.tracks.forEach((track, trackIdx) => {
             track.forEach(clip => {
@@ -3474,18 +3957,24 @@ export default function App() {
 
                 const isActive = safeTime >= clip.startAt && safeTime < (clip.startAt + clip.duration);
                 const isHidden = trackStateRef.current.videoHidden[trackIdx];
-                const shouldMuteVideoAudio = true;
+                const shouldMuteVideoAudio = !isActive
+                    || isHidden
+                    || Boolean(clip.linkedAudioId)
+                    || clip.id !== audibleVideoClipId;
 
                 if (clip.type === 'video') {
                     vEl.muted = shouldMuteVideoAudio;
                     vEl.defaultMuted = shouldMuteVideoAudio;
-                    vEl.volume = shouldMuteVideoAudio ? 0 : 1;
+                    vEl.volume = shouldMuteVideoAudio ? 0 : Math.max(0, Math.min(1, Number(clip.volume ?? 1)));
 
                     if (isActive && !isHidden) {
                         if (vEl.style.display === 'none') vEl.style.display = 'block';
                         vEl.playbackRate = clip.playbackRate || 1.0;
                         const clipTime = clip.trimStart + (safeTime - clip.startAt) * (clip.playbackRate || 1.0);
-                        const seekThreshold = forceHardSync || isRenderingRef.current ? 0.03 : 0.1;
+                        // Native media playback is smooth; repeatedly seeking it
+                        // on every small React playhead update is not. Seek only
+                        // for a real drift, scrubbing, or deterministic export.
+                        const seekThreshold = forceHardSync || isRenderingRef.current ? 0.03 : 0.42;
                         if (Math.abs(vEl.currentTime - clipTime) > seekThreshold) {
                             vEl.currentTime = clipTime;
                         }
@@ -3517,7 +4006,7 @@ export default function App() {
                     const shouldHardSync = forceHardSync || !prevState.active || isScrubbingRef.current || isRenderingRef.current;
                     const driftThreshold = shouldHardSync
                         ? 0.08
-                        : (isRecordedVoiceTrack ? 0.6 : 0.35);
+                        : (isRecordedVoiceTrack ? 0.6 : 0.48);
 
                     if (drift > driftThreshold) {
                         audioEl.currentTime = audioTime;
@@ -3682,6 +4171,7 @@ export default function App() {
                 renderAccumulatorRef.current -= frameCount * RENDER_FRAME_STEP;
                 const nextTime = Math.min(totalDuration || 0, renderTimeRef.current + frameCount * RENDER_FRAME_STEP);
                 renderTimeRef.current = nextTime;
+                currentTimeRef.current = nextTime;
                 syncPlaybackElementsForTime(nextTime, { forceHardSync: true });
                 drawToExportCanvas(nextTime);
                 renderVideoTrackRef.current?.requestFrame?.();
@@ -3693,19 +4183,16 @@ export default function App() {
                 }
             } else if (isPlaying) {
                 const delta = (time - lastTime) / 1000;
-                setCurrentTime(prev => {
-                    const nextTime = prev + delta;
-                    drawToExportCanvas(nextTime);
-
-                    if (totalDuration > 0 && nextTime >= totalDuration) {
-                        setIsPlaying(false);
-                        if (isRenderingRef.current) finishRendering();
-                        return totalDuration;
-                    }
-                    return nextTime;
-                });
+                const nextTime = Math.min(totalDuration || Infinity, currentTimeRef.current + Math.max(0, delta));
+                currentTimeRef.current = nextTime;
+                drawToExportCanvas(nextTime);
+                if (totalDuration > 0 && nextTime >= totalDuration) {
+                    setIsPlaying(false);
+                    if (isRenderingRef.current) finishRendering();
+                }
+                setCurrentTime(nextTime);
             } else {
-                drawToExportCanvas(currentTime);
+                drawToExportCanvas(currentTimeRef.current);
             }
             lastTime = time;
             animationRef.current = requestAnimationFrame(updatePlayhead);
@@ -3713,7 +4200,7 @@ export default function App() {
 
         animationRef.current = requestAnimationFrame(updatePlayhead);
         return () => cancelAnimationFrame(animationRef.current);
-    }, [isPlaying, totalDuration, currentTime, drawToExportCanvas, finishRendering, syncPlaybackElementsForTime]);
+    }, [isPlaying, totalDuration, drawToExportCanvas, finishRendering, syncPlaybackElementsForTime]);
 
     useEffect(() => {
         syncPlaybackElementsForTime(currentTime);
@@ -4268,6 +4755,9 @@ export default function App() {
         (projectState.subtitleTransitions || []).forEach(item => {
             if (currentSelected.includes(item.id)) draggedItems.push({ ...item, itemType: 'subtitleTransition' });
         });
+        motionDesign.manualCards.forEach(card => {
+            if (currentSelected.includes(card.id)) draggedItems.push({ ...card, itemType: 'design' });
+        });
 
         const primaryItem = draggedItems.find(i => i.id === item.id);
         if (!primaryItem) return;
@@ -4297,7 +4787,11 @@ export default function App() {
                     videoTransitions: (prev.videoTransitions || [[], [], []]).map(t => [...(t || [])]),
                     audioTracks: prev.audioTracks.map(t => [...(t || [])]),
                     subtitles: [...prev.subtitles],
-                    subtitleTransitions: [...(prev.subtitleTransitions || [])]
+                    subtitleTransitions: [...(prev.subtitleTransitions || [])],
+                    motionDesign: {
+                        ...(prev.motionDesign || {}),
+                        manualCards: [...(prev.motionDesign?.manualCards || [])]
+                    }
                 };
 
                 const draggedIds = dragData.draggedItems.map(i => i.id);
@@ -4307,6 +4801,7 @@ export default function App() {
                 next.audioTracks.forEach(t => t.forEach(c => { if (!draggedIds.includes(c.id)) { snapPoints.push(c.startAt); snapPoints.push(c.startAt + c.duration); } }));
                 next.subtitles.forEach(s => { if (!draggedIds.includes(s.id)) { snapPoints.push(s.startAt); snapPoints.push(s.endAt); } });
                 next.subtitleTransitions.forEach(s => { if (!draggedIds.includes(s.id)) { snapPoints.push(s.startAt); snapPoints.push(s.startAt + s.duration); } });
+                next.motionDesign.manualCards.forEach(card => { if (!draggedIds.includes(card.id)) { snapPoints.push(card.startAt); snapPoints.push(card.endAt); } });
 
                 if (dragData.action === 'move') {
                     let trackShift = 0;
@@ -4326,13 +4821,14 @@ export default function App() {
                         }
                     });
 
+                    const primaryDuration = Number(dragData.primaryItem.duration ?? (dragData.primaryItem.endAt - dragData.primaryItem.startAt));
                     let newPrimaryStart = dragData.primaryItem.startAt + rawDeltaTime;
                     let snappedPrimaryStart = newPrimaryStart;
                     let minDist = 0.5;
 
                     snapPoints.forEach(p => {
                         if (Math.abs(p - newPrimaryStart) < minDist) { minDist = Math.abs(p - newPrimaryStart); snappedPrimaryStart = p; }
-                        if (Math.abs(p - (newPrimaryStart + dragData.primaryItem.duration)) < minDist) { minDist = Math.abs(p - (newPrimaryStart + dragData.primaryItem.duration)); snappedPrimaryStart = p - dragData.primaryItem.duration; }
+                        if (Math.abs(p - (newPrimaryStart + primaryDuration)) < minDist) { minDist = Math.abs(p - (newPrimaryStart + primaryDuration)); snappedPrimaryStart = p - primaryDuration; }
                     });
 
                     const finalDeltaTime = snappedPrimaryStart - dragData.primaryItem.startAt;
@@ -4342,6 +4838,7 @@ export default function App() {
                     const cleanAudio = prev.audioTracks.map(t => t ? t.filter(a => !draggedIds.includes(a.id)) : []);
                     let cleanSubs = prev.subtitles.filter(s => !draggedIds.includes(s.id));
                     let cleanSubtitleTransitions = (prev.subtitleTransitions || []).filter(item => !draggedIds.includes(item.id));
+                    let cleanDesignCards = (prev.motionDesign?.manualCards || []).filter(card => !draggedIds.includes(card.id));
 
                     dragData.draggedItems.forEach(item => {
                         const newStart = Math.max(0, item.startAt + finalDeltaTime);
@@ -4360,6 +4857,9 @@ export default function App() {
                             cleanSubs.push({ ...item, startAt: newStart, endAt: newStart + duration });
                         } else if (item.itemType === 'subtitleTransition') {
                             cleanSubtitleTransitions.push({ ...item, startAt: newStart });
+                        } else if (item.itemType === 'design') {
+                            const duration = Math.max(0.2, Number(item.endAt) - Number(item.startAt));
+                            cleanDesignCards.push({ ...item, startAt: newStart, endAt: newStart + duration });
                         }
                     });
 
@@ -4368,6 +4868,7 @@ export default function App() {
                     next.audioTracks = cleanAudio;
                     next.subtitles = cleanSubs;
                     next.subtitleTransitions = cleanSubtitleTransitions;
+                    next.motionDesign.manualCards = cleanDesignCards;
                 }
                 else {
                     const item = dragData.primaryItem;
@@ -4463,6 +4964,15 @@ export default function App() {
                             transition.duration = Math.max(0.1, item.duration - (snapStart - item.startAt));
                             transition.startAt = snapStart;
                         }
+                    } else if (item.itemType === 'design') {
+                        const cardIndex = next.motionDesign.manualCards.findIndex(card => card.id === item.id);
+                        if (cardIndex === -1) return prev;
+                        const card = next.motionDesign.manualCards[cardIndex];
+                        if (dragData.action === 'resizeRight') {
+                            card.endAt = Math.max(card.startAt + 0.2, item.endAt + rawDeltaTime);
+                        } else if (dragData.action === 'resizeLeft') {
+                            card.startAt = Math.max(0, Math.min(item.endAt - 0.2, item.startAt + rawDeltaTime));
+                        }
                     }
                 }
                 return next;
@@ -4541,11 +5051,67 @@ export default function App() {
         canvasHistorySnapshotRef.current = cloneProjectSnapshot(projectStateRef.current);
     };
 
+    const handleMotionCanvasMouseDown = (e, layer, action) => {
+        e.stopPropagation();
+        if (e.button !== 0 || !layer?.manual) return;
+        const layout = layer.layout || (layer.kind === 'hyperframe-asset'
+            ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+            : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
+        const rect = previewContainerRef.current.getBoundingClientRect();
+        setSelectedIds([layer.id]);
+        setCanvasDrag({
+            entityType: 'motion',
+            id: layer.id,
+            action,
+            startX: e.clientX,
+            startY: e.clientY,
+            origX: layout.x,
+            origY: layout.y,
+            origW: layout.w,
+            origH: layout.h,
+            containerW: rect.width,
+            containerH: rect.height
+        });
+        canvasHistorySnapshotRef.current = cloneProjectSnapshot(projectStateRef.current);
+    };
+
     useEffect(() => {
         if (!canvasDrag) return;
 
         const onMove = (e) => {
-            if (canvasDrag?.entityType !== 'subtitle') {
+            if (canvasDrag?.entityType === 'motion') {
+                const deltaXPx = e.clientX - canvasDrag.startX;
+                const deltaYPx = e.clientY - canvasDrag.startY;
+                const deltaX = (deltaXPx / canvasDrag.containerW) * 100;
+                const deltaY = (deltaYPx / canvasDrag.containerH) * 100;
+                setProjectState(prev => ({
+                    ...prev,
+                    motionDesign: {
+                        ...DEFAULT_MOTION_DESIGN,
+                        ...(prev.motionDesign || {}),
+                        manualCards: (prev.motionDesign?.manualCards || []).map(card => {
+                            if (card.id !== canvasDrag.id) return card;
+                            const layout = card.layout || (card.assetId
+                                ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+                                : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
+                            const next = { ...layout };
+                            if (canvasDrag.action === 'move') {
+                                next.x = clamp(canvasDrag.origX + deltaX, 0, Math.max(0, 100 - canvasDrag.origW));
+                                next.y = clamp(canvasDrag.origY + deltaY, 0, Math.max(0, 100 - canvasDrag.origH));
+                            } else if (canvasDrag.action === 'resize-br') {
+                                next.w = clamp(canvasDrag.origW + deltaX, 8, 100 - canvasDrag.origX);
+                                next.h = clamp(canvasDrag.origH + deltaY, 6, 100 - canvasDrag.origY);
+                            } else if (canvasDrag.action === 'resize-tl') {
+                                next.x = clamp(canvasDrag.origX + deltaX, 0, canvasDrag.origX + canvasDrag.origW - 8);
+                                next.y = clamp(canvasDrag.origY + deltaY, 0, canvasDrag.origY + canvasDrag.origH - 6);
+                                next.w = clamp(canvasDrag.origW - (next.x - canvasDrag.origX), 8, 100);
+                                next.h = clamp(canvasDrag.origH - (next.y - canvasDrag.origY), 6, 100);
+                            }
+                            return { ...card, layout: next };
+                        })
+                    }
+                }), { recordHistory: false });
+            } else if (canvasDrag?.entityType !== 'subtitle') {
                 const deltaXPx = e.clientX - canvasDrag.startX;
                 const deltaYPx = e.clientY - canvasDrag.startY;
                 const deltaX = (deltaXPx / canvasDrag.containerW) * 100;
@@ -9826,16 +10392,247 @@ ${JSON.stringify(subtitlePayload)}
         }
     };
 
-    const handleImportAssets = async (e) => {
-        const files = Array.from(e.target.files);
-        if (files.length === 0) return;
+    const generateLocalMacVoice = async (subtitleOverride = null, voiceOverride = null) => {
+        const requestedSubtitles = Array.isArray(subtitleOverride) && subtitleOverride.length
+            ? subtitleOverride
+            : highlightSubtitles;
+        const ttsSubtitles = requestedSubtitles
+            .map(normalizeSubtitle)
+            .filter(sub => String(sub.text || '').trim() && Number(sub.endAt) > Number(sub.startAt));
+        if (!ttsSubtitles.length) {
+            alert('請先建立完整字幕／旁白稿，才能使用本機 TTS。');
+            return;
+        }
+        const token = String(settings.automationApiToken || '').trim();
+        if (!settings.automationApiEnabled || !token) {
+            alert('本機 TTS 需要啟用 OpenViscribe Automation API，並在設定內填入本機 Token。');
+            return;
+        }
 
+        const baseUrl = String(settings.automationApiUrl || 'http://127.0.0.1:4318').replace(/\/+$/, '');
+        const configuredVoice = String(voiceOverride?.voice || 'Ting-Ting').trim() || 'Ting-Ting';
+        const configuredRate = Number(voiceOverride?.rate);
+        const rate = Number.isFinite(configuredRate) ? Math.max(110, Math.min(260, Math.round(configuredRate))) : 185;
+        const taskController = beginAiTask('voice');
+        const taskSignal = taskController.signal;
+        const reports = [];
+        const newAudioClips = [];
+        let successCount = 0;
+        setStatusPanels(prev => ({ ...prev, voice: true }));
+        updateTtsStatus({
+            phase: 'running',
+            message: '本機 TTS 生成中',
+            detail: `正在使用 macOS ${configuredVoice} 語音逐段生成；文字與音檔都不會送到 Azure。`,
+            aiLabel: 'macOS 本機 TTS',
+            currentStep: 0,
+            totalSteps: ttsSubtitles.length,
+            progressPercent: 0,
+            stageLabel: '準備旁白稿',
+            successCount: 0,
+            totalCount: ttsSubtitles.length,
+            clips: []
+        });
+        try {
+            for (let index = 0; index < ttsSubtitles.length; index += 1) {
+                throwIfAborted(taskSignal);
+                const sub = ttsSubtitles[index];
+                updateTtsStatus({
+                    phase: 'running',
+                    message: '本機 TTS 生成中',
+                    detail: `正在生成第 ${index + 1}/${ttsSubtitles.length} 段本機語音。`,
+                    aiLabel: 'macOS 本機 TTS',
+                    currentStep: index + 1,
+                    totalSteps: ttsSubtitles.length,
+                    progressPercent: Math.round((index / ttsSubtitles.length) * 100),
+                    stageLabel: `生成第 ${index + 1}/${ttsSubtitles.length} 段`,
+                    successCount,
+                    totalCount: ttsSubtitles.length,
+                    clips: [...reports]
+                });
+                try {
+                    const response = await fetchWithTimeout(`${baseUrl}/v1/local-tts`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        body: JSON.stringify({ text: sub.text, voice: configuredVoice, rate })
+                    }, 35_000, taskSignal);
+                    const payload = await response.json().catch(() => ({}));
+                    if (!response.ok || !payload.audioBase64) {
+                        throw new Error(payload?.error?.message || `本機 TTS HTTP ${response.status}`);
+                    }
+                    const mimeType = normalizeAudioMimeType(payload.mimeType, 'audio/wav');
+                    const wavBlob = new Blob([decodeBase64ToBytes(payload.audioBase64)], { type: mimeType });
+                    const fallbackDuration = Math.max(1.2, Number(sub.endAt) - Number(sub.startAt));
+                    const actualAudioDuration = await getAudioBlobDuration(wavBlob, fallbackDuration);
+                    const audioId = `local_tts_${Date.now()}_${index}`;
+                    await saveBlobToDB(audioId, wavBlob);
+                    newAudioClips.push({
+                        id: audioId,
+                        type: 'audio',
+                        src: URL.createObjectURL(wavBlob),
+                        blobId: audioId,
+                        startAt: Number(sub.startAt),
+                        duration: actualAudioDuration,
+                        originalDuration: actualAudioDuration,
+                        playbackRate: 1,
+                        trimStart: 0,
+                        trimEnd: actualAudioDuration,
+                        name: `本機旁白：${sub.text}`,
+                        volume: 1,
+                        fadeIn: 0.03,
+                        fadeOut: 0.08,
+                        source: 'local-macos-tts',
+                        sourceSubtitleId: sub.id,
+                        sourceSubtitleText: sub.text,
+                        sourceIndex: index
+                    });
+                    reports.push({
+                        index: index + 1,
+                        text: sub.text,
+                        duration: Number(actualAudioDuration.toFixed(2)),
+                        sizeKb: Number((wavBlob.size / 1024).toFixed(1)),
+                        status: 'success'
+                    });
+                    successCount += 1;
+                } catch (error) {
+                    if (isAiTaskCancelledError(error) || error?.name === 'AbortError') throw error;
+                    reports.push({ index: index + 1, text: sub.text, duration: 0, sizeKb: 0, status: 'error', error: String(error?.message || error) });
+                }
+            }
+            // macOS voices have a natural duration that can be longer than an
+            // AI's estimated cue. Reflow each successful segment sequentially
+            // instead of allowing the waveform clips to overlap and speak at
+            // the same time.
+            const narrationStart = Math.max(0, Math.min(...ttsSubtitles.map(sub => Number(sub.startAt) || 0)));
+            const timingBySubtitleId = new Map();
+            let narrationCursor = narrationStart;
+            newAudioClips
+                .sort((a, b) => Number(a.sourceIndex || 0) - Number(b.sourceIndex || 0))
+                .forEach((clip, index) => {
+                    const naturalDuration = Math.max(0.35, Number(clip.originalDuration || clip.duration) || 0.35);
+                    clip.startAt = Number(narrationCursor.toFixed(2));
+                    clip.duration = Number(naturalDuration.toFixed(2));
+                    clip.playbackRate = 1;
+                    clip.trimEnd = Number(naturalDuration.toFixed(2));
+                    const endAt = Number((narrationCursor + naturalDuration).toFixed(2));
+                    if (clip.sourceSubtitleId) timingBySubtitleId.set(clip.sourceSubtitleId, { startAt: clip.startAt, endAt });
+                    narrationCursor = endAt + (index < newAudioClips.length - 1 ? 0.14 : 0);
+                });
+            setProjectState(prev => {
+                const nextTracks = [...prev.audioTracks];
+                nextTracks[0] = [...(nextTracks[0] || []).filter(clip => clip?.source !== 'local-macos-tts'), ...newAudioClips];
+                const nextSubtitles = prev.subtitles.map(raw => {
+                    const timing = timingBySubtitleId.get(raw.id);
+                    return timing ? normalizeSubtitle({ ...raw, ...timing }) : raw;
+                });
+
+                // If the natural narration runs longer than the initial rough
+                // cut, loop the existing AI B-roll in V2 rather than ending on
+                // a black frame while the final sentence is still speaking.
+                const nextVideoTracks = prev.tracks.map(track => [...track]);
+                const aiVisuals = [...(nextVideoTracks[1] || [])]
+                    .filter(clip => clip?.source === 'ai-editor' && (clip.type === 'video' || clip.type === 'image'))
+                    .sort((a, b) => a.startAt - b.startAt);
+                const visualEnd = aiVisuals.reduce((max, clip) => Math.max(max, Number(clip.startAt || 0) + Number(clip.duration || 0)), 0);
+                const requiredEnd = Math.max(0, narrationCursor);
+                if (aiVisuals.length && visualEnd + 0.05 < requiredEnd) {
+                    let fillCursor = visualEnd;
+                    let fillIndex = 0;
+                    const fills = [];
+                    while (fillCursor < requiredEnd - 0.05 && fillIndex < 80) {
+                        const source = aiVisuals[fillIndex % aiVisuals.length];
+                        const sourceDuration = Math.max(0.8, Number(source.duration) || 4);
+                        const duration = Math.min(sourceDuration, requiredEnd - fillCursor);
+                        fills.push({
+                            ...source,
+                            id: `ai_editor_voice_fill_${Date.now()}_${fillIndex}`,
+                            startAt: Number(fillCursor.toFixed(2)),
+                            duration: Number(duration.toFixed(2)),
+                            trimEnd: Number(((source.trimStart || 0) + duration * (source.playbackRate || 1)).toFixed(2)),
+                            source: 'ai-editor-voice-fill',
+                            mediaFit: 'cover'
+                        });
+                        fillCursor += duration;
+                        fillIndex += 1;
+                    }
+                    nextVideoTracks[1] = [...nextVideoTracks[1], ...fills];
+                }
+                return { ...prev, tracks: nextVideoTracks, subtitles: nextSubtitles, audioTracks: nextTracks };
+            });
+            updateTtsStatus({
+                phase: successCount === ttsSubtitles.length ? 'success' : successCount ? 'warning' : 'error',
+                message: successCount === ttsSubtitles.length ? '本機 TTS 已生成' : successCount ? '本機 TTS 部分完成' : '本機 TTS 生成失敗',
+                detail: successCount ? `已在本機建立 ${successCount}/${ttsSubtitles.length} 段旁白音檔。` : '未建立任何旁白音檔，請確認本機 Automation API 正在執行。',
+                aiLabel: 'macOS 本機 TTS',
+                currentStep: ttsSubtitles.length,
+                totalSteps: ttsSubtitles.length,
+                progressPercent: 100,
+                stageLabel: '完成',
+                successCount,
+                totalCount: ttsSubtitles.length,
+                clips: reports
+            });
+        } catch (error) {
+            const cancelled = isAiTaskCancelledError(error) || error?.name === 'AbortError';
+            updateTtsStatus({
+                phase: cancelled ? 'warning' : 'error',
+                message: cancelled ? '本機 TTS 已取消' : '本機 TTS 生成失敗',
+                detail: cancelled ? '本次本機語音任務已取消。' : String(error?.message || error),
+                stageLabel: cancelled ? '已取消' : '失敗'
+            });
+        } finally {
+            finishAiTask(taskController);
+        }
+    };
+
+    // Repair projects made by the first local-TTS implementation. Those clips
+    // retained estimated subtitle start times even when macOS spoke longer,
+    // which made every waveform overlap. This runs once only when a genuine
+    // overlap is found and preserves all non-local audio.
+    useEffect(() => {
+        const localClips = [...(projectState.audioTracks?.[0] || [])]
+            .filter(clip => clip?.source === 'local-macos-tts')
+            .sort((a, b) => Number(a.startAt || 0) - Number(b.startAt || 0));
+        if (localClips.length < 2) return;
+        const overlaps = localClips.some((clip, index) => index > 0
+            && Number(clip.startAt || 0) < Number(localClips[index - 1].startAt || 0) + Number(localClips[index - 1].duration || 0) - 0.04);
+        if (!overlaps) return;
+
+        const cueStart = Math.max(0, Number(localClips[0].startAt) || 0);
+        let cursor = cueStart;
+        const timingById = new Map();
+        const timingByText = new Map();
+        const repaired = localClips.map((clip, index) => {
+            const duration = Math.max(0.35, Number(clip.originalDuration || clip.duration) || 0.35);
+            const startAt = Number(cursor.toFixed(2));
+            const endAt = Number((cursor + duration).toFixed(2));
+            const text = String(clip.sourceSubtitleText || clip.name || '').replace(/^本機旁白：/, '').trim();
+            if (clip.sourceSubtitleId) timingById.set(clip.sourceSubtitleId, { startAt, endAt });
+            if (text) timingByText.set(text, { startAt, endAt });
+            cursor = endAt + (index < localClips.length - 1 ? 0.14 : 0);
+            return { ...clip, startAt, duration: Number(duration.toFixed(2)), originalDuration: duration, playbackRate: 1, trimEnd: Number(duration.toFixed(2)) };
+        });
+        setProjectState(prev => ({
+            ...prev,
+            audioTracks: prev.audioTracks.map((track, index) => index === 0
+                ? [...(track || []).filter(clip => clip?.source !== 'local-macos-tts'), ...repaired]
+                : track),
+            subtitles: prev.subtitles.map(raw => {
+                const normalized = normalizeSubtitle(raw);
+                const timing = timingById.get(raw.id) || timingByText.get(String(normalized.text || '').trim());
+                return timing ? normalizeSubtitle({ ...raw, ...timing }) : raw;
+            })
+        }), { recordHistory: false });
+    }, [projectState.audioTracks, projectState.subtitles, setProjectState]);
+
+    const addFilesToMediaLibrary = useCallback(async (files, options = {}) => {
+        const list = Array.from(files || []);
+        if (list.length === 0) return [];
         const newAssets = [];
-        for (const file of files) {
+        for (const file of list) {
             const id = `asset_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
             await saveBlobToDB(id, file);
 
-            const fileType = file.type.startsWith('video/') ? 'video' : (file.type.startsWith('image/') ? 'image' : (file.type.startsWith('audio/') ? 'audio' : 'unknown'));
+            const fileType = getImportedMediaType(file);
             const objectUrl = URL.createObjectURL(file);
             let duration = null;
             if (fileType === 'video' || fileType === 'audio') {
@@ -9852,8 +10649,798 @@ ${JSON.stringify(subtitlePayload)}
             ...prev,
             assets: [...prev.assets, ...newAssets.filter(a => a.type !== 'unknown')]
         }));
+        if (options.selectNewAssets) setSelectedIds(newAssets.filter(a => a.type !== 'unknown').map(asset => asset.id));
+        return newAssets.filter(asset => asset.type !== 'unknown');
+    }, [setProjectState]);
+
+    const addWorkspaceHandlesToMediaLibrary = useCallback(async (entries, options = {}) => {
+        const list = Array.from(entries || []);
+        if (!list.length) return [];
+        const newAssets = [];
+        let unreadableCount = 0;
+        let committedCount = 0;
+        const commitDiscoveredAssets = () => {
+            const batch = newAssets.slice(committedCount);
+            if (!batch.length) return;
+            committedCount = newAssets.length;
+            // External drives can contain hundreds of clips. Surface usable
+            // materials incrementally instead of leaving the library at zero
+            // until the entire index has completed.
+            setProjectState(prev => ({ ...prev, assets: [...prev.assets, ...batch] }));
+        };
+
+        // A FileSystemFileHandle keeps the material on the external disk.  Do not
+        // copy the complete file into IndexedDB: a normal media drive can be tens
+        // of GB and immediately exceed a browser extension's storage quota.
+        for (let index = 0; index < list.length; index += 1) {
+            const entry = list[index];
+            try {
+                const file = await entry.handle.getFile();
+                const fileType = getImportedMediaType(file);
+                if (fileType === 'unknown') continue;
+                const id = `workspace_asset_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`;
+                const objectUrl = URL.createObjectURL(file);
+                await saveFileHandleToDB(id, entry.handle);
+                newAssets.push({
+                    id,
+                    blobId: id,
+                    type: fileType,
+                    src: objectUrl,
+                    name: file.name,
+                    duration: null,
+                    sourceKind: 'external-folder',
+                    fileSize: file.size
+                });
+            } catch (error) {
+                unreadableCount += 1;
+            }
+            if ((index + 1) % 20 === 0) {
+                commitDiscoveredAssets();
+                options.onProgress?.(index + 1, list.length, newAssets.length);
+                await new Promise(resolve => window.requestAnimationFrame(resolve));
+            }
+        }
+
+        commitDiscoveredAssets();
+        if (newAssets.length) {
+            if (options.selectNewAssets) setSelectedIds(newAssets.map(asset => asset.id));
+        }
+        return { assets: newAssets, unreadableCount };
+    }, [setProjectState]);
+
+    const handleImportAssets = async (e) => {
+        const files = Array.from(e.target.files || []);
+        if (files.length === 0) return;
+        await addFilesToMediaLibrary(files);
         e.target.value = '';
     };
+
+    const scanWorkspaceFolder = useCallback(async () => {
+        if (!('showDirectoryPicker' in window)) {
+            setWorkspaceScanStatus('此瀏覽器不支援資料夾掃描，請改用 Chromium 系瀏覽器。');
+            return;
+        }
+        try {
+            setWorkspaceScanStatus('正在掃描工作資料夾…');
+            const folder = await window.showDirectoryPicker({ mode: 'read' });
+            const entries = [];
+            let skippedEntries = 0;
+            const walk = async (directory) => {
+                try {
+                    for await (const entry of directory.values()) {
+                        if (String(entry.name || '').startsWith('.')) continue;
+                        try {
+                            if (entry.kind === 'directory') {
+                                await walk(entry);
+                            } else if (entry.kind === 'file') {
+                                // Filter by file name first.  This avoids opening every
+                                // unrelated file in a large work drive during discovery.
+                                if (getImportedMediaType({ name: entry.name, type: '' }) !== 'unknown') {
+                                    entries.push({ handle: entry });
+                                }
+                            }
+                        } catch (error) {
+                            skippedEntries += 1;
+                        }
+                    }
+                } catch (error) {
+                    skippedEntries += 1;
+                }
+            };
+            await walk(folder);
+            if (!entries.length) {
+                setWorkspaceScanStatus('找不到可用的影片、圖片或音訊檔。');
+                return;
+            }
+            setWorkspaceScanStatus(`找到 ${entries.length} 個媒體，正在建立外接素材索引…`);
+            const { assets: imported, unreadableCount } = await addWorkspaceHandlesToMediaLibrary(entries, {
+                selectNewAssets: false,
+                onProgress: (processed, total, importedCount) => setWorkspaceScanStatus(`正在建立外接素材索引… ${processed}/${total}（已可用 ${importedCount} 個）`)
+            });
+            const ignoredCount = skippedEntries + unreadableCount;
+            setMediaLibraryVisibleCount(80);
+            setWorkspaceScanStatus(`已索引 ${imported.length} 個外接素材；檔案保留在原資料夾，不會複製到瀏覽器資料庫。${ignoredCount ? `略過 ${ignoredCount} 個無法讀取的項目。` : ''}`);
+            setAiEditorMessages(prev => [...prev, {
+                role: 'assistant',
+                text: `工作資料夾已掃描完成，已建立 ${imported.length} 個外接素材索引。告訴我影片用途或直接說「幫我自動剪輯」，我會先提出剪輯方案。`
+            }]);
+        } catch (error) {
+            if (error?.name !== 'AbortError') {
+                console.warn('workspace media scan failed', error);
+                setWorkspaceScanStatus('掃描工作資料夾失敗，請再試一次。');
+            }
+        }
+    }, [addWorkspaceHandlesToMediaLibrary]);
+
+    const toggleAiEditorVoiceInput = useCallback(() => {
+        const runningRecognition = aiEditorRecognitionRef.current;
+        if (runningRecognition) {
+            runningRecognition.stop();
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            setAiEditorVoiceStatus('此瀏覽器不支援語音輸入，請改用 Chrome 或 Edge。');
+            return;
+        }
+
+        const recognition = new SpeechRecognition();
+        let finalTranscript = '';
+        aiEditorVoiceBaseRef.current = aiEditorPrompt.trim();
+        recognition.lang = settings.language === 'zh-TW' ? 'zh-TW' : 'en-US';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onstart = () => {
+            setAiEditorListening(true);
+            setAiEditorVoiceStatus('正在聆聽，點一下麥克風即可停止。');
+        };
+        recognition.onresult = (event) => {
+            let interimTranscript = '';
+            for (let index = event.resultIndex; index < event.results.length; index += 1) {
+                const transcript = event.results[index]?.[0]?.transcript || '';
+                if (event.results[index].isFinal) finalTranscript += transcript;
+                else interimTranscript += transcript;
+            }
+            const spokenText = `${finalTranscript}${interimTranscript}`.trim();
+            setAiEditorPrompt(aiEditorVoiceBaseRef.current && spokenText
+                ? `${aiEditorVoiceBaseRef.current} ${spokenText}`
+                : (aiEditorVoiceBaseRef.current || spokenText));
+        };
+        recognition.onerror = (event) => {
+            const message = event.error === 'not-allowed'
+                ? '請允許瀏覽器使用麥克風後再試一次。'
+                : event.error === 'no-speech'
+                    ? '沒有收到語音，請再試一次。'
+                    : `語音輸入暫時無法使用：${event.error || '未知錯誤'}。`;
+            setAiEditorVoiceStatus(message);
+        };
+        recognition.onend = () => {
+            if (aiEditorRecognitionRef.current === recognition) aiEditorRecognitionRef.current = null;
+            setAiEditorListening(false);
+        };
+
+        aiEditorRecognitionRef.current = recognition;
+        try {
+            recognition.start();
+        } catch (error) {
+            aiEditorRecognitionRef.current = null;
+            setAiEditorListening(false);
+            setAiEditorVoiceStatus('語音輸入無法啟動，請稍後再試。');
+        }
+    }, [aiEditorPrompt, settings.language]);
+
+    useEffect(() => () => {
+        aiEditorRecognitionRef.current?.abort?.();
+        aiEditorPlanAbortRef.current?.abort?.();
+    }, []);
+
+    useEffect(() => {
+        if (aiEditorProviderStatus.phase !== 'running' || !aiEditorProviderStatus.startedAt) {
+            setAiEditorElapsedSeconds(0);
+            return undefined;
+        }
+        const updateElapsed = () => setAiEditorElapsedSeconds(Math.max(0, Math.floor((Date.now() - aiEditorProviderStatus.startedAt) / 1000)));
+        updateElapsed();
+        const timer = window.setInterval(updateElapsed, 500);
+        return () => window.clearInterval(timer);
+    }, [aiEditorProviderStatus.phase, aiEditorProviderStatus.startedAt]);
+
+    const cancelAiEditorPlan = useCallback(() => {
+        if (!aiEditorPlanAbortRef.current) return;
+        setAiEditorProviderStatus(previous => ({
+            ...previous,
+            phase: 'cancelling',
+            detail: '正在取消本次 API 剪輯規劃…'
+        }));
+        aiEditorPlanAbortRef.current.abort();
+    }, []);
+
+    const refreshAgentEditRequestStatus = useCallback(async (projectId = automationProjectId) => {
+        const targetProjectId = String(projectId || '').trim();
+        const token = String(settings.automationApiToken || '').trim();
+        if (!targetProjectId || !settings.automationApiEnabled || !token) return null;
+        const baseUrl = String(settings.automationApiUrl || 'http://127.0.0.1:4318').replace(/\/+$/, '');
+        const response = await fetch(`${baseUrl}/v1/projects/${encodeURIComponent(targetProjectId)}/agent-edit-request`, {
+            headers: { Authorization: `Bearer ${token}` }
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload?.error?.message || '無法取得 MCP 任務狀態。');
+        setAgentEditRequestStatus(payload?.request || null);
+        return payload?.request || null;
+    }, [automationProjectId, settings.automationApiEnabled, settings.automationApiToken, settings.automationApiUrl]);
+
+    useEffect(() => {
+        if (aiEditorSource !== 'mcp' || aiEditorMcpMode !== 'edit' || !automationProjectId) return undefined;
+        let active = true;
+        const refresh = async () => {
+            try {
+                await refreshAgentEditRequestStatus();
+            } catch (error) {
+                if (active) console.warn('Unable to refresh MCP edit request status', error);
+            }
+        };
+        void refresh();
+        const timer = window.setInterval(refresh, 2500);
+        return () => {
+            active = false;
+            window.clearInterval(timer);
+        };
+    }, [aiEditorMcpMode, aiEditorSource, automationProjectId, refreshAgentEditRequestStatus]);
+
+    const requestAiEditorPlan = useCallback(async () => {
+        const prompt = aiEditorPrompt.trim();
+        if (!prompt || aiEditorBusy) return;
+        const assets = projectStateRef.current.assets || [];
+        // Follow the user's actual instruction language. A project can retain
+        // an English locale while its operator is writing Traditional Chinese;
+        // letting that hidden setting win caused Chinese requests to produce
+        // English narration.
+        const editorLanguage = /[\u3400-\u9fff]/.test(prompt) ? 'zh-TW' : settings.language;
+        const fallbackPlan = buildLocalEditorPlan({ prompt, assets, language: editorLanguage });
+        const userMessage = { role: 'user', text: prompt };
+        setAiEditorMessages(prev => [...prev, userMessage]);
+        setAiEditorPrompt('');
+        // A newly submitted request replaces the previous proposal. Keeping an
+        // old plan visible while the next model call is running makes it look
+        // as if the new request has already finished and can apply stale edits.
+        setAiEditorPlan(null);
+        setAiEditorBusy(true);
+
+        if (aiEditorSource === 'mcp') {
+            try {
+                const baseUrl = String(settings.automationApiUrl || 'http://127.0.0.1:4318').replace(/\/+$/, '');
+                const token = String(settings.automationApiToken || '').trim();
+                if (!settings.automationApiEnabled || !token) {
+                    throw new Error('請先在設定啟用「允許 Codex 工作流控制」並填入本機 Automation API Token。');
+                }
+                const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` };
+                let projectId = automationProjectId;
+                const createAutomationProject = async () => {
+                    const created = await fetch(`${baseUrl}/v1/projects`, {
+                        method: 'POST', headers,
+                        body: JSON.stringify({
+                            name: 'Codex AI 剪輯任務',
+                            title: projectStateRef.current.articleTopic || 'Codex AI 剪輯任務',
+                            topic: projectStateRef.current.articleTopic || '',
+                            brief: prompt,
+                            skillId: activeSkillId,
+                            // This task is created from the currently open Studio.
+                            // Never initialize an empty Studio project over its imported media.
+                            initialize: false,
+                            snapshot: getAutomationSnapshot()
+                        })
+                    });
+                    const payload = await created.json().catch(() => ({}));
+                    if (!created.ok) throw new Error(payload?.error?.message || '無法建立 Codex 剪輯任務。');
+                    const createdProjectId = payload?.project?.id;
+                    if (!createdProjectId) throw new Error('Codex 剪輯任務沒有建立成功。');
+                    setAutomationProjectId(createdProjectId);
+                    return createdProjectId;
+                };
+                if (!projectId) projectId = await createAutomationProject();
+
+                // Push the latest library immediately. The normal bridge sync is
+                // debounced, but Codex may be launched as soon as this request is
+                // submitted and must not see an older empty snapshot.
+                const syncSnapshot = async (targetProjectId) => {
+                    const response = await fetch(`${baseUrl}/v1/projects/${encodeURIComponent(targetProjectId)}/snapshot`, {
+                        method: 'POST', headers,
+                        body: JSON.stringify({ snapshot: getAutomationSnapshot() })
+                    });
+                    return { response, payload: await response.json().catch(() => ({})) };
+                };
+                let synced = await syncSnapshot(projectId);
+                if (synced.response.status === 404) {
+                    // A local service may have been reinstalled while Studio was
+                    // open. Transparently create a fresh task instead of leaving
+                    // the dialogue tied to a stale project ID.
+                    projectId = await createAutomationProject();
+                    synced = await syncSnapshot(projectId);
+                }
+                if (!synced.response.ok) throw new Error(synced.payload?.error?.message || '無法同步目前素材庫給 Codex。');
+
+                if (aiEditorMcpMode === 'browser-tutorial') {
+                    const startUrl = browserTutorialStartUrl.trim();
+                    let allowedDomain = '';
+                    try {
+                        const parsedUrl = new URL(startUrl);
+                        if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('invalid protocol');
+                        allowedDomain = parsedUrl.hostname;
+                    } catch {
+                        throw new Error('Browser 教學需要有效的 http:// 或 https:// 起始網址。');
+                    }
+                    const response = await fetch(`${baseUrl}/v1/projects/${encodeURIComponent(projectId)}/browser-tutorial-request`, {
+                        method: 'POST', headers,
+                        body: JSON.stringify({
+                            agent: aiEditorAgent,
+                            title: prompt.slice(0, 80),
+                            goal: prompt,
+                            startUrl,
+                            allowedDomains: [allowedDomain],
+                            instructions: prompt
+                        })
+                    });
+                    const payload = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(payload?.error?.message || '無法建立 Browser 教學任務。');
+                    setBrowserTutorialStatus(`任務已建立：${payload?.script?.steps?.length || 0} 個步驟，允許操作 ${allowedDomain}。`);
+                    setAiEditorMessages(prev => [...prev, {
+                        role: 'assistant',
+                        text: `Browser 教學任務已交給 ${aiEditorAgent}。Agent 可透過 OpenViscribe MCP 認領任務、啟動錄影、逐步操作並回報畫面證據。登入、密碼、CAPTCHA、付款、刪除與外部送出仍會停下來請你接手。`
+                    }]);
+                    return;
+                }
+                const response = await fetch(`${baseUrl}/v1/projects/${encodeURIComponent(projectId)}/agent-edit-request`, {
+                    method: 'POST', headers,
+                    body: JSON.stringify({ prompt, requestedBy: 'OpenViscribe AI 剪輯總監', agent: aiEditorAgent })
+                });
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(payload?.error?.message || '無法送出 Codex 剪輯任務。');
+                setAgentEditRequestStatus(payload?.request || null);
+                setAiEditorMessages(prev => [...prev, {
+                    role: 'assistant',
+                    text: aiEditorAgent === 'Codex'
+                        ? `已交給本機 Codex 規劃。任務 ID：${projectId}；Codex 會自動領取並將待確認的剪輯方案送回這裡，不會直接修改時間軸。`
+                        : `已建立本機 MCP 剪輯任務。任務 ID：${projectId}；${aiEditorAgent} 需透過 OpenViscribe MCP 主動領取後才會開始規劃。`
+                }]);
+            } catch (error) {
+                const detail = String(error?.message || '未知錯誤');
+                const restartHint = /API route was not found|HTTP 404/i.test(detail)
+                    ? '目前執行中的 OpenViscribe Automation API 是舊版。請停止後重新啟動 `npm run automation:api`，再送出一次。'
+                    : `無法交給 ${aiEditorAgent} Agent：${detail}`;
+                setAiEditorMessages(prev => [...prev, { role: 'assistant', text: restartHint }]);
+            } finally {
+                setAiEditorBusy(false);
+            }
+            return;
+        }
+
+        // Do not serialize a complete media drive into a local model prompt.
+        // Hundreds of file names can consume most of the context window before
+        // Ollama produces its first token. Prefer prompt-name matches, then take
+        // an even sample across the remaining visual library so later folders
+        // are represented as well as the first folder discovered.
+        const visualAssets = assets.filter(asset => asset.type === 'video' || asset.type === 'image');
+        const planningAssetLimit = articleProvider === 'ollama' ? 72 : 160;
+        const normalizedPrompt = prompt.toLocaleLowerCase();
+        const promptTokens = Array.from(new Set(normalizedPrompt.match(/[a-z0-9][a-z0-9_-]{1,}|[\u3400-\u9fff]{2,}/gi) || []));
+        const rankedPlanningAssets = visualAssets.map((asset, index) => {
+            const searchableName = String(asset.name || '').toLocaleLowerCase();
+            const matchScore = promptTokens.reduce((score, token) => score + (searchableName.includes(token) ? 1 : 0), 0);
+            return { asset, index, matchScore };
+        });
+        const matchedPlanningAssets = rankedPlanningAssets
+            .filter(item => item.matchScore > 0)
+            .sort((a, b) => b.matchScore - a.matchScore || a.index - b.index)
+            .slice(0, planningAssetLimit);
+        const selectedPlanningIds = new Set(matchedPlanningAssets.map(item => item.asset.id));
+        const unmatchedPlanningAssets = rankedPlanningAssets.filter(item => !selectedPlanningIds.has(item.asset.id));
+        const remainingPlanningSlots = Math.max(0, planningAssetLimit - matchedPlanningAssets.length);
+        const sampledPlanningAssets = [];
+        if (remainingPlanningSlots >= unmatchedPlanningAssets.length) {
+            sampledPlanningAssets.push(...unmatchedPlanningAssets);
+        } else if (remainingPlanningSlots > 0) {
+            for (let index = 0; index < remainingPlanningSlots; index += 1) {
+                const sampleIndex = Math.min(
+                    unmatchedPlanningAssets.length - 1,
+                    Math.floor(index * unmatchedPlanningAssets.length / remainingPlanningSlots)
+                );
+                sampledPlanningAssets.push(unmatchedPlanningAssets[sampleIndex]);
+            }
+        }
+        const planningAssets = [...matchedPlanningAssets, ...sampledPlanningAssets].map(item => item.asset);
+        // Workspace asset IDs contain timestamps and random suffixes. Repeating
+        // those long IDs in every sequence item wastes a large part of a local
+        // model's completion budget. Give the model compact aliases and resolve
+        // them back to the actual project IDs after parsing.
+        const planningAssetAliases = new Map(planningAssets.map((asset, index) => [`a${index + 1}`, asset.id]));
+        const assetSummary = planningAssets.map((asset, index) => ({
+            id: `a${index + 1}`,
+            name: asset.name,
+            type: asset.type,
+            // Scanned workspace metadata can persist duration as a numeric
+            // string. Normalize it before rounding; calling toFixed directly
+            // on that string aborted the request before Ollama was contacted
+            // and left the editor stuck in its busy state.
+            duration: Number.isFinite(Number(asset.duration)) ? Number(Number(asset.duration).toFixed(2)) : null
+        }));
+        // Estimate requested duration from the prompt as a blank project has no
+        // timeline duration yet. A three-minute narrated edit needs materially
+        // more output than a 45-second short; do not truncate its JSON script.
+        const durationMatches = [...prompt.matchAll(/(\d+(?:\.\d+)?)\s*(分鐘|分|mins?|min|秒|s)/gi)];
+        let requestedPromptDuration = durationMatches.reduce((maximum, match) => {
+            const amount = Number(match[1]) || 0;
+            return Math.max(maximum, /^(秒|s)$/i.test(match[2]) ? amount : amount * 60);
+        }, 0);
+        const chineseDigitMap = { 零: 0, 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+        const parseChineseDurationNumber = value => {
+            const source = String(value || '');
+            if (source === '半') return 0.5;
+            if (source.includes('十')) {
+                const [tens, ones] = source.split('十');
+                return (tens ? (chineseDigitMap[tens] ?? 0) : 1) * 10 + (ones ? (chineseDigitMap[ones] ?? 0) : 0);
+            }
+            return chineseDigitMap[source] ?? 0;
+        };
+        const chineseDurationMatches = [...prompt.matchAll(/([零一二兩三四五六七八九十半]+)\s*(分鐘|分|秒)/g)];
+        requestedPromptDuration = chineseDurationMatches.reduce((maximum, match) => {
+            const amount = parseChineseDurationNumber(match[1]);
+            return Math.max(maximum, match[2] === '秒' ? amount : amount * 60);
+        }, requestedPromptDuration);
+        const requiredPlanDuration = Math.max(Number(totalDuration) || 0, requestedPromptDuration, 24);
+        const outputBudgetDuration = Math.max(requiredPlanDuration, 60);
+        // A full one-minute plan contains asset IDs plus timed narration. 950
+        // tokens regularly stopped Qwen mid-string and produced invalid JSON,
+        // so scale a larger completion budget with the requested duration.
+        const aiEditorOutputBudget = Math.min(2800, Math.max(1600, Math.round(1000 + outputBudgetDuration * 8)));
+        const providerAbortController = new AbortController();
+        aiEditorPlanAbortRef.current = providerAbortController;
+        setAiEditorProviderStatus({
+            phase: 'running',
+            provider: articleProviderLabel,
+            model: articleModelLabel,
+            detail: `已從 ${visualAssets.length} 個可視素材挑選 ${planningAssets.length} 個候選；正在向 ${articleProviderLabel} 的 ${articleModelLabel} 要求剪輯方案（最長 ${aiEditorOutputBudget} tokens）。`,
+            startedAt: Date.now()
+        });
+        const systemText = editorLanguage === 'zh-TW'
+            ? '你是資深影片剪輯師與動態設計總監。根據使用者目標與可用素材，提出保守、可執行的影片剪輯方案。只能使用提供的 assetId；不可捏造已看過未提供的畫面內容。回傳精簡的純 JSON，不可使用 Markdown 或補充說明；reply 與 brief 各不超過 80 字。所有人類可讀文字（reply、title、brief、cards、subtitles）一律使用繁體中文。欄位為 reply, title, brief, sequence([{assetId,duration?}]), presetId(signal|editorial|creator), templateId, contentAssetIds, cards([{text,position}]), subtitles([{text,startAt,endAt}]), localTts, voice({voice,rate}), generateSubtitles。subtitles 是必要欄位：必須是完整、可朗讀的繁體中文旁白／字幕稿，從 0 秒連續覆蓋整支影片；不能只給字卡或標題。sequence 最多 24 段並以敘事順序安排，subtitles 最多 12 段，cards 最多 3 張，localTts 預設 true。'
+            : 'You are a senior video editor and motion design director. Create a conservative, executable edit plan using only supplied asset IDs. Do not claim to have seen footage that was not provided. Return compact pure JSON with no Markdown or extra commentary; keep reply and brief under 80 words each. Fields: reply, title, brief, sequence([{assetId,duration?}]), presetId(signal|editorial|creator), templateId, contentAssetIds, cards([{text,position}]), subtitles([{text,startAt,endAt}]), localTts, voice({voice,rate}), and generateSubtitles. subtitles is required: it must be a complete, speakable timed narration from 0 seconds across the video, never just title cards. Use at most 24 sequence items, 12 subtitle segments, and 3 cards.';
+        const userText = `${editorLanguage === 'zh-TW' ? '使用者指令' : 'User direction'}：${prompt}\n\n${editorLanguage === 'zh-TW' ? `候選素材（完整素材庫共 ${visualAssets.length} 個，本次預選 ${planningAssets.length} 個）` : `Candidate assets (${planningAssets.length} preselected from ${visualAssets.length} visual assets)`}：${JSON.stringify(assetSummary)}\n\n${editorLanguage === 'zh-TW' ? '目標影片長度' : 'Required target duration'}：${requiredPlanDuration.toFixed(2)}s\n${editorLanguage === 'zh-TW' ? '輸出語言：繁體中文。sequence 的 duration 總和及最後一段字幕 endAt 必須到達目標影片長度。' : 'Output language: English. The sequence duration total and final subtitle endAt must reach the required target duration.'}\n${editorLanguage === 'zh-TW' ? '目前影片長度' : 'Current timeline duration'}：${Number(totalDuration || 0).toFixed(2)}s`;
+        let plan = fallbackPlan;
+
+        try {
+            let raw = '';
+            if (articleProvider === 'azure' && azureChatEndpoint && azureChatKey && azureChatDeployment) {
+                const response = await fetchWithTimeout(`${azureChatEndpoint.replace(/\/+$/, '')}/openai/deployments/${azureChatDeployment}/chat/completions?api-version=2024-02-15-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'api-key': azureChatKey },
+                    body: JSON.stringify({
+                        messages: [{ role: 'system', content: systemText }, { role: 'user', content: userText }],
+                        temperature: 0.25,
+                        response_format: { type: 'json_object' }
+                    })
+                }, 25000, providerAbortController.signal);
+                if (!response.ok) throw new Error(`AI 剪輯師 HTTP ${response.status}`);
+                const data = await response.json();
+                raw = data.choices?.[0]?.message?.content || '';
+            } else if (articleProvider === 'gemini' && settings.apiKey?.trim() && settings.model?.trim()) {
+                const response = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${encodeURIComponent(settings.apiKey.trim())}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `${systemText}\n\n${userText}` }] }],
+                        generationConfig: { temperature: 0.25, responseMimeType: 'application/json' }
+                    })
+                }, 25000, providerAbortController.signal);
+                if (!response.ok) throw new Error(`AI 剪輯師 HTTP ${response.status}`);
+                const data = await response.json();
+                raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            } else if (articleProvider === 'lmstudio' && lmStudioEndpoint && settings.lmStudioChatModel?.trim()) {
+                raw = await callLmStudioChat({
+                    endpoint: lmStudioEndpoint,
+                    apiKey: lmStudioApiKey,
+                    model: settings.lmStudioChatModel.trim(),
+                    prompt: `${systemText}\n\n${userText}`,
+                    temperature: 0.25,
+                    format: 'json',
+                    timeoutMs: lmStudioTimeoutMs,
+                    signal: providerAbortController.signal
+                });
+            } else if (articleProvider === 'ollama' && ollamaEndpoint && settings.ollamaChatModel?.trim()) {
+                raw = await callOllamaChat({
+                    endpoint: ollamaEndpoint,
+                    model: settings.ollamaChatModel.trim(),
+                    prompt: `${systemText}\n\n${userText}`,
+                    temperature: 0.25,
+                    format: 'json',
+                    // qwen3.6:35b-mlx spends its initial completion in the
+                    // separate thinking field unless explicitly disabled.  The
+                    // editor needs the JSON to arrive in message.content.
+                    think: false,
+                    numPredict: aiEditorOutputBudget,
+                    timeoutMs: ollamaTimeoutMs,
+                    signal: providerAbortController.signal,
+                    onProgress: ({ characters, evalCount }) => {
+                        setAiEditorProviderStatus(previous => previous.phase === 'running' ? {
+                            ...previous,
+                            detail: `Ollama 正在輸出剪輯方案：已收到 ${characters.toLocaleString()} 個字元${evalCount ? `／${evalCount.toLocaleString()} tokens` : ''}。`
+                        } : previous);
+                    }
+                });
+            } else {
+                throw new Error(`${articleProviderLabel} 的剪輯模型尚未設定完成。`);
+            }
+
+            if (!raw) throw new Error(`${articleProviderLabel} 沒有回傳可用的剪輯方案。`);
+            {
+                const parsed = parseModelJsonObject(raw);
+                const validAssetIds = new Set(assets.map(asset => asset.id));
+                const validContentIds = new Set(HYPERFRAME_ASSETS.map(asset => asset.id));
+                let sequence = Array.isArray(parsed.sequence)
+                    ? parsed.sequence
+                        .map(item => ({ ...item, assetId: planningAssetAliases.get(item?.assetId) || item?.assetId }))
+                        .filter(item => validAssetIds.has(item?.assetId))
+                        .slice(0, 80)
+                    : [];
+                const contentAssetIds = Array.isArray(parsed.contentAssetIds)
+                    ? parsed.contentAssetIds.filter(id => validContentIds.has(id)).slice(0, 3)
+                    : [];
+                const getSequenceItemDuration = item => Math.max(0.8, Number(item.duration) || Number(assets.find(asset => asset.id === item.assetId)?.duration) || 5);
+                const sequenceDuration = sequence.reduce((total, item) => total + getSequenceItemDuration(item), 0);
+                if (sequence.length && requiredPlanDuration > sequenceDuration + 0.5) {
+                    const durationScale = requiredPlanDuration / Math.max(1, sequenceDuration);
+                    sequence = sequence.map(item => ({
+                        ...item,
+                        duration: Number(Math.max(0.8, getSequenceItemDuration(item) * durationScale).toFixed(2))
+                    }));
+                }
+                const plannedDuration = Math.max(24, requiredPlanDuration, sequence.reduce((total, item) => total + getSequenceItemDuration(item), 0));
+                plan = {
+                    ...fallbackPlan,
+                    ...parsed,
+                    sequence: sequence.length ? sequence : fallbackPlan.sequence,
+                    presetId: ['signal', 'editorial', 'creator'].includes(parsed.presetId) ? parsed.presetId : fallbackPlan.presetId,
+                    templateId: getHyperframeTemplate(parsed.templateId)?.id || fallbackPlan.templateId,
+                    contentAssetIds: contentAssetIds.length ? contentAssetIds : fallbackPlan.contentAssetIds,
+                    cards: Array.isArray(parsed.cards)
+                        ? parsed.cards.filter(card => String(card?.text || '').trim()).slice(0, 3)
+                        : fallbackPlan.cards,
+                    subtitles: normalizeEditorNarration(parsed.subtitles, parsed.title || fallbackPlan.title, editorLanguage, plannedDuration),
+                    generateSubtitles: parsed.generateSubtitles !== false && fallbackPlan.generateSubtitles,
+                    localTts: parsed.localTts !== false,
+                    voice: {
+                        voice: String(parsed?.voice?.voice || fallbackPlan.voice?.voice || 'Ting-Ting').slice(0, 80),
+                        rate: Number.isFinite(Number(parsed?.voice?.rate)) ? Number(parsed.voice.rate) : Number(fallbackPlan.voice?.rate || 185)
+                    },
+                    source: 'ai-editor'
+                };
+                setAiEditorProviderStatus({
+                    phase: 'success',
+                    provider: articleProviderLabel,
+                    model: articleModelLabel,
+                    detail: `已由 ${articleProviderLabel}／${articleModelLabel} 回傳剪輯方案。`,
+                    startedAt: null
+                });
+            }
+        } catch (error) {
+            if (isAiTaskCancelledError(error)) {
+                plan = null;
+                setAiEditorProviderStatus({
+                    phase: 'cancelled',
+                    provider: articleProviderLabel,
+                    model: articleModelLabel,
+                    detail: '已取消本次 API 剪輯規劃；時間軸沒有被修改。',
+                    startedAt: null
+                });
+            } else {
+                console.warn('AI editor plan failed; using local plan', error);
+                const detail = String(error?.message || '未知錯誤');
+                setAiEditorProviderStatus({
+                    phase: 'fallback',
+                    provider: articleProviderLabel,
+                    model: articleModelLabel,
+                    detail: `${articleProviderLabel} 未完成方案：${detail}。目前已改用本機保守方案。`,
+                    startedAt: null
+                });
+                plan.reply = `${fallbackPlan.reply}\n\n目前無法連上 ${articleProviderLabel} 剪輯師模型，因此先以本機素材清單建立可編輯的保守方案。`;
+            }
+        } finally {
+            if (aiEditorPlanAbortRef.current === providerAbortController) aiEditorPlanAbortRef.current = null;
+            if (plan) {
+                setAiEditorPlan(plan);
+                setAiEditorMessages(prev => [...prev, { role: 'assistant', text: plan.reply }]);
+            }
+            setAiEditorBusy(false);
+        }
+    }, [activeSkillId, aiEditorAgent, aiEditorBusy, aiEditorMcpMode, aiEditorPrompt, aiEditorSource, articleModelLabel, articleProvider, articleProviderLabel, automationProjectId, azureChatDeployment, azureChatEndpoint, azureChatKey, browserTutorialStartUrl, getAutomationSnapshot, lmStudioApiKey, lmStudioEndpoint, lmStudioTimeoutMs, ollamaEndpoint, ollamaTimeoutMs, settings, totalDuration]);
+
+    const submitAiEditorPlan = useCallback(() => {
+        void requestAiEditorPlan().catch(error => {
+            // Keep unexpected preflight failures visible. Previously an error
+            // while serializing imported metadata left only the busy spinner,
+            // which looked like a stalled provider even though no request had
+            // reached Ollama.
+            const detail = String(error?.message || '未知錯誤');
+            aiEditorPlanAbortRef.current = null;
+            setAiEditorBusy(false);
+            if (aiEditorSource === 'provider') {
+                setAiEditorProviderStatus({
+                    phase: 'fallback',
+                    provider: articleProviderLabel,
+                    model: articleModelLabel,
+                    detail: `送出前處理失敗：${detail}。尚未呼叫 ${articleProviderLabel}。`,
+                    startedAt: null
+                });
+            }
+            setAiEditorMessages(previous => [...previous, {
+                role: 'assistant',
+                text: `剪輯規劃未能送出：${detail}`
+            }]);
+        });
+    }, [aiEditorSource, articleModelLabel, articleProviderLabel, requestAiEditorPlan]);
+
+    const applyAiEditorPlan = useCallback(async () => {
+        if (!aiEditorPlan) return;
+        const current = projectStateRef.current;
+        const assetsById = new Map((current.assets || []).map(asset => [asset.id, asset]));
+        let sequence = (aiEditorPlan.sequence || []).map(item => ({ ...item, asset: assetsById.get(item.assetId) })).filter(item => item.asset && (item.asset.type === 'video' || item.asset.type === 'image'));
+        let usedAutomaticMediaFallback = false;
+        if (!sequence.length) {
+            // A local agent can write an excellent narration plan while omitting
+            // asset IDs when the scanned library is very large. Do not make the
+            // Apply button silently fail in that case: build a conservative V2
+            // rough cut from the currently imported visual media, long enough
+            // to cover the returned narration script.
+            const requestedNarrationDuration = Math.max(
+                18,
+                ...(aiEditorPlan.subtitles || []).map(cue => Number(cue?.endAt) || 0)
+            );
+            const fallbackMedia = (current.assets || []).filter(asset => asset && (asset.type === 'video' || asset.type === 'image'));
+            let coveredDuration = 0;
+            sequence = fallbackMedia.slice(0, 80).reduce((selected, asset) => {
+                if (coveredDuration >= requestedNarrationDuration && selected.length >= 2) return selected;
+                const availableDuration = asset.type === 'image' ? 4 : Math.max(0.8, Number(asset.duration) || 5);
+                const plannedDuration = Math.min(availableDuration, asset.type === 'image' ? 4 : 6);
+                selected.push({ asset, duration: plannedDuration, assetId: asset.id });
+                coveredDuration += plannedDuration;
+                return selected;
+            }, []);
+            usedAutomaticMediaFallback = sequence.length > 0;
+        }
+        if (!sequence.length) {
+            setAiEditorMessages(prev => [...prev, { role: 'assistant', text: '這份方案沒有可放入時間軸的影片或圖片。請先掃描工作資料夾或匯入素材。' }]);
+            return;
+        }
+
+        let cursor = 0;
+        const clips = sequence.map((item, index) => {
+            const asset = item.asset;
+            const availableDuration = asset.type === 'image'
+                ? 4
+                : Math.max(0.8, Number(asset.duration) || 5);
+            const requestedDuration = Number(item.duration);
+            const duration = Number(Math.min(availableDuration, Number.isFinite(requestedDuration) && requestedDuration > 0 ? Math.max(0.8, requestedDuration) : availableDuration).toFixed(2));
+            const clip = {
+                id: `ai_editor_clip_${Date.now()}_${index}`,
+                type: asset.type,
+                src: asset.src,
+                blobId: getMediaBlobId(asset),
+                startAt: Number(cursor.toFixed(2)),
+                duration,
+                originalDuration: availableDuration,
+                trimStart: 0,
+                trimEnd: duration,
+                playbackRate: 1,
+                name: asset.name,
+                source: 'ai-editor',
+                layout: { ...DEFAULT_CLIP_LAYOUT },
+                mediaFit: 'cover',
+                kenBurns: createDefaultKenBurnsEffect()
+            };
+            cursor += duration;
+            return clip;
+        });
+        const totalEditDuration = Math.max(1, cursor);
+        const cardAt = (position, fallback) => {
+            if (position === 'closing') return Math.max(0.5, totalEditDuration - 4);
+            if (position === 'middle') return Math.max(1.5, totalEditDuration * 0.52);
+            return fallback;
+        };
+        // Narration already carries the message. AI text cards would duplicate
+        // it, so an automated narration edit uses the intro/outro for branding
+        // and reserves the frame for subtitles plus, at most, one visual
+        // Contents layer.
+        const hasPlannedNarration = Array.isArray(aiEditorPlan.subtitles) && aiEditorPlan.subtitles.some(cue => String(cue?.text || '').trim());
+        const editorialCards = hasPlannedNarration ? [] : (aiEditorPlan.cards || []).map((card, index) => {
+            const startAt = Number(cardAt(card.position, index === 0 ? 1.2 : totalEditDuration * 0.55).toFixed(2));
+            return {
+                id: `ai_editor_card_${Date.now()}_${index}`,
+                text: String(card.text).trim(),
+                creator: 'AI EDITOR',
+                presetId: aiEditorPlan.presetId || 'signal',
+                startAt,
+                endAt: Number(Math.min(totalEditDuration - 0.1, startAt + 3.2).toFixed(2)),
+                source: 'ai-editor',
+                layout: { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 }
+            };
+        }).filter(card => card.endAt > card.startAt);
+        const contentCards = (aiEditorPlan.contentAssetIds || []).slice(0, 1).map((assetId, index) => {
+            const asset = HYPERFRAME_ASSETS.find(item => item.id === assetId);
+            if (!asset) return null;
+            const duration = Math.min(3.6, Number(asset.duration) || 4);
+            const introClearance = Math.min(totalEditDuration, Number(current.motionDesign?.introDuration) || 2.6) + 0.45;
+            const outroClearance = Math.max(introClearance, totalEditDuration - (Number(current.motionDesign?.outroDuration) || 3.1) - duration - 0.45);
+            const startAt = Number(Math.max(introClearance, Math.min(outroClearance, totalEditDuration * 0.52)).toFixed(2));
+            return {
+                id: `ai_editor_content_${asset.id}_${Date.now()}`,
+                text: asset.nameZh,
+                creator: 'AI EDITOR / CONTENTS',
+                presetId: asset.presetId || aiEditorPlan.presetId || 'signal',
+                assetId: asset.id,
+                startAt,
+                endAt: Number(Math.min(totalEditDuration - 0.1, startAt + duration).toFixed(2)),
+                source: 'ai-editor',
+                layout: { x: 14, y: 12, w: 72, h: 50, opacity: 100 }
+            };
+        }).filter(Boolean).filter(card => card.endAt > card.startAt);
+        const plannedNarration = normalizeEditorNarration(
+            aiEditorPlan.subtitles,
+            aiEditorPlan.title || current.articleTopic,
+            settings.language,
+            totalEditDuration
+        ).map((cue, index) => normalizeSubtitle({
+            id: `ai_editor_subtitle_${Date.now()}_${index}`,
+            text: cue.text,
+            startAt: cue.startAt,
+            endAt: cue.endAt,
+            trackIndex: 1,
+            source: 'ai-editor',
+            narration: true
+        }));
+        const nextProject = {
+            ...current,
+            articleTopic: aiEditorPlan.title || current.articleTopic,
+            tutorialDescription: aiEditorPlan.brief || current.tutorialDescription,
+            tracks: current.tracks.map((track, index) => index === 1
+                ? [...track.filter(clip => !['ai-editor', 'ai-editor-voice-fill'].includes(clip?.source)), ...clips]
+                : track),
+            subtitles: [
+                ...(current.subtitles || []).filter(sub => normalizeSubtitle(sub).source !== 'ai-editor'),
+                ...plannedNarration
+            ],
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(current.motionDesign || {}),
+                enabled: true,
+                aiAutoEnabled: true,
+                includeIntro: true,
+                includeOutro: true,
+                // The narration itself is the on-screen copy. Never generate a
+                // second per-subtitle lower-third on top of it.
+                includeLowerThird: false,
+                presetId: aiEditorPlan.presetId || 'signal',
+                hyperframeTemplateId: aiEditorPlan.templateId || 'hf-clean-product',
+                manualCards: [
+                    ...((current.motionDesign?.manualCards || []).filter(card => card?.source !== 'ai-editor')),
+                    ...editorialCards,
+                    ...contentCards
+                ]
+            }
+        };
+        projectStateRef.current = nextProject;
+        setProjectState(nextProject);
+        setSelectedIds(clips.map(clip => clip.id));
+        setAiEditorMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `已把 AI 粗剪放到 V2，共 ${clips.length} 段；完整字幕／旁白稿 ${plannedNarration.length} 段已放入 S2，另加入 ${editorialCards.length} 張字卡與 ${contentCards.length} 個 Contents。原本的 V1 素材沒有被覆蓋。${usedAutomaticMediaFallback ? ' Codex 這次沒有指定素材順序，因此已從素材庫自動挑選前段可視素材建立保守粗剪。' : ''}${aiEditorPlan.localTts ? ' 接著會使用 macOS 本機 TTS 產生旁白。' : ''}`
+        }]);
+        setAiEditorPlan(null);
+        if (aiEditorPlan.localTts && plannedNarration.length) {
+            window.setTimeout(() => { void generateLocalMacVoice(plannedNarration, aiEditorPlan.voice); }, 350);
+        } else if (aiEditorPlan.generateSubtitles && !plannedNarration.length) {
+            window.setTimeout(() => { void generateAiSubtitles(); }, 350);
+        }
+    }, [aiEditorPlan, generateAiSubtitles, generateLocalMacVoice, setProjectState, settings.language]);
 
     const handleLibraryDragStart = (e, item) => {
         const payload = item.type === 'transition'
@@ -10280,6 +11867,7 @@ ${JSON.stringify(subtitlePayload)}
                 audioCtxRef.current = new AudioContext();
                 audioDestRef.current = audioCtxRef.current.createMediaStreamDestination();
             }
+            void audioCtxRef.current.resume().catch(() => { });
 
             projectStateRef.current.tracks.flat().forEach(clip => {
                 const el = videoRefs.current[clip.id];
@@ -10287,6 +11875,7 @@ ${JSON.stringify(subtitlePayload)}
                     try {
                         const source = audioCtxRef.current.createMediaElementSource(el);
                         source.connect(audioDestRef.current);
+                        source.connect(audioCtxRef.current.destination);
                         el.captured = true;
                     } catch (e) { }
                 }
@@ -10296,6 +11885,7 @@ ${JSON.stringify(subtitlePayload)}
                     try {
                         const source = audioCtxRef.current.createMediaElementSource(el);
                         source.connect(audioDestRef.current);
+                        source.connect(audioCtxRef.current.destination);
                         el.captured = true;
                     } catch (e) { }
                 }
@@ -10482,14 +12072,25 @@ ${JSON.stringify(subtitlePayload)}
         if (!projectId) throw new Error('Automation command does not include a project ID.');
 
         if (command.action === 'project.initialize') {
-            const skillId = getSkillById(input.skillId || 'tutorial').id;
+            const workflow = getSkillById(input.skillId || 'tutorial');
+            const skillId = workflow.id;
+            const defaults = workflow.workflowDefaults || {};
             const nextProject = {
                 ...createEmptyProjectState(),
                 articleTopic: String(input.topic || input.title || '').trim(),
-                tutorialDescription: String(input.brief || '').trim()
+                tutorialDescription: String(input.brief || '').trim(),
+                motionDesign: {
+                    ...DEFAULT_MOTION_DESIGN,
+                    presetId: defaults.presetId || DEFAULT_MOTION_DESIGN.presetId,
+                    hyperframeTemplateId: defaults.templateId || DEFAULT_MOTION_DESIGN.hyperframeTemplateId,
+                    cardDuration: defaults.cardDuration || DEFAULT_MOTION_DESIGN.cardDuration,
+                    enabled: defaults.designEnabled === true,
+                    aiAutoEnabled: defaults.designEnabled === true
+                }
             };
             resetProjectHistory();
             setActiveSkillId(skillId);
+            if (defaults.aspectRatio) setSettings(prev => ({ ...prev, aspectRatio: defaults.aspectRatio }));
             setProjectState(nextProject, { recordHistory: false });
             setSelectedIds([]);
             setAutomationProjectId(projectId);
@@ -10535,6 +12136,79 @@ ${JSON.stringify(subtitlePayload)}
         if (command.action === 'subtitles.generate') {
             await generateAiSubtitles();
             return { status: 'completed', detail: 'Subtitle generation finished.', result: getAutomationSnapshot() };
+        }
+
+        if (command.action === 'agent.edit.propose') {
+            const plan = input.plan && typeof input.plan === 'object' ? input.plan : null;
+            if (!plan) throw new Error('Codex edit proposal requires a plan object.');
+            const proposedDuration = Math.max(24, Number(totalDuration) || 0, (plan.sequence || []).reduce((sum, item) => sum + Math.max(0.8, Number(item?.duration) || 5), 0));
+            setAiEditorPlan({
+                ...plan,
+                subtitles: normalizeEditorNarration(plan.subtitles, plan.title || projectStateRef.current.articleTopic, settings.language, proposedDuration),
+                localTts: plan.localTts !== false,
+                voice: {
+                    voice: String(plan?.voice?.voice || 'Ting-Ting').slice(0, 80),
+                    rate: Number.isFinite(Number(plan?.voice?.rate)) ? Number(plan.voice.rate) : 185
+                },
+                source: 'codex-agent'
+            });
+            setShowAiEditor(true);
+            setAiEditorMessages(prev => [...prev, {
+                role: 'assistant',
+                text: `Codex Agent 已送回剪輯方案：${String(plan.reply || '請檢視待套用方案。')}`
+            }]);
+            return { status: 'completed', detail: 'Codex edit proposal is ready for user review in the AI editor.' };
+        }
+
+        if (command.action === 'agent.content.apply') {
+            const rawSubtitles = Array.isArray(input.subtitles) ? input.subtitles : null;
+            const subtitleSeed = Date.now();
+            const agentSubtitles = rawSubtitles
+                ? rawSubtitles.map((item, index) => {
+                    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+                    const startAt = Math.max(0, Number(item?.startAt) || 0);
+                    const requestedEndAt = Number(item?.endAt);
+                    const endAt = Math.max(startAt + 0.35, Number.isFinite(requestedEndAt) ? requestedEndAt : startAt + 2.5);
+                    return text ? normalizeSubtitle({
+                        id: `sub_agent_${subtitleSeed}_${index + 1}`,
+                        text,
+                        startAt: Number(startAt.toFixed(3)),
+                        endAt: Number(endAt.toFixed(3)),
+                        trackIndex: Number.isInteger(item?.trackIndex) ? item.trackIndex : 1,
+                        agentAuthored: true,
+                        fontSize: item?.fontSize,
+                        x: item?.x,
+                        y: item?.y
+                    }) : null;
+                }).filter(Boolean)
+                : null;
+            const articleMarkdown = String(input.articleMarkdown || '').trim().slice(0, 180000);
+            const articleTopic = String(input.articleTopic || '').trim().slice(0, 500);
+            const tutorialDescription = String(input.tutorialDescription || '').trim().slice(0, 5000);
+
+            setProjectState(prev => {
+                const next = { ...prev };
+                if (agentSubtitles) {
+                    next.subtitles = input.replaceSubtitles === false
+                        ? [...prev.subtitles, ...agentSubtitles]
+                        : agentSubtitles;
+                }
+                if (articleMarkdown) next[activeSkill.markdownField || 'tutorialMD'] = articleMarkdown;
+                if (articleTopic) next.articleTopic = articleTopic;
+                if (tutorialDescription) next.tutorialDescription = tutorialDescription;
+                return next;
+            });
+
+            return {
+                status: 'completed',
+                detail: `Applied agent-authored content${agentSubtitles ? ` (${agentSubtitles.length} subtitle cue${agentSubtitles.length === 1 ? '' : 's'})` : ''}${articleMarkdown ? ' and Markdown article' : ''}; no Studio AI provider was called.`,
+                result: {
+                    subtitleCount: agentSubtitles?.length || 0,
+                    subtitleMode: agentSubtitles ? (input.replaceSubtitles === false ? 'append' : 'replace') : 'unchanged',
+                    articleApplied: !!articleMarkdown,
+                    usesStudioAiProvider: false
+                }
+            };
         }
 
         if (command.action === 'article.generate') {
@@ -10614,7 +12288,8 @@ ${JSON.stringify(subtitlePayload)}
                             presetId: input.presetId || requestedAsset.presetId,
                             assetId: requestedAsset.id,
                             startAt,
-                            endAt
+                            endAt,
+                            assetConfig: getHyperframeAssetConfig(requestedAsset, input.assetConfig)
                         }]
                     }
                 }));
@@ -10662,7 +12337,7 @@ ${JSON.stringify(subtitlePayload)}
         }
 
         throw new Error(`Unsupported automation action: ${command.action}`);
-    }, [applyAutomaticContents, automationProjectId, currentTime, generateAiSubtitles, generateAiVoice, generateArticleFromSubtitles, getAutomationSnapshot, isRecording, resetProjectHistory, setProjectState, settings.includeAudio, stopRecording, totalDuration]);
+    }, [activeSkill.markdownField, applyAutomaticContents, automationProjectId, currentTime, generateAiSubtitles, generateAiVoice, generateArticleFromSubtitles, getAutomationSnapshot, isRecording, resetProjectHistory, setProjectState, settings.includeAudio, stopRecording, totalDuration]);
 
     useEffect(() => {
         setAutomationCommandHandler(handleAutomationCommand);
@@ -10681,7 +12356,12 @@ ${JSON.stringify(subtitlePayload)}
         <div className="flex flex-col h-screen bg-gray-900 text-white font-sans overflow-hidden">
 
             {/* 🌟 隱藏的渲染畫布 (不能用 display:none，改用 opacity:0 並移出可視區以確保 captureStream 正常擷取) */}
-            <canvas ref={exportCanvasRef} width={1920} height={1080} className="fixed top-[-9999px] left-[-9999px] opacity-0 pointer-events-none" />
+            <canvas
+                ref={exportCanvasRef}
+                width={canvasDimensions.width}
+                height={canvasDimensions.height}
+                className="fixed top-[-9999px] left-[-9999px] opacity-0 pointer-events-none"
+            />
 
             {projectState.audioTracks.flatMap(t => t || []).map(audio => (
                 <audio key={audio.id} ref={el => audioRefs.current[audio.id] = el} src={audio.src} />
@@ -10705,8 +12385,8 @@ ${JSON.stringify(subtitlePayload)}
 
             <header className="flex items-center justify-between px-4 py-2 bg-gray-800 border-b border-gray-700">
                 <div className="flex items-center space-x-2">
-                    <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-inner">
-                        <MonitorPlay size={20} className="text-white" />
+                    <div className="h-8 w-8 shrink-0 overflow-hidden rounded-lg shadow-[0_3px_10px_rgba(168,85,247,0.3)]">
+                        <img src="/openviscribe-logo.svg" alt="OpenViscribe" className="h-full w-full" />
                     </div>
                     <div>
                         <h1 className="text-lg font-bold tracking-wide">OpenViscribe</h1>
@@ -10720,7 +12400,7 @@ ${JSON.stringify(subtitlePayload)}
 
                 <div className="flex items-center space-x-4">
                     <div className="flex items-center space-x-2 rounded-lg border border-gray-700 bg-gray-900/80 px-3 py-1.5">
-                        <span className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">Skill:</span>
+                        <span className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">工作流:</span>
                         {activeSkillId === 'ui-debug'
                             ? <Bug size={14} className="text-amber-300" />
                             : activeSkillId === 'ux-research'
@@ -10728,15 +12408,20 @@ ${JSON.stringify(subtitlePayload)}
                                 : <MonitorPlay size={14} className="text-sky-300" />}
                         <select
                             value={activeSkillId}
-                            onChange={(e) => setActiveSkillId(getSkillById(e.target.value).id)}
+                            onChange={(e) => activateWorkflow(e.target.value)}
                             className="bg-transparent text-sm text-white focus:outline-none"
-                            title="切換 Skill"
+                            title="切換影片工作流或分析工具"
                         >
-                            {SKILL_REGISTRY.map(skill => (
-                                <option key={skill.id} value={skill.id} className="bg-gray-900 text-white">
-                                    {skill.name}
-                                </option>
-                            ))}
+                            <optgroup label="影片工作流">
+                                {SKILL_REGISTRY.filter(skill => skill.workflowCategory === 'video').map(skill => (
+                                    <option key={skill.id} value={skill.id} className="bg-gray-900 text-white">{skill.name}</option>
+                                ))}
+                            </optgroup>
+                            <optgroup label="分析與研究工具">
+                                {SKILL_REGISTRY.filter(skill => skill.workflowCategory !== 'video').map(skill => (
+                                    <option key={skill.id} value={skill.id} className="bg-gray-900 text-white">{skill.name}</option>
+                                ))}
+                            </optgroup>
                         </select>
                     </div>
 
@@ -10750,19 +12435,16 @@ ${JSON.stringify(subtitlePayload)}
                         </button>
                     )}
 
-                    <div className="h-6 w-px bg-gray-700"></div>
-
                     <input type="file" ref={importProjectRef} accept=".json" style={{ display: 'none' }} onChange={handleImportProject} />
                     <button onClick={() => importProjectRef.current?.click()} className="flex items-center space-x-1 hover:text-blue-400 transition text-sm">
                         <Upload size={16} className="mr-1" /> 匯入專案 JSON
                     </button>
                     <button
-                        onClick={handleImportProjectMediaFolder}
-                        className={`flex items-center space-x-1 transition text-sm ${currentMissingMediaCount > 0 ? 'text-amber-300 hover:text-amber-200' : 'text-gray-500 hover:text-gray-300'}`}
-                        title={currentMissingMediaCount > 0 ? `尚有 ${currentMissingMediaCount} 個媒體檔待重連` : '目前沒有待重連的媒體檔'}
+                        onClick={currentMissingMediaCount > 0 ? handleImportProjectMediaFolder : scanWorkspaceFolder}
+                        className={`flex items-center space-x-1 text-sm transition ${currentMissingMediaCount > 0 ? 'text-amber-300 hover:text-amber-100' : 'text-cyan-200 hover:text-cyan-100'}`}
+                        title={currentMissingMediaCount > 0 ? '重新連結匯入專案後缺少的媒體檔' : '掃描工作資料夾中的影片、圖片與音訊，匯入素材庫供 AI 剪輯'}
                     >
-                        <FolderOpen size={16} className="mr-1" /> 匯入素材資料夾
-                        {currentMissingMediaCount > 0 && <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] text-amber-100">{currentMissingMediaCount}</span>}
+                        <FolderOpen size={16} className="mr-1" /> {currentMissingMediaCount > 0 ? '重新連結素材' : '掃描工作資料夾'}
                     </button>
 
                     <button onClick={saveDraft} className="flex items-center space-x-1 hover:text-green-400 transition text-sm">
@@ -10797,7 +12479,7 @@ ${JSON.stringify(subtitlePayload)}
             <div className="flex flex-1 overflow-hidden relative">
 
                 {isMultiSelect && !hasOnlySubtitleSelection ? (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <span className="font-bold text-sm">已選擇多個片段 ({selectedIds.length})</span>
                             <button onClick={() => setSelectedIds([])} className="text-xs text-gray-400 hover:text-white">取消選取</button>
@@ -10810,7 +12492,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 ) : hasOnlySubtitleSelection && subtitleBatchDraft ? (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <span className="font-bold text-sm">{isMultiSubtitleSelect ? `批次編輯字幕 (${selectedSubtitles.length})` : '編輯字幕'}</span>
                             <button onClick={() => setSelectedIds([])} className="text-xs text-gray-400 hover:text-white">關閉</button>
@@ -10971,7 +12653,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 ) : activeTransition ? (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <span className="font-bold text-sm">編輯過場動畫</span>
                             <button onClick={() => setSelectedIds([])} className="text-xs text-gray-400 hover:text-white">關閉</button>
@@ -11004,7 +12686,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 ) : activeClip ? (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <span className="font-bold text-sm flex items-center"><FastForward size={16} className="mr-2" /> 編輯片段</span>
                             <button onClick={() => setSelectedIds([])} className="text-xs text-gray-400 hover:text-white">關閉</button>
@@ -11174,7 +12856,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 ) : activeAudio ? (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <span className="font-bold text-sm flex items-center"><Volume2 size={16} className="mr-2" /> 音訊編輯</span>
                             <button onClick={() => setSelectedIds([])} className="text-xs text-gray-400 hover:text-white">關閉</button>
@@ -11199,11 +12881,18 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 ) : (
-                    <div style={{ width: `${leftPanelWidth}px` }} className="shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl">
+                    <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
                         <div className="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-900">
                             <div>
                                 <div className="font-bold text-sm">{activeSkill.name}</div>
                                 <div className="text-[11px] text-gray-400 mt-1">{activeSkill.description}</div>
+                                {activeSkill.workflowDefaults && (
+                                    <div className="mt-2 flex flex-wrap gap-1.5 text-[9px] font-semibold">
+                                        <span className="rounded bg-sky-400/10 px-1.5 py-0.5 text-sky-200">{activeSkill.workflowDefaults.aspectRatio}</span>
+                                        <span className="rounded bg-violet-400/10 px-1.5 py-0.5 text-violet-200">{getMotionDesignPreset(activeSkill.workflowDefaults.presetId).name}</span>
+                                        <span className="rounded bg-white/5 px-1.5 py-0.5 text-gray-300">可手動編輯</span>
+                                    </div>
+                                )}
                             </div>
                         </div>
                         <div className="flex-1 overflow-y-auto p-4 space-y-6">
@@ -11367,10 +13056,17 @@ ${JSON.stringify(subtitlePayload)}
                                                 </>
                                             )}
                                         </div>
-                                        <button onClick={generateAiVoice} className="w-full p-3 bg-gray-700 hover:bg-green-600 rounded-xl flex items-center space-x-3 transition shadow-sm">
-                                            {aiLoading && activeAiTask === 'voice' ? <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-white"></div> : <Mic size={20} />}
-                                            <span className="text-sm font-medium">AI 自動語音生成</span>
-                                        </button>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <button onClick={generateAiVoice} className="p-3 bg-gray-700 hover:bg-green-600 rounded-xl flex items-center justify-center space-x-2 transition shadow-sm">
+                                                {aiLoading && activeAiTask === 'voice' ? <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-white"></div> : <Mic size={18} />}
+                                                <span className="text-sm font-medium">AI 語音</span>
+                                            </button>
+                                            <button onClick={() => void generateLocalMacVoice()} className="p-3 border border-cyan-300/35 bg-cyan-400/10 hover:bg-cyan-400/20 text-cyan-50 rounded-xl flex items-center justify-center space-x-2 transition shadow-sm">
+                                                <Mic size={18} />
+                                                <span className="text-sm font-medium">本機 TTS</span>
+                                            </button>
+                                        </div>
+                                        <p className="text-[10px] leading-4 text-cyan-100/70">本機 TTS 使用這台 Mac 的語音引擎，不需要 Azure、Gemini 或 Ollama；會依 S2 字幕時間軸建立旁白。</p>
                                         <div className={`rounded-xl border px-3 py-2 space-y-2 ${ttsStatusClasses}`}>
                                             <button
                                                 type="button"
@@ -11952,14 +13648,14 @@ ${JSON.stringify(subtitlePayload)}
                 )}
 
                 <div
-                    className={`group relative w-2 shrink-0 cursor-col-resize border-r border-gray-700/80 bg-gray-800/70 transition hover:bg-blue-500/30 ${isResizingLeftPanel ? 'bg-blue-500/40' : ''}`}
+                    className={`group relative w-2 shrink-0 cursor-col-resize bg-gray-800/70 transition hover:bg-blue-500/30 ${isShortsEditingWorkspace ? 'order-2 border-l border-gray-700/80' : 'border-r border-gray-700/80'} ${isResizingLeftPanel ? 'bg-blue-500/40' : ''}`}
                     onMouseDown={() => setIsResizingLeftPanel(true)}
                     title="拖拉調整左側面板寬度"
                 >
                     <div className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-gray-500/80 group-hover:bg-blue-300" />
                 </div>
 
-                <div className="flex-1 bg-[#12141A] flex flex-col items-center justify-center relative p-8">
+                <div className={`${isShortsEditingWorkspace ? 'order-0 w-[360px] max-w-[32vw] shrink-0 flex-none border-r border-gray-700 p-4' : 'flex-1 p-8'} bg-[#12141A] flex flex-col items-center justify-center relative min-w-0 min-h-0`}>
 
                     {aiLoading && aiProgress && (
                         <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-[2500] min-w-[320px] max-w-[520px] text-white px-5 py-3 rounded-2xl shadow-2xl text-sm space-y-2 border pointer-events-auto ${activeTaskAccent.panel}`}>
@@ -12000,14 +13696,15 @@ ${JSON.stringify(subtitlePayload)}
 
                     <div
                         ref={previewContainerRef}
-                        className="w-full max-w-4xl aspect-video bg-black rounded-lg shadow-2xl overflow-hidden relative border border-gray-800"
+                        className={`bg-black rounded-lg shadow-2xl overflow-hidden relative border border-gray-800 ${isShortsEditingWorkspace ? 'shrink min-h-0' : canvasDimensions.isPortrait || canvasDimensions.isSquare ? 'shrink-0' : 'w-full max-w-4xl'}`}
+                        style={{ ...previewCanvasStyle, containerType: 'inline-size' }}
                     >
                         {isRecording && (
                             <div className="absolute inset-0 z-[1400] bg-black">
                                 <canvas
                                     ref={recordingPreviewCanvasRef}
-                                    width={1920}
-                                    height={1080}
+                                    width={canvasDimensions.width}
+                                    height={canvasDimensions.height}
                                     className="h-full w-full object-contain"
                                 />
                                 <div className="absolute left-4 top-4 rounded-full border border-red-400/40 bg-red-500/15 px-3 py-1 text-xs font-semibold tracking-[0.18em] text-red-100">
@@ -12052,15 +13749,14 @@ ${JSON.stringify(subtitlePayload)}
                                                     ref={el => videoRefs.current[clip.id] = el}
                                                     src={clip.src}
                                                     playsInline
-                                                    muted={true}
-                                                    className="w-full h-full object-contain pointer-events-none"
+                                                className={`w-full h-full ${clip.mediaFit === 'cover' ? 'object-cover' : 'object-contain'} pointer-events-none`}
                                                     style={buildKenBurnsPreviewMediaStyle(clip, currentTime)}
                                                 />
                                             ) : (
                                                 <img
                                                     ref={el => imageRefs.current[clip.id] = el}
                                                     src={clip.src}
-                                                    className="w-full h-full object-contain pointer-events-none"
+                                                className={`w-full h-full ${clip.mediaFit === 'cover' ? 'object-cover' : 'object-contain'} pointer-events-none`}
                                                     style={buildKenBurnsPreviewMediaStyle(clip, currentTime)}
                                                     alt={clip.name}
                                                 />
@@ -12103,7 +13799,10 @@ ${JSON.stringify(subtitlePayload)}
                                     const subtitleStyle = {
                                         left: `${sub.x}%`,
                                         top: `${sub.y}%`,
-                                        fontSize: `${sub.fontSize}px`,
+                                        // Subtitle sizes are stored in output-canvas pixels.
+                                        // Scale them to the responsive preview instead of
+                                        // rendering a 56px export font as 56 CSS pixels.
+                                        fontSize: `clamp(10px, ${(sub.fontSize / canvasDimensions.width) * 100}cqw, ${sub.fontSize}px)`,
                                         fontFamily: sub.fontFamily,
                                         color: sub.textColor,
                                         backgroundColor: hexToRgba(sub.backgroundColor, sub.backgroundOpacity),
@@ -12112,12 +13811,12 @@ ${JSON.stringify(subtitlePayload)}
                                     return (
                                         <div
                                             key={sub.id}
-                                            className="absolute max-w-[80%] cursor-move pointer-events-auto"
+                                            className="absolute w-max max-w-[92%] cursor-move pointer-events-auto"
                                             style={subtitleStyle}
                                             onMouseDown={(e) => handleSubtitleCanvasMouseDown(e, sub)}
                                         >
                                             <div
-                                                className={`px-4 py-2 rounded text-center font-bold tracking-wide drop-shadow-[0_4px_4px_rgba(0,0,0,0.8)] border whitespace-pre-wrap ${isSelected ? 'border-orange-400 shadow-[0_0_0_2px_rgba(251,146,60,0.85)]' : 'border-white/20'}`}
+                                                className={`px-[0.8em] py-[0.36em] rounded-[0.2em] text-center font-bold tracking-wide drop-shadow-[0_4px_4px_rgba(0,0,0,0.8)] border whitespace-pre-wrap break-normal ${isSelected ? 'border-orange-400 shadow-[0_0_0_2px_rgba(251,146,60,0.85)]' : 'border-white/20'}`}
                                             >
                                                 {sub.text}
                                             </div>
@@ -12135,30 +13834,56 @@ ${JSON.stringify(subtitlePayload)}
                             if (layer.kind === 'hyperframe-asset') {
                                 const asset = HYPERFRAME_ASSETS.find(item => item.id === layer.assetId);
                                 if (!asset) return null;
+                                const layout = layer.layout || { x: 12, y: 17, w: 76, h: 66, opacity: 100 };
+                                const isSelected = layer.manual && selectedIds.includes(layer.id);
                                 return (
-                                    <div key={`motion_${layer.kind}_${layer.id}`} className="absolute inset-0 z-[1725] flex items-center justify-center px-[12%] py-[8%]" style={{ opacity: easedProgress * (1 - (layer.exitProgress || 0)), transform: `translateY(${(1 - easedProgress + (layer.exitProgress || 0)) * 32}px)` }}>
-                                        <HyperframeAssetPreview asset={asset} className="h-full w-full max-h-[66%] max-w-[76%] shadow-2xl" />
+                                    <div
+                                        key={`motion_${layer.kind}_${layer.id}`}
+                                        className="absolute z-[1725] cursor-move"
+                                        style={{ left: `${layout.x}%`, top: `${layout.y}%`, width: `${layout.w}%`, height: `${layout.h}%`, opacity: easedProgress * (1 - (layer.exitProgress || 0)) * (layout.opacity / 100), transform: `translateY(${(1 - easedProgress + (layer.exitProgress || 0)) * 32}px)` }}
+                                        onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'move')}
+                                    >
+                                        <HyperframeAssetPreview asset={asset} config={layer.assetConfig} className="h-full w-full shadow-2xl" />
+                                        {isSelected && (
+                                            <div className="pointer-events-none absolute inset-0 border-2 border-violet-300 shadow-[0_0_0_2px_rgba(196,181,253,0.35)]">
+                                                <div className="pointer-events-auto absolute -left-1.5 -top-1.5 h-3 w-3 cursor-nwse-resize rounded-full bg-violet-300" onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'resize-tl')} />
+                                                <div className="pointer-events-auto absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-full bg-violet-300" onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'resize-br')} />
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             }
                             if (layer.kind === 'lower-third') {
                                 const offset = (1 - easedProgress + (layer.exitProgress || 0)) * 24;
+                                const layout = layer.layout || { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 };
+                                const isSelected = layer.manual && selectedIds.includes(layer.id);
                                 return (
                                     <div
                                         key={`motion_${layer.kind}_${layer.text}`}
-                                        className="absolute left-[6.5%] bottom-[11%] z-[1700] w-[53%] overflow-hidden rounded-xl border border-white/10 shadow-2xl"
+                                        className="absolute z-[1700] cursor-move overflow-hidden rounded-xl border border-white/10 shadow-2xl"
                                         style={{
                                             backgroundColor: `${layerPreset.surface}ee`,
                                             borderLeft: `6px solid ${layerPreset.accent}`,
-                                            opacity: easedProgress * (1 - (layer.exitProgress || 0)),
+                                            left: `${layout.x}%`,
+                                            top: `${layout.y}%`,
+                                            width: `${layout.w}%`,
+                                            height: `${layout.h}%`,
+                                            opacity: easedProgress * (1 - (layer.exitProgress || 0)) * (layout.opacity / 100),
                                             transform: `translateX(${offset}%)`
                                         }}
+                                        onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'move')}
                                     >
-                                        <div className="px-5 py-3">
+                                        <div className="h-full px-5 py-3">
                                             <div className="mb-1 h-1 w-12 rounded-full" style={{ backgroundColor: layerPreset.accentAlt }} />
                                             <div className="text-[10px] font-bold tracking-[0.16em]" style={{ color: layerPreset.accent }}>{layerCreator.toUpperCase()}</div>
                                             <div className="mt-1 text-base font-bold leading-snug" style={{ color: layerPreset.foreground }}>{layer.text}</div>
                                         </div>
+                                        {isSelected && (
+                                            <div className="pointer-events-none absolute inset-0 border-2 border-violet-300 shadow-[0_0_0_2px_rgba(196,181,253,0.35)]">
+                                                <div className="pointer-events-auto absolute -left-1.5 -top-1.5 h-3 w-3 cursor-nwse-resize rounded-full bg-violet-300" onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'resize-tl')} />
+                                                <div className="pointer-events-auto absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-full bg-violet-300" onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'resize-br')} />
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             }
@@ -12202,7 +13927,7 @@ ${JSON.stringify(subtitlePayload)}
                     </div>
                 </div>
 
-                {isLibraryOpen && (
+                {isLibraryOpen && !isShortsEditingWorkspace && (
                     <div
                         className={`group relative w-2 shrink-0 cursor-col-resize border-l border-gray-700/80 bg-gray-800/70 transition hover:bg-blue-500/30 ${isResizingLibrary ? 'bg-blue-500/40' : ''}`}
                         onMouseDown={() => setIsResizingLibrary(true)}
@@ -12215,7 +13940,7 @@ ${JSON.stringify(subtitlePayload)}
                 {!isLibraryOpen && (
                     <button
                         onClick={() => setIsLibraryOpen(true)}
-                        className="shrink-0 self-center bg-gray-700 p-1 rounded-l-md z-10 border border-r-0 border-gray-600 hover:bg-gray-600 shadow-md"
+                        className={`${isShortsEditingWorkspace ? 'order-1' : ''} shrink-0 self-center bg-gray-700 p-1 rounded-l-md z-10 border border-r-0 border-gray-600 hover:bg-gray-600 shadow-md`}
                         title="展開素材庫"
                     >
                         <ChevronLeft size={16} />
@@ -12223,8 +13948,10 @@ ${JSON.stringify(subtitlePayload)}
                 )}
 
                 <div
-                    style={{ width: isLibraryOpen ? `${libraryWidth}px` : '0px' }}
-                    className="bg-gray-800 border-l border-gray-700 transition-[width] duration-300 flex flex-col overflow-hidden relative z-10 shrink-0"
+                    style={{
+                        width: isLibraryOpen ? (isShortsEditingWorkspace ? undefined : `${libraryWidth}px`) : '0px'
+                    }}
+                    className={`${isShortsEditingWorkspace ? 'order-1 flex-1 min-w-[420px] shrink' : 'shrink-0'} bg-gray-800 border-l border-gray-700 transition-[width] duration-300 flex flex-col overflow-hidden relative z-10`}
                 >
                     <button
                         onClick={() => setIsLibraryOpen(!isLibraryOpen)}
@@ -12235,8 +13962,8 @@ ${JSON.stringify(subtitlePayload)}
 
                     <div className="p-4 border-b border-gray-700 flex justify-between items-center w-full min-w-0">
                         <div>
-                            <h2 className="font-semibold text-sm">素材庫</h2>
-                            <div className="mt-1 text-[10px] text-gray-500">素材、轉場與影片設計</div>
+                            <h2 className="font-semibold text-sm">{isShortsEditingWorkspace ? '素材庫／故事板' : '素材庫'}</h2>
+                            <div className="mt-1 text-[10px] text-gray-500">{isShortsEditingWorkspace ? '挑選素材、安排敘事與加入設計' : '素材、轉場與影片設計'}</div>
                         </div>
 
                         <input type="file" ref={fileInputRef} style={{ display: 'none' }} multiple accept="video/*,image/*,audio/*" onChange={handleImportAssets} />
@@ -12253,11 +13980,11 @@ ${JSON.stringify(subtitlePayload)}
                     <div className="px-2 pt-2 w-full min-w-0">
                         <div className="flex flex-wrap gap-1 rounded-xl bg-gray-900/80 p-1 border border-gray-700">
                             {[
+                                ['hyperframes', 'Contents'],
                                 ['transitions', '過場'],
                                 ['assets', '素材'],
                                 ['cards', 'Cards'],
                                 ['intro-outro', 'Intro / Outro'],
-                                ['hyperframes', 'Contents'],
                                 ['ai-design', 'AI 設計']
                             ].map(([key, label]) => (
                                 <button
@@ -12273,7 +14000,45 @@ ${JSON.stringify(subtitlePayload)}
                     </div>
 
                     <div className="flex-1 p-3 space-y-3 overflow-y-auto w-full min-w-0">
-                        {(libraryTab === 'transitions' || libraryTab === 'assets') && (libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems).map((asset, i) => (
+                        {selectedDesignTimelineItem && (
+                            <div className="rounded-2xl border border-violet-300/45 bg-gradient-to-br from-violet-500/15 via-gray-900 to-cyan-500/10 p-3 shadow-lg">
+                                <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0"><div className="flex items-center gap-2 text-xs font-bold text-violet-100"><Sparkles size={14} /> 已選取設計素材</div><div className="mt-1 truncate text-[11px] text-white">{selectedDesignTimelineItem.label}</div></div>
+                                    <span className="shrink-0 rounded bg-violet-300/15 px-1.5 py-0.5 text-[9px] font-mono text-violet-100">{selectedDesignTimelineItem.startAt.toFixed(1)}–{selectedDesignTimelineItem.endAt.toFixed(1)}s</span>
+                                </div>
+                                {selectedManualDesignCard ? (() => {
+                                    const layout = selectedManualDesignCard.layout || (selectedManualDesignCard.assetId
+                                        ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+                                        : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
+                                    const updateLayout = (key, value) => updateManualDesignCard(selectedManualDesignCard.id, card => ({
+                                        layout: { ...layout, [key]: Number(value) }
+                                    }));
+                                    return <div className="mt-3 space-y-2">
+                                        <div className="text-[10px] leading-4 text-violet-100/80">直接在預覽上拖曳素材；右下與左上控制點可縮放。這裡可精確調整內容與參數。</div>
+                                        <label className="block text-[10px] text-gray-400">顯示標題<input value={selectedManualDesignCard.text} onChange={(event) => updateManualDesignCard(selectedManualDesignCard.id, { text: event.target.value.slice(0, 92) })} className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white focus:border-violet-300 focus:outline-none" /></label>
+                                        <label className="block text-[10px] text-gray-400">副標／來源<input value={selectedManualDesignCard.creator || ''} onChange={(event) => updateManualDesignCard(selectedManualDesignCard.id, { creator: event.target.value.slice(0, 44) })} placeholder="例如：OPEN VISCRIBE" className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white placeholder:text-gray-600 focus:border-violet-300 focus:outline-none" /></label>
+                                        {selectedManualDesignCard.assetId && (() => {
+                                            const asset = HYPERFRAME_ASSETS.find(item => item.id === selectedManualDesignCard.assetId);
+                                            return asset ? <HyperframeAssetParameterEditor asset={asset} value={selectedManualDesignCard.assetConfig} onChange={(assetConfig) => updateManualDesignCard(selectedManualDesignCard.id, { assetConfig })} /> : null;
+                                        })()}
+                                        <div className="grid grid-cols-2 gap-2">{[['開始秒數', selectedManualDesignCard.startAt, (value) => updateManualDesignCard(selectedManualDesignCard.id, card => { const startAt = Math.max(0, Number(value) || 0); return { startAt, endAt: startAt + Math.max(0.2, card.endAt - card.startAt) }; })], ['持續秒數', Math.max(0.2, selectedManualDesignCard.endAt - selectedManualDesignCard.startAt), (value) => updateManualDesignCard(selectedManualDesignCard.id, card => ({ endAt: card.startAt + Math.max(0.2, Math.min(60, Number(value) || 0.2)) }))]].map(([label, value, onChange]) => <label key={label} className="rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[9px] text-gray-400">{label}<input type="number" min="0" max="600" step="0.1" value={Number(Number(value).toFixed(1))} onChange={(event) => onChange(event.target.value)} className="mt-1 w-full bg-transparent text-right text-xs text-white outline-none" /></label>)}</div>
+                                        <div className="grid grid-cols-2 gap-2">{[['x', '左側 %', 0, 95], ['y', '頂部 %', 0, 95], ['w', '寬度 %', 8, 100], ['h', '高度 %', 6, 100]].map(([key, label, min, max]) => <label key={key} className="rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[9px] text-gray-400">{label}<input type="number" min={min} max={max} step="0.5" value={Number(layout[key].toFixed(1))} onChange={(event) => updateLayout(key, event.target.value)} className="mt-1 w-full bg-transparent text-right text-xs text-white outline-none" /></label>)}</div>
+                                        <label className="block text-[10px] text-gray-400">不透明度 <span className="float-right text-white">{Math.round(layout.opacity)}%</span><input type="range" min="15" max="100" value={layout.opacity} onChange={(event) => updateLayout('opacity', event.target.value)} className="mt-1 w-full accent-violet-400" /></label>
+                                    </div>;
+                                })() : selectedDesignTimelineItem.kind === 'auto-card' ? (
+                                    <div className="mt-3 space-y-2 text-[11px] text-gray-300"><p>這是依字幕產生的 AI 字卡。若要改文字、位置、大小或透明度，先轉成手動字卡。</p><button type="button" onClick={() => {
+                                        const subtitleId = selectedDesignTimelineItem.id.replace('design-auto-card-', '');
+                                        const source = projectState.subtitles.find(item => item.id === subtitleId);
+                                        const id = `manual_card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+                                        setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), manualCards: [...(prev.motionDesign?.manualCards || []), { id, text: source?.text || '關鍵操作提示', creator: motionDesign.creator, presetId: motionDesign.presetId, startAt: selectedDesignTimelineItem.startAt, endAt: selectedDesignTimelineItem.endAt, layout: { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 } }] } }));
+                                        setSelectedIds([id]);
+                                    }} className="w-full rounded-lg bg-violet-300 px-3 py-2 text-xs font-bold text-gray-950 hover:bg-violet-200">轉為可編輯手動字卡</button></div>
+                                ) : (
+                                    <div className="mt-3 space-y-2 text-[11px] text-gray-300"><p>{selectedDesignTimelineItem.kind === 'intro' || selectedDesignTimelineItem.kind === 'outro' ? '片頭與片尾是全畫面設計；可在這裡直接改內容與持續秒數。' : '選取這個素材後可調整內容。'}</p><label className="block text-[10px] text-gray-400">片頭標題<input value={motionDesign.title} onChange={(event) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), title: event.target.value } }))} className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white focus:border-violet-300 focus:outline-none" /></label><label className="block text-[10px] text-gray-400">創作者／片尾名稱<input value={motionDesign.creator} onChange={(event) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), creator: event.target.value } }))} className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white focus:border-violet-300 focus:outline-none" /></label></div>
+                                )}
+                            </div>
+                        )}
+                        {(libraryTab === 'transitions' || libraryTab === 'assets') && (libraryTab === 'transitions' ? transitionLibraryItems : mediaLibraryItems.slice(0, mediaLibraryVisibleCount)).map((asset, i) => (
                             <div
                                 key={i}
                                 draggable
@@ -12298,6 +14063,15 @@ ${JSON.stringify(subtitlePayload)}
                                     ? <>暫無過場</>
                                     : <>暫無素材<br />點擊上方資料夾圖示匯入</>}
                             </div>
+                        )}
+                        {libraryTab === 'assets' && mediaLibraryItems.length > mediaLibraryVisibleCount && (
+                            <button
+                                type="button"
+                                onClick={() => setMediaLibraryVisibleCount(count => Math.min(mediaLibraryItems.length, count + 80))}
+                                className="mt-2 w-full rounded-lg border border-cyan-300/25 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100 hover:bg-cyan-400/20"
+                            >
+                                顯示更多素材（尚有 {mediaLibraryItems.length - mediaLibraryVisibleCount} 個）
+                            </button>
                         )}
 
                         {libraryTab === 'cards' && (
@@ -12470,15 +14244,15 @@ ${JSON.stringify(subtitlePayload)}
                 className="h-2 bg-gray-800 hover:bg-blue-600 cursor-row-resize transition-all z-50 flex items-center justify-center relative border-y border-gray-700"
                 onMouseDown={() => setIsResizingTimeline(true)}
             >
-                <div className="pointer-events-none absolute right-4 bottom-3 z-50 flex items-center rounded-2xl border border-gray-600/80 bg-gray-900/90 p-1.5 shadow-[0_10px_30px_rgba(0,0,0,0.35)] backdrop-blur">
+                <div className="pointer-events-none absolute right-4 bottom-3 z-50 flex items-center rounded-xl border border-gray-600/80 bg-gray-900/90 p-1 shadow-[0_6px_18px_rgba(0,0,0,0.35)] backdrop-blur">
                     <button
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={handleUndo}
                         disabled={!canUndo}
-                        className={`group pointer-events-auto relative flex h-10 w-10 items-center justify-center rounded-xl border border-transparent transition ${canUndo ? 'bg-transparent text-gray-200 hover:border-sky-400/60 hover:bg-sky-600 hover:text-white' : 'bg-transparent text-gray-500 cursor-not-allowed opacity-50'}`}
+                        className={`group pointer-events-auto relative flex h-5 w-5 items-center justify-center rounded-md border border-transparent transition ${canUndo ? 'bg-transparent text-gray-200 hover:border-sky-400/60 hover:bg-sky-600 hover:text-white' : 'bg-transparent text-gray-500 cursor-not-allowed opacity-50'}`}
                         title="復原 (Ctrl/Cmd+Z)"
                     >
-                        <Undo2 size={18} />
+                        <Undo2 size={9} />
                         <span className="absolute -top-9 right-0 rounded border border-gray-600 bg-gray-800 px-2 py-1 text-[10px] whitespace-nowrap text-white opacity-0 pointer-events-none transition group-hover:opacity-100">
                             復原 (Ctrl/Cmd+Z)
                         </span>
@@ -12487,22 +14261,22 @@ ${JSON.stringify(subtitlePayload)}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={handleRedo}
                         disabled={!canRedo}
-                        className={`group pointer-events-auto relative flex h-10 w-10 items-center justify-center rounded-xl border border-transparent transition ${canRedo ? 'bg-transparent text-gray-200 hover:border-emerald-400/60 hover:bg-emerald-600 hover:text-white' : 'bg-transparent text-gray-500 cursor-not-allowed opacity-50'}`}
+                        className={`group pointer-events-auto relative flex h-5 w-5 items-center justify-center rounded-md border border-transparent transition ${canRedo ? 'bg-transparent text-gray-200 hover:border-emerald-400/60 hover:bg-emerald-600 hover:text-white' : 'bg-transparent text-gray-500 cursor-not-allowed opacity-50'}`}
                         title="重做 (Ctrl+Y / Cmd+Shift+Z)"
                     >
-                        <Redo2 size={18} />
+                        <Redo2 size={9} />
                         <span className="absolute -top-9 right-0 rounded border border-gray-600 bg-gray-800 px-2 py-1 text-[10px] whitespace-nowrap text-white opacity-0 pointer-events-none transition group-hover:opacity-100">
                             重做 (Ctrl+Y / Cmd+Shift+Z)
                         </span>
                     </button>
-                    <div className="mx-1 h-6 w-px bg-gray-700" />
+                    <div className="mx-0.5 h-3 w-px bg-gray-700" />
                     <button
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={splitClipAtPlayhead}
-                        className="group pointer-events-auto relative flex h-10 w-10 items-center justify-center rounded-xl border border-transparent bg-transparent text-gray-200 transition hover:border-blue-400/60 hover:bg-blue-600 hover:text-white"
+                        className="group pointer-events-auto relative flex h-5 w-5 items-center justify-center rounded-md border border-transparent bg-transparent text-gray-200 transition hover:border-blue-400/60 hover:bg-blue-600 hover:text-white"
                         title="裁切片段 (Cmd+B)"
                     >
-                        <Scissors size={18} />
+                        <Scissors size={9} />
                         <span className="absolute -top-9 right-0 rounded border border-gray-600 bg-gray-800 px-2 py-1 text-[10px] whitespace-nowrap text-white opacity-0 pointer-events-none transition group-hover:opacity-100">
                             裁切片段 (Cmd+B)
                         </span>
@@ -12510,10 +14284,10 @@ ${JSON.stringify(subtitlePayload)}
                     <button
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={addSubtitleAtPlayhead}
-                        className="group pointer-events-auto relative flex h-10 w-10 items-center justify-center rounded-xl border border-transparent bg-transparent text-gray-200 transition hover:border-yellow-400/60 hover:bg-yellow-500 hover:text-gray-950"
+                        className="group pointer-events-auto relative flex h-5 w-5 items-center justify-center rounded-md border border-transparent bg-transparent text-gray-200 transition hover:border-yellow-400/60 hover:bg-yellow-500 hover:text-gray-950"
                         title="新增字幕到 S1 用戶字幕軌 (游標位置)"
                     >
-                        <Type size={18} />
+                        <Type size={9} />
                         <span className="absolute -top-9 right-0 rounded border border-gray-600 bg-gray-800 px-2 py-1 text-[10px] whitespace-nowrap text-white opacity-0 pointer-events-none transition group-hover:opacity-100">
                             新增字幕到 S1 (游標位置)
                         </span>
@@ -12604,6 +14378,28 @@ ${JSON.stringify(subtitlePayload)}
                                 </div>
                             </div>
                         ))}
+
+                        <div className={`h-14 shrink-0 border-b border-gray-700 px-3 text-xs transition ${trackState.designHidden ? 'text-gray-500' : 'bg-violet-950/20 text-violet-100 hover:bg-violet-950/35'}`}>
+                            <div className="flex h-full items-center justify-between gap-2">
+                                <div className="flex min-w-0 items-center gap-2">
+                                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-violet-400/35 bg-violet-400/10">
+                                        <Sparkles size={14} className="text-violet-200" />
+                                    </span>
+                                    <span className="min-w-0">
+                                        <span className="block truncate font-semibold text-[12px]">設計素材</span>
+                                        <span className="block text-[9px] uppercase tracking-[0.14em] text-violet-200/65">GFX · Cards · Contents</span>
+                                    </span>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => setTrackState(prev => ({ ...prev, designHidden: !prev.designHidden }))}
+                                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition ${trackState.designHidden ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/10'}`}
+                                    title={trackState.designHidden ? '顯示設計素材軌' : '隱藏設計素材軌與輸出中的設計素材'}
+                                >
+                                    {trackState.designHidden ? <EyeOff size={14} /> : <Eye size={14} />}
+                                </button>
+                            </div>
+                        </div>
 
                         {[2, 1, 0].map(i => (
                             <div key={i} className="h-16 shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition">
@@ -12805,6 +14601,41 @@ ${JSON.stringify(subtitlePayload)}
                                     })}
                                 </div>
                             ))}
+
+                            <div className={`h-14 shrink-0 border-b border-gray-800 relative ${trackState.designHidden ? 'opacity-30' : 'bg-violet-950/15'}`}>
+                                {designTimelineItems.length === 0 ? (
+                                    <div className="absolute inset-0 flex items-center px-3 text-[11px] text-violet-200/50">
+                                        加入 Cards、Intro / Outro 或 Contents 後，設計素材會顯示在這條 GFX 軌道。
+                                    </div>
+                                ) : designTimelineItems.map(item => {
+                                    const isSelected = selectedIds.includes(item.id);
+                                    const classByKind = item.kind === 'content'
+                                        ? 'border-cyan-300/70 bg-cyan-500/35 text-cyan-50'
+                                        : item.kind === 'intro' || item.kind === 'outro'
+                                            ? 'border-amber-300/70 bg-amber-400/30 text-amber-50'
+                                            : item.kind === 'auto-card'
+                                                ? 'border-fuchsia-300/70 bg-fuchsia-500/30 text-fuchsia-50'
+                                                : 'border-violet-300/70 bg-violet-500/30 text-violet-50';
+                                    return (
+                                        <button
+                                            key={item.id}
+                                            type="button"
+                                            data-id={item.id}
+                                            onMouseDown={(event) => handleItemMouseDown(event, item, 'design')}
+                                            onClick={() => {
+                                                setCurrentTime(item.startAt);
+                                                setSelectedIds([item.id]);
+                                            }}
+                                            className={`timeline-item absolute top-1 bottom-1 flex items-center overflow-hidden rounded border px-2 text-left text-[10px] font-semibold shadow-sm transition hover:brightness-125 ${item.kind === 'content' || item.kind === 'card' ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} ${isSelected ? 'ring-2 ring-white/80 ring-offset-1 ring-offset-gray-900 z-20' : 'z-10'} ${classByKind}`}
+                                            style={{ left: `${item.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${Math.max(14, (item.endAt - item.startAt) * pixelsPerSecond)}px` }}
+                                            title={`${item.label}｜${item.startAt.toFixed(1)}s–${item.endAt.toFixed(1)}s${item.kind === 'content' || item.kind === 'card' ? '（可拖曳調整時間）' : ''}`}
+                                        >
+                                            <Sparkles size={11} className="mr-1 shrink-0 opacity-85" />
+                                            <span className="truncate">{item.label}</span>
+                                        </button>
+                                    );
+                                })}
+                            </div>
 
                             {[2, 1, 0].map(trackIndex => {
                                 const track = projectState.tracks[trackIndex];
@@ -13044,6 +14875,137 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 </div>
+            )}
+
+            {!showAiEditor && (
+                <button
+                    type="button"
+                    onClick={() => setShowAiEditor(true)}
+                    className="fixed bottom-5 right-5 z-[4200] flex items-center gap-2 rounded-full border border-fuchsia-200/70 bg-gradient-to-r from-fuchsia-700 via-violet-700 to-indigo-700 px-4 py-3 text-sm font-bold text-white shadow-[0_14px_42px_rgba(126,34,206,0.46)] ring-1 ring-fuchsia-300/20 transition hover:-translate-y-0.5 hover:from-fuchsia-600 hover:via-violet-600"
+                    title="開啟 AI 剪輯總監"
+                >
+                    <MessageCircle size={18} className="text-fuchsia-300" /> AI 剪輯
+                </button>
+            )}
+
+            {showAiEditor && (
+                <section className="fixed bottom-5 right-5 z-[4200] flex h-[min(620px,calc(100vh-2.5rem))] w-[440px] max-w-[calc(100vw-2.5rem)] flex-col overflow-hidden rounded-2xl border border-fuchsia-300/55 bg-gradient-to-b from-[#2a1645] via-[#1a1732] to-[#101522] shadow-[0_24px_80px_rgba(76,29,149,0.52)] ring-1 ring-fuchsia-200/20">
+                        <div className="flex items-start justify-between border-b border-fuchsia-200/15 bg-fuchsia-400/5 px-4 py-3">
+                            <div>
+                                <div className="flex items-center gap-2 text-base font-bold text-white"><Sparkles size={18} className="text-fuchsia-300" /> AI 剪輯總監</div>
+                                <p className="mt-1 text-[11px] leading-4 text-slate-400">對話規劃，確認後才套用到時間軸。</p>
+                            </div>
+                            <button type="button" onClick={() => setShowAiEditor(false)} className="rounded-lg px-2 py-1 text-xs text-slate-400 transition hover:bg-white/10 hover:text-white">縮小</button>
+                        </div>
+
+                        <div className="border-b border-fuchsia-200/15 bg-[#160f29]/45 px-4 py-2">
+                            <div className="mb-2 inline-flex items-center gap-0.5 rounded-lg border border-white/10 bg-slate-950/70 p-0.5">
+                                <button type="button" onClick={() => setAiEditorSource('provider')} className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${aiEditorSource === 'provider' ? 'bg-fuchsia-500 text-white' : 'text-slate-400 hover:text-white'}`}>API 方式</button>
+                                <button type="button" onClick={() => setAiEditorSource('mcp')} className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition ${aiEditorSource === 'mcp' ? 'bg-cyan-400 text-slate-950' : 'text-slate-400 hover:text-white'}`}>MCP Agent</button>
+                            </div>
+                            {aiEditorSource === 'provider' && (
+                                <div className={`rounded-lg border px-2.5 py-2 text-[10px] leading-4 ${aiEditorProviderStatus.phase === 'fallback' || aiEditorProviderStatus.phase === 'cancelled' ? 'border-amber-300/30 bg-amber-300/10 text-amber-100' : aiEditorProviderStatus.phase === 'success' ? 'border-emerald-300/30 bg-emerald-300/10 text-emerald-100' : 'border-fuchsia-300/25 bg-slate-950/45 text-slate-200'}`}>
+                                    <div className="flex items-center justify-between gap-2 font-semibold">
+                                        <span>本次 API：{articleProviderLabel}／{articleModelLabel}</span>
+                                        <div className="flex shrink-0 items-center gap-1.5">
+                                            {articleProvider === 'ollama' && <span className="rounded bg-fuchsia-300/10 px-1.5 py-0.5 text-[9px] text-fuchsia-100">thinking 關閉</span>}
+                                            {articleProvider === 'ollama' && <span className="rounded bg-emerald-300/10 px-1.5 py-0.5 text-[9px] text-emerald-100">即時進度</span>}
+                                            {aiEditorProviderStatus.phase === 'running' && <span className="rounded bg-cyan-300/10 px-1.5 py-0.5 text-[9px] text-cyan-100">已等待 {aiEditorElapsedSeconds}s</span>}
+                                            {aiEditorProviderStatus.phase === 'running' && <button type="button" onClick={cancelAiEditorPlan} className="rounded border border-rose-200/35 px-1.5 py-0.5 text-[9px] text-rose-100 transition hover:bg-rose-400/15">取消</button>}
+                                        </div>
+                                    </div>
+                                    <p className="mt-1 opacity-85">{aiEditorProviderStatus.detail || (articleProvider === 'ollama' ? `將呼叫 ${ollamaEndpoint || '未設定 Endpoint'}。` : '送出後會在這裡顯示實際呼叫與 fallback 狀態。')}</p>
+                                </div>
+                            )}
+                            {aiEditorSource === 'mcp' && <>
+                                <div className="mb-2 flex gap-2">
+                                    <select value={aiEditorMcpMode} onChange={(event) => setAiEditorMcpMode(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-cyan-300/20 bg-slate-950/70 px-2 py-1.5 text-[11px] font-semibold text-cyan-100 outline-none">
+                                        <option value="edit">剪輯方案</option>
+                                        <option value="browser-tutorial">Browser 教學</option>
+                                    </select>
+                                    <select value={aiEditorAgent} onChange={(event) => setAiEditorAgent(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-cyan-300/20 bg-slate-950/70 px-2 py-1.5 text-[11px] font-semibold text-cyan-100 outline-none">
+                                        {['Codex', 'Claude', 'Hermes', 'OpenClaw'].map(agent => <option key={agent} value={agent}>{agent}</option>)}
+                                    </select>
+                                </div>
+                                {aiEditorMcpMode === 'browser-tutorial' ? <>
+                                    <input value={browserTutorialStartUrl} onChange={(event) => setBrowserTutorialStartUrl(event.target.value)} placeholder="起始網址，例如：https://www.youtube.com" className="w-full rounded-lg border border-cyan-300/25 bg-slate-950/70 px-3 py-1.5 text-xs text-white outline-none placeholder:text-slate-500 focus:border-cyan-300" />
+                                    <p className="mt-1.5 text-[10px] leading-4 text-cyan-100/80">只操作此網域；登入、CAPTCHA、付款、刪除與外部送出會交由你接手。</p>
+                                    {aiEditorAgent === 'Claude' && <p className="mt-1.5 rounded-md bg-amber-300/10 px-2 py-1.5 text-[10px] leading-4 text-amber-100">Claude Cowork 無法存取本機 MCP。請使用公開 Remote MCP，或改用具本機 MCP 的 Claude Desktop 工作階段。</p>}
+                                </> : <>
+                                    <p className="text-[10px] leading-4 text-cyan-100/80">不使用 API，使用本機 Agent 進行。Agent 必須主動透過 OpenViscribe MCP 領取任務；不會直接推送到目前的聊天視窗。</p>
+                                    {agentEditRequestStatus && (() => {
+                                        const status = describeAgentEditRequestStatus(agentEditRequestStatus, settings.language);
+                                        const toneClasses = {
+                                            amber: 'border-amber-300/25 bg-amber-300/10 text-amber-50',
+                                            cyan: 'border-cyan-300/25 bg-cyan-300/10 text-cyan-50',
+                                            emerald: 'border-emerald-300/25 bg-emerald-300/10 text-emerald-50',
+                                            rose: 'border-rose-300/25 bg-rose-300/10 text-rose-50',
+                                            slate: 'border-slate-300/20 bg-slate-300/10 text-slate-100'
+                                        };
+                                        return <div className={`mt-2 rounded-lg border px-2.5 py-2 ${toneClasses[status.tone] || toneClasses.slate}`}>
+                                            <div className="flex items-center justify-between gap-2"><span className="text-[11px] font-bold">{status.label}</span><button type="button" onClick={() => void refreshAgentEditRequestStatus().catch(() => {})} className="rounded border border-current/20 px-1.5 py-0.5 text-[9px] font-semibold opacity-85 hover:bg-white/10">更新狀態</button></div>
+                                            <p className="mt-1 text-[10px] leading-4 opacity-85">{status.detail}</p>
+                                            <p className="mt-1 text-[9px] opacity-60">任務 {String(agentEditRequestStatus.id || '').slice(-8)} · {agentEditRequestStatus.updatedAt ? new Date(agentEditRequestStatus.updatedAt).toLocaleTimeString() : '剛剛'}</p>
+                                        </div>;
+                                    })()}
+                                </>}
+                            </>}
+                        </div>
+
+                        <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
+                            {aiEditorMessages.map((message, index) => (
+                                <div key={`${message.role}_${index}`} className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm leading-6 ${message.role === 'user' ? 'ml-auto bg-fuchsia-600 text-white' : 'border border-white/10 bg-slate-800/80 text-slate-100'}`}>
+                                    {message.text}
+                                </div>
+                            ))}
+                            {aiEditorBusy && <div className="inline-flex items-center gap-2 rounded-2xl border border-fuchsia-300/20 bg-fuchsia-400/10 px-4 py-3 text-sm text-fuchsia-100"><span className="h-3 w-3 animate-spin rounded-full border-2 border-fuchsia-200 border-t-transparent" /> 剪輯總監正在規劃…</div>}
+                        </div>
+
+                        {aiEditorPlan && (
+                            <div className="mx-4 mb-3 rounded-2xl border border-emerald-300/25 bg-emerald-400/10 p-3">
+                                <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                        <div className="text-sm font-bold text-emerald-100">待套用剪輯方案</div>
+                                        <div className="mt-1 text-xs text-emerald-100/75">素材庫 {projectState.assets.length} 個 · 方案使用 {(aiEditorPlan.sequence || []).length} 段 · 完整字幕／旁白 {(aiEditorPlan.subtitles || []).length} 段 · {(aiEditorPlan.cards || []).length} 張字卡 · {(aiEditorPlan.contentAssetIds || []).length} 個 Contents{(aiEditorPlan.sequence || []).length === 0 && projectState.assets.length > 0 ? ' · 未列素材時會自動建立粗剪' : ''}</div>
+                                    </div>
+                                    <button type="button" onClick={applyAiEditorPlan} className="shrink-0 rounded-xl bg-emerald-400 px-4 py-2 text-sm font-bold text-emerald-950 transition hover:bg-emerald-300">套用到時間軸</button>
+                                </div>
+                                {(aiEditorPlan.subtitles || []).length > 0 && <div className="mt-3 max-h-32 space-y-1.5 overflow-y-auto rounded-xl border border-emerald-200/15 bg-slate-950/35 p-2.5 text-[11px] leading-4 text-emerald-50">
+                                    {(aiEditorPlan.subtitles || []).map((cue, index) => <div key={`${cue.startAt}_${index}`} className="grid grid-cols-[58px_minmax(0,1fr)] gap-2"><span className="font-mono text-emerald-200/70">{Number(cue.startAt || 0).toFixed(1)}–{Number(cue.endAt || 0).toFixed(1)}s</span><span>{cue.text}</span></div>)}
+                                </div>}
+                                <p className="mt-2 text-[11px] leading-5 text-emerald-100/75">會建立／更新 V2 的 AI 粗剪，不會覆蓋 V1 原始片段；完整字幕會放入 S2，並{aiEditorPlan.localTts ? '自動使用 macOS 本機 TTS 建立旁白。' : '保留為可手動朗讀或稍後生成的腳本。'}</p>
+                            </div>
+                        )}
+
+                        <div className="border-t border-fuchsia-200/15 bg-[#120d24]/70 px-4 py-3">
+                            <div className="flex gap-2">
+                                <textarea
+                                    value={aiEditorPrompt}
+                                    onChange={(event) => setAiEditorPrompt(event.target.value)}
+                                    onKeyDown={(event) => {
+                                        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') submitAiEditorPlan();
+                                    }}
+                                    placeholder={aiEditorSource === 'mcp' && aiEditorMcpMode === 'browser-tutorial' ? '逐行寫下操作腳本，例如：\n1. 開啟搜尋欄並輸入 OpenViscribe\n2. 開啟頻道頁\n3. 點選訂閱並確認已訂閱' : '例如：幫我做成 45 秒直式產品短片，節奏快，突出部署成果，加上世界地圖與 console。'}
+                                    className="min-h-[76px] flex-1 resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2.5 text-sm leading-5 text-white outline-none placeholder:text-slate-500 focus:border-fuchsia-300/60"
+                                />
+                                <div className="flex shrink-0 flex-col justify-end gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={toggleAiEditorVoiceInput}
+                                        className={`rounded-xl p-3 transition ${aiEditorListening ? 'bg-rose-500 text-white shadow-[0_0_0_3px_rgba(251,113,133,0.22)]' : 'border border-fuchsia-300/35 bg-fuchsia-400/10 text-fuchsia-100 hover:bg-fuchsia-400/20'}`}
+                                        title={aiEditorListening ? '停止語音輸入' : '開始語音輸入'}
+                                        aria-label={aiEditorListening ? '停止語音輸入' : '開始語音輸入'}
+                                    >
+                                        <Mic size={18} className={aiEditorListening ? 'animate-pulse' : ''} />
+                                    </button>
+                                    <button type="button" onClick={submitAiEditorPlan} disabled={!aiEditorPrompt.trim() || aiEditorBusy || (aiEditorSource === 'mcp' && aiEditorMcpMode === 'browser-tutorial' && !browserTutorialStartUrl.trim())} className="rounded-xl bg-fuchsia-500 p-3 text-white transition hover:bg-fuchsia-400 disabled:cursor-not-allowed disabled:opacity-40" title={aiEditorSource === 'mcp' && aiEditorMcpMode === 'browser-tutorial' ? '建立 Browser 教學任務' : '送出剪輯指令'}><Send size={18} /></button>
+                                </div>
+                            </div>
+                            {aiEditorVoiceStatus && <p className={`mt-2 text-[11px] ${aiEditorListening ? 'text-rose-200' : 'text-slate-400'}`}>{aiEditorVoiceStatus}</p>}
+                            {browserTutorialStatus && aiEditorSource === 'mcp' && aiEditorMcpMode === 'browser-tutorial' && <p className="mt-2 text-[11px] text-cyan-200">{browserTutorialStatus}</p>}
+                            <p className="mt-2 text-[11px] text-slate-500">⌘ / Ctrl + Enter 送出。{aiEditorSource === 'mcp' ? `${aiEditorAgent} 模式不會呼叫 Azure，會建立 MCP 剪輯任務。` : '會使用目前設定的 Azure、Gemini、LM Studio 或 Ollama；未設定時仍可產生本機保守方案。'}</p>
+                        </div>
+                    </section>
             )}
 
             {showHelp && (
