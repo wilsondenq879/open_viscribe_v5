@@ -149,6 +149,7 @@ export default function ArticleScreenshotReview({ steps, onConfirm, onCancel }) 
     const baseHighlightRectPct   = currentCandidate?.highlightRectPct ?? null;
     const activeHighlightRectPct = adjustedRects[stepIdx] ?? baseHighlightRectPct;
     const hasAdjustment          = adjustedRects[stepIdx] !== null;
+    const usesManualHighlightFallback = currentCandidate?.highlightSource === 'manual-fallback';
 
     // ── Navigation ──────────────────────────────────────────────────────────
     const prevStep = () => setStepIdx(i => Math.max(0, i - 1));
@@ -202,7 +203,51 @@ export default function ArticleScreenshotReview({ steps, onConfirm, onCancel }) 
         onConfirm(result);
     };
 
-    if (!currentStep) return null;
+    if (!currentStep) {
+        return (
+            <>
+                <div className="fixed inset-0 z-[9998] bg-black/50" />
+                <div className="fixed inset-y-0 right-0 z-[9999] flex w-[560px] max-w-[calc(100vw-24px)] flex-col border-l border-gray-800 bg-gray-950 shadow-2xl">
+                    <div className="flex items-center justify-between gap-3 border-b border-gray-800 px-5 py-4">
+                        <div>
+                            <p className="text-sm font-semibold text-white">截圖選擇</p>
+                            <p className="mt-0.5 text-xs text-gray-500">目前沒有可審核的教學步驟</p>
+                        </div>
+                        <button
+                            onClick={onCancel}
+                            className="rounded-lg p-2 text-gray-400 transition hover:bg-gray-800 hover:text-white"
+                            aria-label="關閉"
+                        >
+                            <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M2 2l12 12M14 2L2 14" />
+                            </svg>
+                        </button>
+                    </div>
+                    <div className="flex flex-1 flex-col items-center justify-center px-8 text-center">
+                        <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-amber-400/25 bg-amber-400/10 text-2xl text-amber-200">!</div>
+                        <h2 className="mt-5 text-lg font-semibold text-white">沒有偵測到可用步驟</h2>
+                        <p className="mt-2 max-w-sm text-sm leading-6 text-gray-400">
+                            你仍可略過截圖審核並完成文章；文章會保留目前可取得的內容，不會讓流程停在等待狀態。
+                        </p>
+                    </div>
+                    <div className="flex items-center justify-end gap-2 border-t border-gray-800 px-5 py-4">
+                        <button
+                            onClick={onCancel}
+                            className="rounded-lg bg-gray-800 px-4 py-2 text-sm text-gray-300 transition hover:bg-gray-700"
+                        >
+                            取消
+                        </button>
+                        <button
+                            onClick={() => onConfirm([])}
+                            className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white transition hover:bg-blue-500"
+                        >
+                            略過審核並生成文章
+                        </button>
+                    </div>
+                </div>
+            </>
+        );
+    }
 
     return (
         <>
@@ -290,11 +335,11 @@ export default function ArticleScreenshotReview({ steps, onConfirm, onCancel }) 
                             <span className="text-amber-500 text-xs">無候選截圖</span>
                         )}
                         {activeHighlightRectPct && (
-                            <span className="text-red-400 text-[10px] font-medium ml-auto flex items-center gap-1 shrink-0">
+                            <span className={`${usesManualHighlightFallback ? 'text-amber-300' : 'text-red-400'} text-[10px] font-medium ml-auto flex items-center gap-1 shrink-0`}>
                                 <svg className="w-3 h-3" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2">
                                     <rect x="2" y="2" width="12" height="12" rx="1.5" />
                                 </svg>
-                                拖曳紅框微調位置
+                                {usesManualHighlightFallback ? '未取得點擊座標，請拖曳紅框定位' : '拖曳紅框微調位置'}
                             </span>
                         )}
                     </div>
@@ -374,7 +419,9 @@ export default function ArticleScreenshotReview({ steps, onConfirm, onCancel }) 
                                     <span className="text-gray-500 text-xs flex-1">
                                         {hasAdjustment
                                             ? '✎ 已手動調整紅框'
-                                            : '● AI 自動定位紅框 — 可拖曳或拉角微調'}
+                                            : usesManualHighlightFallback
+                                                ? '● 已放入預設紅框 — 請拖曳到實際點擊位置'
+                                                : '● AI 自動定位紅框 — 可拖曳或拉角微調'}
                                     </span>
                                     {hasAdjustment && (
                                         <button
@@ -459,7 +506,7 @@ export default function ArticleScreenshotReview({ steps, onConfirm, onCancel }) 
                         onClick={handleConfirm}
                         className="px-5 py-2 rounded-lg bg-blue-600 text-white text-sm font-semibold hover:bg-blue-500 transition whitespace-nowrap"
                     >
-                        確認並生成文章
+                        {currentCandidates.length === 0 ? '略過此截圖並生成文章' : '確認並生成文章'}
                     </button>
                 </div>
             </div>

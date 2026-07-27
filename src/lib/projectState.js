@@ -51,6 +51,7 @@ export function createEmptyProjectState() {
         debugEventLog: [],
         recordingSessionId: '',
         recordingRange: { startEpochMs: null, endEpochMs: null },
+        recordingSessions: {},
         aiSubtitleTimelineSnapshot: '',
         aiSubtitleGeneratedAt: null,
         compositeSubtitleAnalysis: []
@@ -282,7 +283,10 @@ export function normalizeProjectState(state) {
         assets: Array.isArray(safe.assets) ? safe.assets : [],
         motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(safe.motionDesign || {}) },
         clickEventLog: Array.isArray(safe.clickEventLog) ? safe.clickEventLog : [],
-        debugEventLog: Array.isArray(safe.debugEventLog) ? safe.debugEventLog : []
+        debugEventLog: Array.isArray(safe.debugEventLog) ? safe.debugEventLog : [],
+        recordingSessions: safe.recordingSessions && typeof safe.recordingSessions === 'object'
+            ? safe.recordingSessions
+            : {}
     };
 }
 

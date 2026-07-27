@@ -446,12 +446,23 @@ async function computeHighlightRectPctForFrame(clickEvent, frame, viewportOffset
 
 // Wrap a raw frame + optional pre-rendered highlight frame into a candidate object
 // expected by ArticleScreenshotReview and the post-review highlight application step.
-function makeCandidateWrapper(rawFrame, previewFrame, highlightRectPct) {
+const DEFAULT_MANUAL_HIGHLIGHT_RECT_PCT = Object.freeze({
+    xPct: 0.38,
+    yPct: 0.38,
+    wPct: 0.24,
+    hPct: 0.14
+});
+
+function makeCandidateWrapper(rawFrame, previewFrame, highlightRectPct, options = {}) {
     const f = rawFrame || previewFrame;
+    const resolvedHighlightRectPct = highlightRectPct || (options.forceHighlight
+        ? { ...DEFAULT_MANUAL_HIGHLIGHT_RECT_PCT }
+        : null);
     return {
         rawFrame: rawFrame || previewFrame,
         previewFrame: previewFrame || rawFrame,
-        highlightRectPct: highlightRectPct || null,
+        highlightRectPct: resolvedHighlightRectPct,
+        highlightSource: highlightRectPct ? 'click' : (resolvedHighlightRectPct ? 'manual-fallback' : 'none'),
         frameId: f?.frameId,
         relativeTime: f?.relativeTime,
         isLikelyLoading: f?.isLikelyLoading,
@@ -3409,7 +3420,13 @@ export default function App() {
         const includeWebcam = !!options.includeWebcam;
         const requireRealCapture = !!options.requireRealCapture;
         const needsPageDebugRecording = activeSkillId === 'ui-debug' || activeSkillId === 'ux-research';
-        const needsClickSession = settings.clickRippleEnabled; // track clicks for any skill when ripple is enabled
+        const shouldCaptureTutorialClicks = (
+            activeSkillId === 'tutorial' || activeSkillId === 'composite-tutorial'
+        ) && projectStateRef.current.articleIncludeClickHighlight !== false;
+        // Article click boxes depend on metadata, not on whether the visible global
+        // ripple toggle happens to be enabled. Capture tutorial clicks temporarily
+        // whenever the article option requests them, then restore the user's toggle.
+        const needsClickSession = settings.clickRippleEnabled || shouldCaptureTutorialClicks;
         try {
             const newSessionId = `rec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
             recordingSessionIdRef.current = newSessionId;
@@ -3592,6 +3609,8 @@ export default function App() {
                     duration: finalDuration, originalDuration: finalDuration,
                     trimStart: 0, trimEnd: finalDuration, playbackRate: 1.0,
                     recordingSessionId: newSessionId,
+                    recordingStartEpochMs: recordStartTimeRef.current,
+                    recordingEndEpochMs: recordEndTimeRef.current,
                     hasEmbeddedAudio: includeAudio,
                     hasWebcamOverlay: false,
                     linkedAudioId,
@@ -3610,6 +3629,8 @@ export default function App() {
                     originalDuration: finalDuration,
                     playbackRate: 1.0,
                     recordingSessionId: newSessionId,
+                    recordingStartEpochMs: recordStartTimeRef.current,
+                    recordingEndEpochMs: recordEndTimeRef.current,
                     trimStart: 0,
                     trimEnd: finalDuration,
                     name: `${newClip.name} 音訊`,
@@ -3661,7 +3682,11 @@ export default function App() {
                         clickEventLog,
                         debugEventLog,
                         recordingSessionId: newSessionId,
-                        recordingRange: resetRange
+                        recordingRange: resetRange,
+                        recordingSessions: {
+                            ...(prev.recordingSessions || {}),
+                            [newSessionId]: resetRange
+                        }
                     };
                 });
                 setSelectedIds([]);
@@ -3678,6 +3703,9 @@ export default function App() {
                 if (stream.mockAnimationId) cancelAnimationFrame(stream.mockAnimationId);
                 recordingSessionIdRef.current = '';
                 if (needsClickSession) await setGlobalClickSession('');
+                if (shouldCaptureTutorialClicks && !settings.clickRippleEnabled) {
+                    await syncRippleSetting(false);
+                }
                 if (needsPageDebugRecording) await syncPageDebugSetting(false);
             };
 
@@ -3687,6 +3715,9 @@ export default function App() {
         } catch (err) {
             recordingSessionIdRef.current = '';
             if (needsClickSession) await setGlobalClickSession('');
+            if (shouldCaptureTutorialClicks && !settings.clickRippleEnabled) {
+                await syncRippleSetting(false);
+            }
             if (needsPageDebugRecording) await syncPageDebugSetting(false);
             alert("啟動錄影失敗，請檢查瀏覽器權限。");
             return false;
@@ -8787,7 +8818,7 @@ ${orderedFramesText}
             return alert(aiSubtitleTimelineWarning);
         }
 
-        const articleProgress = (currentStep, totalSteps, stageLabel, detail) => {
+        const articleProgress = (currentStep, totalSteps, stageLabel, detail, patch = {}) => {
             const progressPercent = totalSteps > 0 ? Math.round((currentStep / totalSteps) * 100) : 0;
             setAiProgress(createProgressText(currentStep, totalSteps, stageLabel, progressPercent));
             updateArticleStatus({
@@ -8798,7 +8829,9 @@ ${orderedFramesText}
                 currentStep,
                 totalSteps,
                 progressPercent,
-                stageLabel
+                stageLabel,
+                awaitingUser: false,
+                ...patch
             });
         };
 
@@ -8853,54 +8886,95 @@ ${orderedFramesText}
             Array.isArray(projectStateRef.current?.clickEventLog) ? projectStateRef.current.clickEventLog.length : 'none');
         // ──────────────────────────────────────────────────────────────────────
         const articleClickEvents = await loadGlobalClickLog();
+        const normalizeArticleClickEvent = (event) => {
+            if (!event || typeof event !== 'object') return null;
+            const rawEpochMs = event.epochMs ?? event.timestamp ?? event.timeStamp;
+            let epochMs = Number(rawEpochMs);
+            if (!Number.isFinite(epochMs)) {
+                const idEpochMatch = String(event.id || event.clickId || event.eventId || '').match(/(?:clk|click)_(\d{10,})/i);
+                epochMs = idEpochMatch ? Number(idEpochMatch[1]) : NaN;
+            }
+            const id = String(event.id || event.clickId || event.eventId || (Number.isFinite(epochMs) ? `clk_${epochMs}` : '')).trim();
+            if (!id) return null;
+            return {
+                ...event,
+                id,
+                epochMs,
+                sessionId: String(event.sessionId || event.recordingSessionId || '').trim()
+            };
+        };
+        const normalizedArticleClickEvents = (Array.isArray(articleClickEvents) ? articleClickEvents : [])
+            .map(normalizeArticleClickEvent)
+            .filter(Boolean);
         const articleClickEventById = new Map(
-            (Array.isArray(articleClickEvents) ? articleClickEvents : [])
+            normalizedArticleClickEvents
                 .flatMap(event => {
-                    const id = String(event?.id || '').trim();
+                    const id = String(event.id || '').trim();
                     const fallbackKey = event?.epochMs ? `clk_${event.epochMs}` : '';
+                    const legacyClickKey = event?.epochMs ? `click_${event.epochMs}` : '';
                     const entries = [];
                     if (id) entries.push([id, event]);
                     if (fallbackKey && fallbackKey !== id) entries.push([fallbackKey, event]);
+                    if (legacyClickKey && legacyClickKey !== id) entries.push([legacyClickKey, event]);
+                    if (event.clickId && String(event.clickId).trim() !== id) entries.push([String(event.clickId).trim(), event]);
+                    if (event.eventId && String(event.eventId).trim() !== id) entries.push([String(event.eventId).trim(), event]);
                     return entries;
                 })
                 .filter(([id]) => id)
         );
-        // Time-based fallback: find nearest click event when subtitle.clickId is empty.
-        // Convert click epochMs → timeline seconds using the same rangeStart + timeline offset
-        // logic used during subtitle generation.
+        // Time-based fallback for subtitles without clickId. Use the same clip-aware
+        // mapping as subtitle generation so trimming, splitting, moving clips and
+        // appended recording sessions do not detach a real click from its step.
         const _articleRangeStart = Number(projectState.recordingRange?.startEpochMs || recordStartTimeRef.current || 0);
         const _articleSessionId = projectState.recordingSessionId || '';
         const _articleAllClips = projectState.tracks.flat().filter(c => c?.type === 'video');
-        const _articleSessionClips = _articleSessionId
-            ? _articleAllClips.filter(c => String(c?.recordingSessionId || '') === _articleSessionId)
-            : [];
-        const _articleTimelineOffset = _articleSessionClips.length > 0
-            ? Math.min(..._articleSessionClips.map(c => Number(c?.startAt || 0)).filter(Number.isFinite))
-            : 0;
-        console.log('[HighlightDebug] rangeStart=', _articleRangeStart, 'sessionId=', _articleSessionId, 'totalClickEvents=', articleClickEvents.length, 'clickMapSize=', articleClickEventById.size, 'timelineOffset=', _articleTimelineOffset);
-        const _buildSortedClicks = (events, sessionIdFilter) => {
-            if (_articleRangeStart <= 0) return [];
-            return events
-                .filter(ev => typeof ev?.epochMs === 'number' && String(ev?.id || '').trim()
-                    && (!sessionIdFilter || (ev?.sessionId || '') === sessionIdFilter))
-                .map(ev => ({
-                    id: String(ev.id).trim(),
-                    timeS: (ev.epochMs - _articleRangeStart) / 1000 + _articleTimelineOffset
-                }))
-                .filter(ev => ev.timeS >= -1)
-                .sort((a, b) => a.timeS - b.timeS);
+        const _articleRecordingSessions = projectState.recordingSessions && typeof projectState.recordingSessions === 'object'
+            ? projectState.recordingSessions
+            : {};
+        const _sessionIdsWithEvents = [...new Set(normalizedArticleClickEvents.map(ev => ev.sessionId).filter(Boolean))];
+        const _resolveSessionRangeStart = (sessionId, sessionClips) => {
+            const savedSessionStart = Number(_articleRecordingSessions?.[sessionId]?.startEpochMs || 0);
+            if (savedSessionStart > 0) return savedSessionStart;
+            const clipStart = sessionClips
+                .map(clip => Number(clip?.recordingStartEpochMs || 0))
+                .find(value => value > 0);
+            if (clipStart > 0) return clipStart;
+            if (!sessionId || sessionId === _articleSessionId) return _articleRangeStart;
+            return 0;
         };
-        // Try strict session-ID match first; if no results, fall back to time-range-only match.
-        let _sortedArticleClicksByTime = _buildSortedClicks(
-            Array.isArray(articleClickEvents) ? articleClickEvents : [],
-            _articleSessionId
-        );
-        if (_sortedArticleClicksByTime.length === 0 && _articleSessionId) {
-            _sortedArticleClicksByTime = _buildSortedClicks(
-                Array.isArray(articleClickEvents) ? articleClickEvents : [],
-                '' // no session filter — rely on time range only
-            );
+        const _buildSessionMappedClicks = (sessionId) => {
+            const sessionClips = sessionId
+                ? _articleAllClips.filter(clip => String(clip?.recordingSessionId || '') === sessionId)
+                : _articleAllClips;
+            const rangeStart = _resolveSessionRangeStart(sessionId, sessionClips);
+            if (rangeStart <= 0) return [];
+            const timelineOffset = sessionClips.length > 0
+                ? Math.min(...sessionClips.map(clip => Number(clip?.startAt || 0)).filter(Number.isFinite))
+                : 0;
+            const clipEpochRanges = buildClipEpochRanges(sessionClips, rangeStart, sessionId);
+            return normalizedArticleClickEvents
+                .filter(ev => Number.isFinite(ev.epochMs) && (!sessionId || ev.sessionId === sessionId))
+                .map(ev => {
+                    const timeS = epochMsToTimelineTime(ev.epochMs, clipEpochRanges, rangeStart, timelineOffset);
+                    if (timeS === null || !Number.isFinite(timeS) || timeS < -1) return null;
+                    return {
+                        id: ev.id,
+                        timeS,
+                        targetText: String(ev.targetText || '').trim(),
+                        sessionId: ev.sessionId
+                    };
+                })
+                .filter(Boolean);
+        };
+        let _sortedArticleClicksByTime = _sessionIdsWithEvents
+            .flatMap(sessionId => _buildSessionMappedClicks(sessionId));
+        if (normalizedArticleClickEvents.some(ev => !ev.sessionId)) {
+            _sortedArticleClicksByTime.push(..._buildSessionMappedClicks(''));
         }
+        if (_sortedArticleClicksByTime.length === 0) {
+            _sortedArticleClicksByTime = _buildSessionMappedClicks(_articleSessionId);
+        }
+        _sortedArticleClicksByTime.sort((a, b) => a.timeS - b.timeS);
         console.log('[HighlightDebug] sortedClicksByTime count=', _sortedArticleClicksByTime.length, _sortedArticleClicksByTime.slice(0, 3).map(e => `${e.id.slice(0,16)}@${e.timeS.toFixed(2)}s`));
         const findNearestArticleClickId = (targetTimeS, maxGapS = 3) => {
             if (!_sortedArticleClicksByTime.length) return '';
@@ -8912,6 +8986,41 @@ ${orderedFramesText}
                 if (ev.timeS > targetTimeS + maxGapS) break;
             }
             return (best && bestGap <= maxGapS) ? best.id : '';
+        };
+        const findBestArticleClickId = (targetTimeS, hintText = '') => {
+            const closeClickId = findNearestArticleClickId(targetTimeS, 3);
+            if (closeClickId) return closeClickId;
+
+            const normalizeMatchText = (value) => String(value || '')
+                .toLocaleLowerCase()
+                .replace(/[^a-z0-9\u3400-\u9fff]+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const hint = normalizeMatchText(hintText);
+            if (hint) {
+                const hintTokens = hint.split(' ').filter(token => token.length >= 3);
+                let bestSemanticClick = null;
+                let bestSemanticScore = 0;
+                for (const click of _sortedArticleClicksByTime) {
+                    const target = normalizeMatchText(click.targetText);
+                    if (!target) continue;
+                    const directMatch = target.length >= 3 && (hint.includes(target) || target.includes(hint));
+                    const tokenMatches = hintTokens.filter(token => target.includes(token)).length;
+                    if (!directMatch && tokenMatches === 0) continue;
+                    const timeGap = Math.abs(Number(click.timeS || 0) - Number(targetTimeS || 0));
+                    const score = (directMatch ? 20 : 0) + (tokenMatches * 5) - Math.min(12, timeGap * 0.35);
+                    if (score > bestSemanticScore) {
+                        bestSemanticScore = score;
+                        bestSemanticClick = click;
+                    }
+                }
+                if (bestSemanticClick) return bestSemanticClick.id;
+            }
+
+            // Subtitle timing can drift several seconds from the actual pointer
+            // action after narration is segmented. Use a wider final window before
+            // falling back to a manually positioned review rectangle.
+            return findNearestArticleClickId(targetTimeS, 8);
         };
         const articleFramePool = [...activeFrames];
         let nextArticleFrameId = articleFramePool.reduce(
@@ -9365,7 +9474,9 @@ ${JSON.stringify(compositeArticleInput)}
                     const description = cleanAiText(step?.description || segment?.article_step || segment?.voiceover || segment?.subtitle);
                     const screenshotTime = Number(segment?.time_start || step?.time_start || step?.screenshot_time || 0);
                     const rawClickId = segment?.clickId || step?.click_id || '';
-                    const effectiveStepClickId = rawClickId || (includeArticleClickHighlight ? findNearestArticleClickId(screenshotTime) : '');
+                    const effectiveStepClickId = rawClickId || (includeArticleClickHighlight
+                        ? findBestArticleClickId(screenshotTime, `${stepTitle} ${description}`)
+                        : '');
                     const candidateBundle = await resolveArticleClickFrameCandidates(screenshotTime, effectiveStepClickId);
                     registerArticleCandidateExport({
                         stepIndex: index + 1,
@@ -9426,11 +9537,17 @@ ${JSON.stringify(compositeArticleInput)}
             // For tutorial skill: only keep subtitles that coincide with a click event.
             // Non-action narration subtitles have no corresponding click and should be skipped.
             const isTutorialOnlyMode = activeSkillId === 'tutorial';
-            const subtitles = isTutorialOnlyMode && !isScriptDerivedArticle
+            const clickMatchedSubtitles = isTutorialOnlyMode && !isScriptDerivedArticle
                 ? allSubtitlesSorted.filter(sub => {
-                    const id = sub.clickId || findNearestArticleClickId(Number(sub.startAt || 0));
+                    const id = sub.clickId || findBestArticleClickId(Number(sub.startAt || 0), sub.text || '');
                     return !!id;
                 })
+                : [];
+            // A tutorial can be recorded without click telemetry (for example after
+            // importing an existing video). Never reduce the review list to zero in
+            // that case: retain the subtitle steps and capture candidates by time.
+            const subtitles = isTutorialOnlyMode && !isScriptDerivedArticle && clickMatchedSubtitles.length > 0
+                ? clickMatchedSubtitles
                 : allSubtitlesSorted;
             const subtitlePayload = subtitles.map((s, idx) => ({
                 index: idx + 1,
@@ -9929,18 +10046,26 @@ ${JSON.stringify(subtitlePayload)}
                     const stepName = aiStep?.stepName || defaultName || `${settings.language === 'zh-TW' ? '步驟' : 'Step'} ${subIndex}`;
                     const description = aiStep?.description || defaultName;
                     const stepTime = Number(sub.startAt || 0);
-                    const effectiveClickId = sub.clickId || (includeArticleClickHighlight ? findNearestArticleClickId(stepTime) : '');
+                    const effectiveClickId = sub.clickId || (includeArticleClickHighlight
+                        ? findBestArticleClickId(stepTime, `${stepName} ${description}`)
+                        : '');
                     const candidateBundle = await resolveArticleClickFrameCandidates(stepTime, effectiveClickId);
                     // Normalize to CandidateWrapper objects: { rawFrame, previewFrame, highlightRectPct, frameId, ... }
                     let candidates = candidateBundle?.candidateFrames?.length
                         ? candidateBundle.candidateFrames
-                            .map(cf => makeCandidateWrapper(cf.rawFrame, cf.frame, cf.highlightRectPct))
+                            .map(cf => makeCandidateWrapper(
+                                cf.rawFrame,
+                                cf.frame,
+                                cf.highlightRectPct,
+                                { forceHighlight: includeArticleClickHighlight }
+                            ))
                             .filter(c => c.rawFrame || c.previewFrame)
                         : (candidateBundle?.selectedFrame
                             ? [makeCandidateWrapper(
                                 candidateBundle.selectedFrame,
                                 candidateBundle.selectedFrame,
-                                computeHighlightRectPct(articleClickEventById.get(effectiveClickId))
+                                computeHighlightRectPct(articleClickEventById.get(effectiveClickId)),
+                                { forceHighlight: includeArticleClickHighlight }
                               )]
                             : []);
                     // No click-based candidates → capture multiple time-based candidates so the
@@ -9957,13 +10082,23 @@ ${JSON.stringify(subtitlePayload)}
                             const fid = Number(f?.sourceFrameId || f?.frameId || 0);
                             if (fid && seenIds.has(fid)) continue;
                             if (fid) seenIds.add(fid);
-                            if (f) candidates.push(makeCandidateWrapper(f, f, null));
+                            if (f) candidates.push(makeCandidateWrapper(
+                                f,
+                                f,
+                                null,
+                                { forceHighlight: includeArticleClickHighlight }
+                            ));
                         }
                     }
                     // Final single-frame fallback if video seek also produced nothing.
                     if (candidates.length === 0) {
                         const fallbackFrame = pickBestScreenshotFrame(activeFrames, stepTime, new Set(), effectiveClickId);
-                        if (fallbackFrame) candidates.push(makeCandidateWrapper(fallbackFrame, fallbackFrame, null));
+                        if (fallbackFrame) candidates.push(makeCandidateWrapper(
+                            fallbackFrame,
+                            fallbackFrame,
+                            null,
+                            { forceHighlight: includeArticleClickHighlight }
+                        ));
                     }
                     const selectedFrame = candidateBundle?.selectedFrame;
                     // selectedFrame is the highlighted frame; its sourceFrameId = raw frame's frameId
@@ -9987,7 +10122,15 @@ ${JSON.stringify(subtitlePayload)}
                 }
 
                 // ── Screenshot review: pause and let the user pick ────────────────
-                articleProgress(5, 6, '等待截圖審核', '請在截圖審核介面選擇每個步驟的截圖，完成後按「確認並生成文章」。');
+                articleProgress(
+                    5,
+                    6,
+                    '等待截圖審核',
+                    stepReviewData.length > 0
+                        ? '請在截圖審核介面選擇每個步驟的截圖，完成後按「確認並生成文章」。'
+                        : '目前沒有可審核步驟；請在審核介面選擇略過並繼續生成文章。',
+                    { aiLabel: '', awaitingUser: true }
+                );
                 let userSelectedFrames;
                 try {
                     userSelectedFrames = await Promise.race([
@@ -13048,8 +13191,8 @@ ${JSON.stringify(subtitlePayload)}
                                         </button>
                                         <label className="flex items-center justify-between gap-4 rounded-xl border border-gray-700 bg-gray-900/70 px-3 py-2 cursor-pointer">
                                             <div className="pr-3">
-                                                <div className="text-sm text-white">是否加入點擊紅匡</div>
-                                                <div className="text-[11px] text-gray-400 mt-1">取消勾選後，文章截圖與匯出的 11 張候選圖都不會加上紅色框線。</div>
+                                                <div className="text-sm text-white">是否加入點擊紅框</div>
+                                                <div className="text-[11px] text-gray-400 mt-1">勾選後，每個步驟都會顯示紅框；有點擊紀錄時自動定位，沒有紀錄時可在截圖審核中手動拖曳。取消勾選則不加入框線。</div>
                                             </div>
                                             <input
                                                 type="checkbox"
@@ -13701,7 +13844,11 @@ ${JSON.stringify(subtitlePayload)}
                         <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-[2500] min-w-[320px] max-w-[520px] text-white px-5 py-3 rounded-2xl shadow-2xl text-sm space-y-2 border pointer-events-auto ${activeTaskAccent.panel}`}>
                             <div className="flex items-start justify-between gap-3">
                                 <div className="flex items-center gap-3 min-w-0">
-                                    <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-white shrink-0"></div>
+                                    {activeProgressStatus?.awaitingUser ? (
+                                        <div className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/35 bg-white/10 text-[11px] font-bold">✓</div>
+                                    ) : (
+                                        <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-white shrink-0"></div>
+                                    )}
                                     <span className="font-medium">{activeProgressLabel || aiProgress}</span>
                                 </div>
                                 <button
@@ -13712,7 +13859,11 @@ ${JSON.stringify(subtitlePayload)}
                                     取消
                                 </button>
                             </div>
-                            {activeProgressStatus?.aiLabel && (
+                            {activeProgressStatus?.awaitingUser ? (
+                                <div className={`text-[11px] ${activeTaskAccent.chip}`}>
+                                    需要你確認候選截圖後才會繼續
+                                </div>
+                            ) : activeProgressStatus?.aiLabel && (
                                 <div className={`text-[11px] ${activeTaskAccent.chip}`}>
                                     正在與 AI 協作: {activeProgressStatus.aiLabel}
                                 </div>
