@@ -2916,6 +2916,46 @@ export default function App() {
         () => selectedDesignTimelineItem ? motionDesign.manualCards.find(card => card.id === selectedDesignTimelineItem.id) || null : null,
         [motionDesign.manualCards, selectedDesignTimelineItem]
     );
+    const selectedTimelineTrackKey = useMemo(() => {
+        const primarySelectedId = selectedIds[0];
+        if (!primarySelectedId) return null;
+
+        for (let trackIndex = 0; trackIndex < SUBTITLE_TRACKS.length; trackIndex += 1) {
+            if ((subtitlesByTrack[trackIndex] || []).some(item => item.id === primarySelectedId)) {
+                return `subtitle-${trackIndex}`;
+            }
+            if ((subtitleTransitionsByTrack[trackIndex] || []).some(item => item.id === primarySelectedId)) {
+                return `subtitle-${trackIndex}`;
+            }
+        }
+        if (designTimelineItems.some(item => item.id === primarySelectedId)) return 'design';
+        for (let trackIndex = 0; trackIndex < 3; trackIndex += 1) {
+            if ((projectState.tracks[trackIndex] || []).some(item => item.id === primarySelectedId)) {
+                return `video-${trackIndex}`;
+            }
+            if ((projectState.videoTransitions?.[trackIndex] || []).some(item => item.id === primarySelectedId)) {
+                return `video-${trackIndex}`;
+            }
+        }
+        for (let trackIndex = 0; trackIndex < 2; trackIndex += 1) {
+            if ((projectState.audioTracks[trackIndex] || []).some(item => item.id === primarySelectedId)) {
+                return `audio-${trackIndex}`;
+            }
+        }
+        return null;
+    }, [
+        selectedIds,
+        subtitlesByTrack,
+        subtitleTransitionsByTrack,
+        designTimelineItems,
+        projectState.tracks,
+        projectState.videoTransitions,
+        projectState.audioTracks
+    ]);
+    const isTimelineTrackExpanded = (trackKey) => selectedTimelineTrackKey === trackKey;
+    const getTimelineTrackStyle = (trackKey, expandedHeight) => ({
+        height: `${isTimelineTrackExpanded(trackKey) ? expandedHeight : 32}px`
+    });
     const updateManualDesignCard = useCallback((cardId, patch) => {
         setProjectState(prev => ({
             ...prev,
@@ -14315,50 +14355,55 @@ ${JSON.stringify(subtitlePayload)}
                         {SUBTITLE_TRACKS.map((track, trackIndex) => (
                             <div
                                 key={track.key}
-                                className={`h-12 shrink-0 border-b border-gray-700 px-3 text-xs transition ${
+                                style={getTimelineTrackStyle(`subtitle-${trackIndex}`, 48)}
+                                className={`shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${
                                     activeSubtitleTrackIndex === trackIndex
                                         ? 'bg-gray-700/70 text-white shadow-[inset_3px_0_0_rgba(249,115,22,0.95)]'
                                         : 'text-gray-400 hover:bg-gray-700/40'
                                 }`}
                             >
-                                <div className="grid h-full grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-2">
+                                <div className={`grid h-full items-center ${isTimelineTrackExpanded(`subtitle-${trackIndex}`) ? 'grid-cols-[minmax(0,1fr)_auto_auto_auto] gap-1' : 'grid-cols-[minmax(0,1fr)_auto] gap-1.5'}`}>
                                     <button
                                         type="button"
                                         onClick={() => setActiveSubtitleTrackIndex(trackIndex)}
-                                        className="flex min-w-0 items-center gap-2 text-left"
+                                        className="flex min-w-0 items-center gap-1.5 overflow-hidden text-left"
                                         title={trackIndex === 0 ? '手動新增字幕固定放到 S1 用戶字幕軌' : 'S2 保留給 AI字幕結果'}
                                     >
-                                        <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border ${trackIndex === 0 ? 'border-cyan-400/30 bg-cyan-400/10' : 'border-amber-400/30 bg-amber-400/10'}`}>
-                                            <Type size={14} className={track.colorClass} />
+                                        <span className={`flex shrink-0 items-center justify-center rounded-md border ${isTimelineTrackExpanded(`subtitle-${trackIndex}`) ? 'h-7 w-7' : 'h-5 w-5'} ${trackIndex === 0 ? 'border-cyan-400/30 bg-cyan-400/10' : 'border-amber-400/30 bg-amber-400/10'}`}>
+                                            <Type size={isTimelineTrackExpanded(`subtitle-${trackIndex}`) ? 14 : 11} className={track.colorClass} />
                                         </span>
-                                        <span className="min-w-0 flex items-center gap-2">
-                                            <span className="truncate font-semibold text-[12px]">{track.label.replace(` ${track.shortLabel}`, '')}</span>
-                                            <span className="shrink-0 rounded bg-gray-900/60 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-gray-400">
+                                        <span className="flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap">
+                                            <span className={`truncate font-semibold leading-none ${isTimelineTrackExpanded(`subtitle-${trackIndex}`) ? 'text-[12px]' : 'text-[11px]'}`}>{track.label.replace(` ${track.shortLabel}`, '')}</span>
+                                            <span className="shrink-0 rounded bg-gray-900/60 px-1 py-0.5 text-[8px] uppercase tracking-[0.12em] text-gray-400">
                                                 {track.shortLabel}
                                             </span>
                                         </span>
                                     </button>
 
-                                    <label
-                                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-gray-600/80 bg-gray-900/40 px-2 text-[11px] font-medium text-gray-200 transition hover:border-gray-400 hover:bg-gray-700/60"
-                                        title="全選本軌字幕"
-                                    >
-                                        <input
-                                            type="checkbox"
-                                            checked={areAllSubtitlesSelectedByTrack[trackIndex]}
-                                            onChange={(e) => handleToggleSelectAllSubtitles(trackIndex, e.target.checked)}
-                                            className="h-3.5 w-3.5 shrink-0 accent-orange-500 bg-gray-900 border-gray-600 rounded"
-                                        />
-                                        <span>全選</span>
-                                    </label>
+                                    {isTimelineTrackExpanded(`subtitle-${trackIndex}`) && (
+                                        <>
+                                            <label
+                                                className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md border border-gray-600/80 bg-gray-900/40 text-gray-200 transition hover:border-gray-400 hover:bg-gray-700/60"
+                                                title="全選本軌字幕"
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={areAllSubtitlesSelectedByTrack[trackIndex]}
+                                                    onChange={(e) => handleToggleSelectAllSubtitles(trackIndex, e.target.checked)}
+                                                    className="h-3.5 w-3.5 shrink-0 accent-orange-500 bg-gray-900 border-gray-600 rounded"
+                                                />
+                                                <span className="sr-only">全選</span>
+                                            </label>
 
-                                    <button
-                                        onClick={() => handleAlignSelectedSubtitles(trackIndex)}
-                                        className="flex h-8 min-w-[3.25rem] shrink-0 items-center justify-center rounded-lg border border-gray-600/80 bg-gray-900/40 px-3 text-[11px] font-semibold text-gray-200 transition hover:border-gray-400 hover:bg-gray-700/70"
-                                        title="將本軌已選字幕對齊到指定秒數"
-                                    >
-                                        對齊
-                                    </button>
+                                            <button
+                                                onClick={() => handleAlignSelectedSubtitles(trackIndex)}
+                                                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-gray-600/80 bg-gray-900/40 text-[10px] font-semibold text-gray-200 transition hover:border-gray-400 hover:bg-gray-700/70"
+                                                title="將本軌已選字幕對齊到指定秒數"
+                                            >
+                                                齊
+                                            </button>
+                                        </>
+                                    )}
 
                                     <button
                                         onClick={() => setTrackState(prev => {
@@ -14366,7 +14411,7 @@ ${JSON.stringify(subtitlePayload)}
                                             nextHidden[trackIndex] = !nextHidden[trackIndex];
                                             return { ...prev, subtitleHidden: nextHidden };
                                         })}
-                                        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition ${
+                                        className={`flex shrink-0 items-center justify-center rounded-md border transition ${isTimelineTrackExpanded(`subtitle-${trackIndex}`) ? 'h-7 w-7' : 'h-6 w-6'} ${
                                             trackState.subtitleHidden[trackIndex]
                                                 ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200'
                                                 : 'border-gray-500/80 text-gray-300 hover:border-gray-300 hover:text-white'
@@ -14379,21 +14424,21 @@ ${JSON.stringify(subtitlePayload)}
                             </div>
                         ))}
 
-                        <div className={`h-14 shrink-0 border-b border-gray-700 px-3 text-xs transition ${trackState.designHidden ? 'text-gray-500' : 'bg-violet-950/20 text-violet-100 hover:bg-violet-950/35'}`}>
+                        <div style={getTimelineTrackStyle('design', 56)} className={`shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${trackState.designHidden ? 'text-gray-500' : 'bg-violet-950/20 text-violet-100 hover:bg-violet-950/35'}`}>
                             <div className="flex h-full items-center justify-between gap-2">
                                 <div className="flex min-w-0 items-center gap-2">
-                                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-violet-400/35 bg-violet-400/10">
-                                        <Sparkles size={14} className="text-violet-200" />
+                                    <span className={`flex shrink-0 items-center justify-center rounded-md border border-violet-400/35 bg-violet-400/10 ${isTimelineTrackExpanded('design') ? 'h-7 w-7' : 'h-5 w-5'}`}>
+                                        <Sparkles size={isTimelineTrackExpanded('design') ? 14 : 11} className="text-violet-200" />
                                     </span>
                                     <span className="min-w-0">
-                                        <span className="block truncate font-semibold text-[12px]">設計素材</span>
-                                        <span className="block text-[9px] uppercase tracking-[0.14em] text-violet-200/65">GFX · Cards · Contents</span>
+                                        <span className={`block truncate whitespace-nowrap font-semibold leading-none ${isTimelineTrackExpanded('design') ? 'text-[12px]' : 'text-[11px]'}`}>設計素材</span>
+                                        {isTimelineTrackExpanded('design') && <span className="block whitespace-nowrap text-[9px] uppercase tracking-[0.14em] text-violet-200/65">GFX · Cards · Contents</span>}
                                     </span>
                                 </div>
                                 <button
                                     type="button"
                                     onClick={() => setTrackState(prev => ({ ...prev, designHidden: !prev.designHidden }))}
-                                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition ${trackState.designHidden ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/10'}`}
+                                    className={`flex shrink-0 items-center justify-center rounded-md border transition ${isTimelineTrackExpanded('design') ? 'h-7 w-7' : 'h-6 w-6'} ${trackState.designHidden ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/10'}`}
                                     title={trackState.designHidden ? '顯示設計素材軌' : '隱藏設計素材軌與輸出中的設計素材'}
                                 >
                                     {trackState.designHidden ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -14402,7 +14447,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
 
                         {[2, 1, 0].map(i => (
-                            <div key={i} className="h-16 shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition">
+                            <div key={i} style={getTimelineTrackStyle(`video-${i}`, 64)} className="shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition-[height,background-color] duration-200">
                                 <div className="flex items-center">
                                     {i === 0 ? <MonitorPlay size={14} className="mr-1.5 text-blue-400" /> : <FileVideo size={14} className="mr-1.5 text-blue-400" />} V{i + 1}
                                 </div>
@@ -14416,14 +14461,14 @@ ${JSON.stringify(subtitlePayload)}
                             </div>
                         ))}
 
-                        <div className="h-12 shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition">
+                        <div style={getTimelineTrackStyle('audio-0', 48)} className="shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition-[height,background-color] duration-200">
                             <div className="flex items-center"><Music size={14} className="mr-1.5 text-green-500" /> 語音 A1</div>
                             <button onClick={() => setTrackState(prev => ({ ...prev, audioMuted: !prev.audioMuted }))} className="p-1 hover:text-white transition">
                                 {trackState.audioMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
                             </button>
                         </div>
 
-                        <div className="h-12 shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition">
+                        <div style={getTimelineTrackStyle('audio-1', 48)} className="shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition-[height,background-color] duration-200">
                             <div className="flex items-center"><Music size={14} className="mr-1.5 text-teal-500" /> 音樂 A2</div>
                             <button onClick={() => setTrackState(prev => ({ ...prev, bgmMuted: !prev.bgmMuted }))} className="p-1 hover:text-white transition">
                                 {trackState.bgmMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
@@ -14558,11 +14603,12 @@ ${JSON.stringify(subtitlePayload)}
                             {SUBTITLE_TRACKS.map((track, trackIndex) => (
                                 <div
                                     key={`subtitle-track-${track.key}`}
-                                    className={`h-12 shrink-0 border-b border-gray-800 relative ${trackIndex === 0 ? 'bg-cyan-950/10' : 'bg-amber-950/10'} ${trackState.subtitleHidden[trackIndex] ? 'opacity-30' : ''}`}
+                                    style={getTimelineTrackStyle(`subtitle-${trackIndex}`, 48)}
+                                    className={`shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackIndex === 0 ? 'bg-cyan-950/10' : 'bg-amber-950/10'} ${trackState.subtitleHidden[trackIndex] ? 'opacity-30' : ''}`}
                                     onDragOver={(e) => e.preventDefault()}
                                     onDrop={(e) => handleDropOnSubtitleTrack(e, trackIndex)}
                                 >
-                                    {subtitlesByTrack[trackIndex].length === 0 && (
+                                    {isTimelineTrackExpanded(`subtitle-${trackIndex}`) && subtitlesByTrack[trackIndex].length === 0 && (
                                         <div className="absolute inset-0 flex items-center px-3 text-[11px] text-gray-500 pointer-events-none">
                                             {trackIndex === 1 && aiSubtitleStatus.phase === 'error'
                                                 ? `AI字幕未建立：${aiSubtitleStatus.detail}`
@@ -14602,8 +14648,8 @@ ${JSON.stringify(subtitlePayload)}
                                 </div>
                             ))}
 
-                            <div className={`h-14 shrink-0 border-b border-gray-800 relative ${trackState.designHidden ? 'opacity-30' : 'bg-violet-950/15'}`}>
-                                {designTimelineItems.length === 0 ? (
+                            <div style={getTimelineTrackStyle('design', 56)} className={`shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackState.designHidden ? 'opacity-30' : 'bg-violet-950/15'}`}>
+                                {isTimelineTrackExpanded('design') && designTimelineItems.length === 0 ? (
                                     <div className="absolute inset-0 flex items-center px-3 text-[11px] text-violet-200/50">
                                         加入 Cards、Intro / Outro 或 Contents 後，設計素材會顯示在這條 GFX 軌道。
                                     </div>
@@ -14639,15 +14685,16 @@ ${JSON.stringify(subtitlePayload)}
 
                             {[2, 1, 0].map(trackIndex => {
                                 const track = projectState.tracks[trackIndex];
+                                const isExpanded = isTimelineTrackExpanded(`video-${trackIndex}`);
                                 return (
-                                    <div key={trackIndex} data-video-track={trackIndex} className={`h-16 shrink-0 border-b border-gray-800 relative bg-gray-800/20 ${trackState.videoHidden[trackIndex] ? 'opacity-30' : ''}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnTrack(e, trackIndex)}>
+                                    <div key={trackIndex} data-video-track={trackIndex} style={getTimelineTrackStyle(`video-${trackIndex}`, 64)} className={`shrink-0 border-b border-gray-800 relative bg-gray-800/20 transition-[height,opacity] duration-200 ${trackState.videoHidden[trackIndex] ? 'opacity-30' : ''}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnTrack(e, trackIndex)}>
                                         {(projectState.videoTransitions?.[trackIndex] || []).map(item => (
                                             <div
                                                 key={item.id}
                                                 data-id={item.id}
                                                 onMouseDown={(e) => handleItemMouseDown(e, item, 'videoTransition', trackIndex)}
-                                                className={`absolute right-auto top-1 bottom-9 rounded border text-[10px] flex items-center overflow-hidden cursor-grab active:cursor-grabbing timeline-item ${selectedIds.includes(item.id) ? 'bg-orange-500/90 border-white shadow-[0_0_8px_rgba(249,115,22,0.8)] z-30' : 'bg-cyan-500/20 border-cyan-300/50 text-cyan-100 z-10'}`}
-                                                style={{ left: `${item.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${item.duration * pixelsPerSecond}px` }}
+                                                className={`absolute right-auto rounded border text-[10px] flex items-center overflow-hidden cursor-grab active:cursor-grabbing timeline-item ${selectedIds.includes(item.id) ? 'bg-orange-500/90 border-white shadow-[0_0_8px_rgba(249,115,22,0.8)] z-30' : 'bg-cyan-500/20 border-cyan-300/50 text-cyan-100 z-10'}`}
+                                                style={{ left: `${item.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${item.duration * pixelsPerSecond}px`, top: '2px', bottom: isExpanded ? '36px' : '2px' }}
                                                 title={`${item.name} 過場`}
                                             >
                                                 {selectedIds.length === 1 && selectedIds.includes(item.id) && <div className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize z-50 hover:bg-white/40" onMouseDown={(e) => handleItemMouseDown(e, item, 'videoTransition', trackIndex, 'resizeLeft')} />}
@@ -14694,7 +14741,7 @@ ${JSON.stringify(subtitlePayload)}
                             })}
 
                             {[0, 1].map(trackIndex => (
-                                <div key={`audio-track-${trackIndex}`} data-audio-track={trackIndex} className={`h-12 shrink-0 border-b border-gray-800 relative bg-gray-900/30 ${trackIndex === 0 ? (trackState.audioMuted ? 'opacity-30' : '') : (trackState.bgmMuted ? 'opacity-30' : '')}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnAudioTrack(e, trackIndex)}>
+                                <div key={`audio-track-${trackIndex}`} data-audio-track={trackIndex} style={getTimelineTrackStyle(`audio-${trackIndex}`, 48)} className={`shrink-0 border-b border-gray-800 relative bg-gray-900/30 transition-[height,opacity] duration-200 ${trackIndex === 0 ? (trackState.audioMuted ? 'opacity-30' : '') : (trackState.bgmMuted ? 'opacity-30' : '')}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnAudioTrack(e, trackIndex)}>
                                     {projectState.audioTracks[trackIndex]?.map(audio => {
                                         const isSelected = selectedIds.includes(audio.id);
                                         const baseColor = trackIndex === 0 ? 'bg-green-600/60' : 'bg-teal-600/60';
