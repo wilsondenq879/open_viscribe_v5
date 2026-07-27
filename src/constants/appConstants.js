@@ -70,12 +70,10 @@ export const LOCAL_OLLAMA_ENDPOINT = 'http://localhost:11434';
 export const AI_TASK_CANCELLED_MESSAGE = '已取消 AI 任務';
 
 export function getDefaultTimelineHeight() {
-    if (typeof window === 'undefined') return 360;
-    const availableHeight = Math.max(MIN_TIMELINE_HEIGHT * 2, window.innerHeight - RESERVED_EDITOR_HEIGHT);
-    return Math.max(
-        MIN_TIMELINE_HEIGHT,
-        Math.min(window.innerHeight - RESERVED_EDITOR_HEIGHT, Math.round(availableHeight / 2))
-    );
+    if (typeof window === 'undefined') return 196;
+    const availableHeight = Math.max(MIN_TIMELINE_HEIGHT, window.innerHeight - RESERVED_EDITOR_HEIGHT);
+    const compactHeight = Math.round(window.innerHeight * 0.22);
+    return Math.max(MIN_TIMELINE_HEIGHT, Math.min(220, availableHeight, compactHeight));
 }
 
 export const DEFAULT_SUBTITLE_STYLE = {
@@ -139,6 +137,7 @@ export const DEFAULT_MOTION_DESIGN = {
     includeLowerThird: true,
     manualIntroEnabled: false,
     manualOutroEnabled: false,
+    designTrackCount: 1,
     manualCards: [],
     introDuration: 2.6,
     outroDuration: 3.1,

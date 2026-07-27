@@ -116,7 +116,7 @@ OPEN_VISCRIBE_API_TOKEN="your-stable-token" npm run automation:api
 
 ### Contents 樣板與自然語言設計
 
-素材庫新增 **Contents** 分頁，提供 15 個可動態預覽並直接加入播放頭的素材：世界地圖、全球流向、資料圖表、流程圖、終端機、程式碼差異、程式碼打字、應用程式展示、手機裝置、Liquid Glass、社群追蹤卡、新聞跑馬燈、關鍵字字幕、霓虹程式碼與版本路線圖；另保留產品教學、編輯敘事、創作者 CTA、開發者版本說明與功能發表等整套樣板。每個項目都標示對應的 HyperFrames Catalog block 與使用理由。
+素材庫的 **Contents** 分頁現在保留兩個既有世界地圖（全球服務地圖、跨區資料流向），並加入一套原創 Aster／Harbor 素材庫。資料視覺化、片頭／片尾、字卡與字幕／CC 各有兩種設計，且每種皆提供獨立的 16:9 與 9:16 排版；不是把橫式卡壓縮到手機畫面。所有素材都有動態預覽、可編輯文案與對應的 HyperFrames Catalog composition。
 
 透過 MCP 的 Agent 可先呼叫 `openviscribe_list_hyperframe_templates` 或 `openviscribe_list_hyperframe_assets`，再依「做一支有世界地圖與 console 的部署教學」這種自然語言請求提出可比較的素材；使用者確認後以 `openviscribe_apply_hyperframe_template` 或 `openviscribe_add_hyperframe_asset` 套用。若要更自動化，可用 `openviscribe_auto_add_contents` 或在整體工作流開啟 `autoContents`，系統最多挑選兩個有敘事理由的 Contents。這些素材會寫入專案設定並隨影片輸出，而不是僅回傳文字建議。
 

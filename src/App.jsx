@@ -104,6 +104,13 @@ import { HYPERFRAME_TEMPLATES, getHyperframeTemplate, getHyperframeTemplateDefau
 import { HYPERFRAME_ASSETS } from './lib/hyperframeAssets';
 import { getHyperframeAssetConfig, getMapNodePosition, MAP_LOCATIONS } from './lib/hyperframeAssetConfig';
 import {
+    buildProceduralScene,
+    evaluateGeneratedSceneElement,
+    generatedSceneGradientCss,
+    resolveGeneratedSceneColor,
+    resolveGeneratedScenePromptImage
+} from './lib/generatedScene';
+import {
     buildCompositeSubtitleText,
     clamp,
     cleanAiText,
@@ -1142,6 +1149,139 @@ function parseModelJsonObject(rawText) {
     }
 }
 
+// Existing projects may still contain these renderer types. Natural-language
+// creation does not select from this list; it always emits generated-scene.
+const SUPPORTED_STORED_MATERIAL_TYPES = [
+    'generated-scene',
+    'brand-transition',
+    'logo-fill',
+    'stacked-bars',
+    'aster-orbit',
+    'harbor-cascade',
+    'pulse-radar',
+    'rank-ladder',
+    'tide-heatmap',
+    'constellation',
+    'aperture-open',
+    'aperture-close',
+    'margin-note',
+    'folded-proof',
+    'echo-caption',
+    'dual-rail'
+];
+
+const AI_MATERIAL_CATEGORY_BY_TYPE = {
+    'generated-scene': 'AI 原創',
+    'brand-transition': '片頭／片尾',
+    'logo-fill': '片頭／片尾',
+    'stacked-bars': '資料視覺化',
+    'aster-orbit': '資料視覺化',
+    'harbor-cascade': '資料視覺化',
+    'pulse-radar': '資料視覺化',
+    'rank-ladder': '資料視覺化',
+    'tide-heatmap': '資料視覺化',
+    constellation: '資料視覺化',
+    'aperture-open': '片頭／片尾',
+    'aperture-close': '片頭／片尾',
+    'margin-note': '字卡',
+    'folded-proof': '字卡',
+    'echo-caption': '字幕／CC',
+    'dual-rail': '字幕／CC'
+};
+
+const normalizeMaterialHex = (value, fallback) => /^#[0-9a-f]{6}$/i.test(String(value || '').trim())
+    ? String(value).trim().toLowerCase()
+    : fallback;
+
+function createAiMaterialPair(rawValue, prompt, ratioMode = 'both') {
+    const raw = rawValue && typeof rawValue === 'object' ? rawValue : {};
+    const directImageUrl = String(prompt || '').match(/https?:\/\/[^\s"'<>]+\.(?:png|jpe?g|webp|svg)(?:\?[^\s"'<>]*)?/i)?.[0] || '';
+    const resolvedPromptImage = resolveGeneratedScenePromptImage(prompt, directImageUrl);
+    const assetType = 'generated-scene';
+    const baseName = String(raw.nameZh || String(prompt || '').replace(/https?:\/\/\S+/gi, '').split(/[,.!，。！\n]/)[0] || 'AI 原創動態素材').trim().slice(0, 32);
+    const description = String(raw.description || `根據「${String(prompt || '').trim().slice(0, 52)}」生成的專案動態素材。`).trim().slice(0, 120);
+    const duration = Math.max(2.4, Math.min(8, Number(raw.duration) || 4.2));
+    const presetId = ['signal', 'editorial', 'creator'].includes(raw.presetId) ? raw.presetId : 'signal';
+    const palette = {
+        background: normalizeMaterialHex(raw.palette?.background, '#0b1020'),
+        surface: normalizeMaterialHex(raw.palette?.surface, '#17233b'),
+        foreground: normalizeMaterialHex(raw.palette?.foreground, '#f8fafc'),
+        muted: normalizeMaterialHex(raw.palette?.muted, '#9aa8bd'),
+        accent: normalizeMaterialHex(raw.palette?.accent, '#5eead4'),
+        accentAlt: normalizeMaterialHex(raw.palette?.accentAlt, '#fb7185')
+    };
+    const stamp = Date.now().toString(36);
+    const ratios = ratioMode === 'both' ? ['16:9', '9:16'] : [ratioMode === '9:16' ? '9:16' : '16:9'];
+    return ratios.map((aspectRatio) => {
+        const ratioKey = aspectRatio === '9:16' ? 'tall' : 'wide';
+        const rawScene = raw.config?.scenes?.[ratioKey] || raw.scenes?.[ratioKey] || raw.config;
+        const hasGeneratedElements = Array.isArray(rawScene?.elements) && rawScene.elements.length > 0;
+        const sceneInput = hasGeneratedElements ? {
+            ...rawScene,
+            elements: resolvedPromptImage && !rawScene.elements.some(element => element?.type === 'image' && element?.src)
+                ? [...rawScene.elements, {
+                    id: 'prompt-reference-image',
+                    name: '提示來源圖片',
+                    type: 'image',
+                    src: resolvedPromptImage,
+                    x: aspectRatio === '9:16' ? 18 : 36,
+                    y: aspectRatio === '9:16' ? 31 : 24,
+                    w: aspectRatio === '9:16' ? 64 : 28,
+                    h: aspectRatio === '9:16' ? 38 : 48,
+                    objectFit: 'contain',
+                    zIndex: 20,
+                    keyframes: [{ at: 0, scale: .45, opacity: 0, blur: 18 }, { at: .42, scale: 1, opacity: 1, blur: 0, ease: 'out-back' }, { at: .78, scale: 1, opacity: 1 }, { at: 1, scale: 1.3, opacity: 0, blur: 8 }]
+                }]
+                : rawScene.elements
+        } : buildProceduralScene(prompt, { imageSrc: resolvedPromptImage, aspectRatio });
+        const config = getHyperframeAssetConfig({ assetType }, sceneInput);
+        return {
+        id: `ai-material-${stamp}-${aspectRatio === '9:16' ? 'tall' : 'wide'}`,
+        catalogId: `ai-${stamp}-${aspectRatio === '9:16' ? 'tall' : 'wide'}`,
+        nameZh: `${baseName}${aspectRatio === '9:16' ? '（直式）' : ''}`,
+        assetType,
+        category: AI_MATERIAL_CATEGORY_BY_TYPE[assetType] || '字卡',
+        description,
+        duration,
+        presetId,
+        aspectRatio,
+        narrativeReason: String(raw.narrativeReason || '由使用者的自然語言提示生成。').slice(0, 100),
+        config,
+        palette,
+        prompt: String(prompt || '').trim().slice(0, 800),
+        generated: true,
+        generatedAt: new Date().toISOString()
+        };
+    });
+}
+
+function normalizeStoredAiMaterial(asset, index = 0) {
+    if (!asset || typeof asset !== 'object' || !SUPPORTED_STORED_MATERIAL_TYPES.includes(asset.assetType)) return null;
+    const aspectRatio = asset.aspectRatio === '9:16' ? '9:16' : '16:9';
+    const id = String(asset.id || `imported-ai-material-${Date.now()}-${index}`).slice(0, 100);
+    return {
+        ...asset,
+        id,
+        catalogId: String(asset.catalogId || id).slice(0, 100),
+        nameZh: String(asset.nameZh || 'AI 動態素材').slice(0, 48),
+        description: String(asset.description || '從工作資料夾載入的 AI 動態素材。').slice(0, 160),
+        category: AI_MATERIAL_CATEGORY_BY_TYPE[asset.assetType] || '字卡',
+        aspectRatio,
+        duration: Math.max(0.8, Math.min(10, Number(asset.duration) || 4)),
+        presetId: ['signal', 'editorial', 'creator'].includes(asset.presetId) ? asset.presetId : 'signal',
+        config: getHyperframeAssetConfig(asset, asset.config),
+        palette: {
+            background: normalizeMaterialHex(asset.palette?.background, '#0b1020'),
+            surface: normalizeMaterialHex(asset.palette?.surface, '#17233b'),
+            foreground: normalizeMaterialHex(asset.palette?.foreground, '#f8fafc'),
+            muted: normalizeMaterialHex(asset.palette?.muted, '#9aa8bd'),
+            accent: normalizeMaterialHex(asset.palette?.accent, '#5eead4'),
+            accentAlt: normalizeMaterialHex(asset.palette?.accentAlt, '#fb7185')
+        },
+        generated: true
+    };
+}
+
 async function extractHttpErrorMessage(response) {
     const fallback = `HTTP 錯誤 ${response?.status || ''}`.trim();
     if (!response) return fallback;
@@ -1790,9 +1930,58 @@ function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, 
     );
 }
 
-function HyperframeAssetPreview({ asset, config: suppliedConfig, className = '' }) {
-    const preset = getMotionDesignPreset(asset.presetId);
-    const config = getHyperframeAssetConfig(asset, suppliedConfig);
+function GeneratedSceneElementPreview({ element, progress, palette }) {
+    const state = evaluateGeneratedSceneElement(element, progress);
+    const fill = element.gradient ? generatedSceneGradientCss(element.gradient, palette) : resolveGeneratedSceneColor(element.fill, palette);
+    const stroke = resolveGeneratedSceneColor(element.stroke, palette);
+    const commonStyle = {
+        left: `${state.x}%`,
+        top: `${state.y}%`,
+        width: `${state.w}%`,
+        height: `${state.h}%`,
+        opacity: state.opacity,
+        transform: `rotate(${state.rotate}deg) scale(${state.scale}) scaleX(${state.scaleX}) scaleY(${state.scaleY})`,
+        transformOrigin: 'center center',
+        filter: `blur(${state.blur}px) drop-shadow(0 0 ${element.shadow}px ${resolveGeneratedSceneColor(element.fill, palette)})`,
+        clipPath: `inset(0 ${100 - state.clipX}% ${100 - state.clipY}% 0)`,
+        mixBlendMode: element.blendMode,
+        zIndex: element.zIndex,
+        border: element.strokeWidth ? `${element.strokeWidth}px solid ${stroke}` : undefined,
+        borderRadius: `${state.radius}%`,
+        background: fill
+    };
+    if (element.type === 'text') return <div className="absolute flex items-center overflow-hidden whitespace-pre-wrap leading-[1.02]" style={{ ...commonStyle, justifyContent: element.align === 'center' ? 'center' : element.align === 'right' ? 'flex-end' : 'flex-start', color: fill, background: 'transparent', textAlign: element.align, fontSize: `${element.fontSize * .2}rem`, fontWeight: element.fontWeight, letterSpacing: `${element.letterSpacing}em` }}>{element.text}</div>;
+    if (element.type === 'image') return <div className="absolute overflow-hidden" style={{ ...commonStyle, background: 'transparent' }}><img src={element.src} alt={element.name} className="h-full w-full" style={{ objectFit: element.objectFit }} /></div>;
+    if (element.type === 'polygon') return <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute overflow-visible" style={{ ...commonStyle, background: 'transparent', border: undefined }} aria-hidden="true"><polygon points={(element.points.length ? element.points : [[0, 0], [100, 0], [100, 100], [0, 100]]).map(point => point.join(',')).join(' ')} fill={fill} stroke={stroke} strokeWidth={element.strokeWidth} /></svg>;
+    if (element.type === 'line') return <div className="absolute" style={{ ...commonStyle, height: `${Math.max(.15, state.h)}%`, border: undefined, borderRadius: 999 }} />;
+    return <div className="absolute" style={commonStyle} />;
+}
+
+function GeneratedScenePreview({ config, palette }) {
+    const [progress, setProgress] = useState(0);
+    useEffect(() => {
+        let frameId = 0;
+        let startTime = null;
+        // Catalog playback is intentionally separate from export. Export uses
+        // the deterministic timeline progress evaluated by the canvas renderer.
+        const tick = (timestamp) => {
+            if (startTime === null) startTime = timestamp;
+            setProgress(((timestamp - startTime) % 4600) / 4600);
+            frameId = requestAnimationFrame(tick);
+        };
+        frameId = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(frameId);
+    }, []);
+    return <div className="absolute inset-0 overflow-hidden" style={{ background: resolveGeneratedSceneColor(config.background, palette) }}>
+        {config.elements.map(element => <GeneratedSceneElementPreview key={element.id} element={element} progress={progress} palette={palette} />)}
+    </div>;
+}
+
+function HyperframeAssetPreview({ asset, config: suppliedConfig, className = '', stageMode = false }) {
+    const preset = asset.palette
+        ? { ...getMotionDesignPreset(asset.presetId), ...asset.palette }
+        : getMotionDesignPreset(asset.presetId);
+    const config = getHyperframeAssetConfig(asset, suppliedConfig || asset.config);
     const accent = preset.accent;
     const alt = preset.accentAlt;
     const foreground = preset.foreground;
@@ -1882,17 +2071,118 @@ function HyperframeAssetPreview({ asset, config: suppliedConfig, className = '' 
         if (asset.assetType === 'caption-highlight') return <div className="absolute inset-0 flex flex-col items-center justify-center px-4 text-center font-extrabold leading-tight"><span className="text-sm" style={{ color: foreground }}>{config.line}</span><span className="mt-1 text-base" style={{ color: accent }}>{config.highlight}</span></div>;
         return <div className="absolute inset-x-[14%] top-[25%] rounded-xl border p-3" style={{ backgroundColor: `${preset.surface}ee`, borderColor: `${accent}99` }}><div className="flex items-center gap-2"><span className="h-8 w-8 rounded-full" style={{ backgroundColor: alt }} /><div><div className="text-[9px] font-extrabold" style={{ color: foreground }}>{config.handle}</div><div className="mt-1 h-1.5 w-16 rounded bg-white/30" /></div></div><span className="mt-3 block w-full rounded py-1 text-center text-[8px] font-bold" style={{ backgroundColor: accent, color: preset.background }}>{config.cta}</span></div>;
     };
+    const renderBrandTransition = () => {
+        const tall = asset.aspectRatio === '9:16';
+        const slices = Array.from({ length: config.sliceCount }, (_, index) => index);
+        return <div
+            className={`hyperframe-brand-transition hyperframe-brand-transition--${config.entrance} hyperframe-brand-transition--${config.reveal} hyperframe-brand-transition--exit-${config.exit} hyperframe-brand-transition--${config.direction} absolute inset-0 overflow-hidden`}
+            style={{
+                '--brand-angle': `${config.angle}deg`,
+                '--brand-angle-reverse': `${-config.angle}deg`,
+                '--brand-angle-burst': `${config.angle * 1.4}deg`,
+                '--brand-intensity': config.intensity / 100,
+                '--brand-logo-scale': `${config.logoScale}%`,
+                '--brand-slice-count': config.sliceCount,
+                '--brand-accent': accent,
+                '--brand-alt': alt,
+                '--brand-surface': preset.surface,
+                '--brand-foreground': foreground
+            }}
+        >
+            <div className="hyperframe-brand-grid absolute inset-0" />
+            <div className="hyperframe-brand-slices absolute -inset-[20%] flex" aria-hidden="true">
+                {slices.map(index => <span key={index} className="hyperframe-brand-slice relative h-full flex-1" style={{ '--brand-slice-index': index, backgroundColor: index % 3 === 0 ? accent : index % 3 === 1 ? preset.surface : alt }} />)}
+            </div>
+            <div className={`hyperframe-brand-logo-wrap absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center ${tall ? 'h-[46%] w-[76%]' : 'h-[58%] w-[55%]'}`}>
+                <div className="hyperframe-brand-logo relative flex h-[72%] w-full items-center justify-center">
+                    {config.logoSrc ? <img src={config.logoSrc} alt={config.brandName} className="h-full w-full object-contain" style={{ filter: `drop-shadow(0 0 ${4 + config.intensity * .12}px ${accent}88)` }} /> : <div className="text-[38px] font-black italic tracking-[-.08em]" style={{ color: foreground }}>{config.brandName}</div>}
+                    <span className="hyperframe-brand-scan absolute inset-y-[-12%] w-[2px]" style={{ backgroundColor: foreground, boxShadow: `0 0 16px 4px ${accent}` }} />
+                </div>
+                <div className="hyperframe-brand-tagline mt-[4%] font-mono text-[6px] font-bold tracking-[.28em]" style={{ color: foreground }}>{config.tagline}</div>
+            </div>
+            <div className="hyperframe-brand-flash absolute inset-0" aria-hidden="true" />
+            <div className="hyperframe-brand-exit absolute -inset-[26%]" aria-hidden="true" />
+        </div>;
+    };
+    const renderLogoFill = () => {
+        const tall = asset.aspectRatio === '9:16';
+        const logoPosition = tall ? 'left-[12%] top-[34%] h-[17%] w-[76%]' : 'left-[18%] top-[34%] h-[25%] w-[64%]';
+        const reverse = config.direction === 'right-to-left';
+        return <div className="absolute inset-0 overflow-hidden">
+            <div className="absolute left-[7%] top-[9%] font-mono text-[6px] font-bold tracking-[.24em]" style={{ color: `${preset.foreground}66` }}>BRAND SYSTEM / LOADING</div>
+            <div className={`absolute ${logoPosition}`}>
+                {config.logoSrc ? <img src={config.logoSrc} alt={config.brandName} className="absolute inset-0 h-full w-full object-contain opacity-[.12]" /> : <div className="absolute inset-0 flex items-center justify-center text-[28px] font-black tracking-[-.08em] opacity-[.12]" style={{ color: preset.foreground }}>{config.brandName}</div>}
+            </div>
+            <div className={`hyperframe-preview-logo-mask absolute ${logoPosition} ${reverse ? 'hyperframe-preview-logo-mask--reverse' : ''}`}>
+                {config.logoSrc ? <img src={config.logoSrc} alt="" className="absolute inset-0 h-full w-full object-contain" /> : <div className="absolute inset-0 flex items-center justify-center text-[28px] font-black tracking-[-.08em]" style={{ color: preset.foreground }}>{config.brandName}</div>}
+            </div>
+            <div className={`hyperframe-preview-logo-cursor absolute ${tall ? 'left-[12%] top-[31%] h-[23%] w-[76%]' : 'left-[18%] top-[31%] h-[31%] w-[64%]'} ${reverse ? 'hyperframe-preview-logo-cursor--reverse' : ''}`}><span className="absolute right-0 top-0 h-full w-px" style={{ backgroundColor: `${preset.accentAlt}cc`, boxShadow: `0 0 10px ${preset.accentAlt}` }} /></div>
+            <div className={`absolute ${tall ? 'bottom-[22%]' : 'bottom-[18%]'} left-1/2 -translate-x-1/2 text-center`}>
+                <div className="hyperframe-preview-logo-percent font-mono text-[13px] font-black tabular-nums" style={{ color: preset.foreground }} />
+                <div className="mt-1 text-[6px] font-bold tracking-[.2em]" style={{ color: preset.muted }}>{config.label}</div>
+            </div>
+            <div className="absolute bottom-[9%] left-[7%] right-[7%] h-px" style={{ backgroundColor: `${preset.foreground}1f` }}><span className={`hyperframe-preview-logo-progress absolute top-0 h-px ${reverse ? 'right-0' : 'left-0'}`} style={{ backgroundColor: preset.foreground }} /></div>
+        </div>;
+    };
+    const renderOriginalLibraryAsset = () => {
+        const tall = asset.aspectRatio === '9:16';
+        if (asset.assetType === 'stacked-bars') {
+            const categories = config.categories || ['Q1', 'Q2', 'Q3', 'Q4'];
+            const series = config.series || [];
+            const totals = categories.map((_, categoryIndex) => series.reduce((sum, item) => sum + (Number(item.values?.[categoryIndex]) || 0), 0));
+            const maxTotal = Math.max(1, ...totals);
+            const colors = [accent, alt, `${foreground}9c`, `${preset.muted}aa`];
+            return <div className="absolute inset-0"><div className={`absolute ${tall ? 'left-[11%] top-[10%] w-[78%]' : 'left-[9%] top-[20%] w-[39%]'}`}><div className="text-[7px] font-bold tracking-[.14em]" style={{ color: accent }}>{config.eyebrow}</div><div className="mt-2 text-[13px] font-black leading-tight" style={{ color: foreground }}>{config.headline}</div><div className="mt-2 text-[7px] leading-snug" style={{ color: `${foreground}a8` }}>{config.detail}</div><div className="mt-2 text-[10px] font-black" style={{ color: accent }}>{config.metric}</div></div><div className={`absolute flex items-end justify-around gap-2 border-b ${tall ? 'bottom-[12%] left-[14%] h-[48%] w-[72%]' : 'bottom-[17%] right-[9%] h-[61%] w-[47%]'}`} style={{ borderColor: `${foreground}45` }}>{categories.map((category, categoryIndex) => <div key={`${category}-${categoryIndex}`} className="flex h-full flex-1 flex-col items-center justify-end"><div className="flex w-[70%] flex-col-reverse overflow-hidden rounded-t-md" style={{ height: `${Math.max(28, totals[categoryIndex] / maxTotal * 86)}%` }}>{series.map((item, seriesIndex) => { const value = Number(item.values?.[categoryIndex]) || 0; const ratio = value / Math.max(1, totals[categoryIndex]); return <span key={`${item.label}-${seriesIndex}`} className="hyperframe-preview-bar block w-full" style={{ height: `${ratio * 100}%`, minHeight: 3, backgroundColor: colors[seriesIndex % colors.length], '--bar-delay': `${-(categoryIndex * .18 + seriesIndex * .11)}s` }} />; })}</div><span className="mt-1 text-[6px] font-bold" style={{ color: `${foreground}9c` }}>{category}</span></div>)}</div></div>;
+        }
+        if (['pulse-radar', 'rank-ladder', 'tide-heatmap', 'constellation'].includes(asset.assetType)) {
+            const visual = asset.assetType === 'pulse-radar'
+                ? <div className={`hyperframe-preview-radar absolute rounded-full border-[8px] ${tall ? 'left-[27%] top-[18%] h-[48%] w-[46%]' : 'right-[13%] top-[19%] h-[56%] w-[31%]'}`} style={{ borderColor: `${foreground}26`, borderTopColor: accent, borderRightColor: alt }}><div className="hyperframe-preview-radar-core absolute inset-[25%] rounded-[28%]" style={{ backgroundColor: `${accent}55` }} /></div>
+                : asset.assetType === 'rank-ladder'
+                    ? <div className={`absolute ${tall ? 'inset-x-[18%] bottom-[16%] flex h-[54%] items-end gap-2' : 'bottom-[18%] right-[12%] flex h-[54%] w-[48%] items-end gap-2'}`}>{[42, 64, 88].map((height, index) => <span key={height} className="hyperframe-preview-rank flex-1 rounded-t-lg" style={{ height: `${height}%`, backgroundColor: index === 2 ? accent : `${alt}${index ? 'cc' : '88'}`, '--rank-delay': `${index * -0.22}s` }} />)}</div>
+                    : asset.assetType === 'tide-heatmap'
+                        ? <div className={`absolute grid grid-cols-7 gap-1.5 ${tall ? 'inset-x-[16%] bottom-[18%]' : 'bottom-[22%] right-[11%] w-[51%]'}`}>{Array.from({ length: 28 }, (_, index) => <span key={index} className="hyperframe-preview-heat aspect-square rounded" style={{ backgroundColor: index % 5 === 0 ? accent : index % 3 === 0 ? `${alt}cc` : `${foreground}20`, '--heat-delay': `${index * -0.07}s` }} />)}</div>
+                        : <div className={`absolute border-b border-l ${tall ? 'bottom-[19%] left-[17%] h-[48%] w-[66%]' : 'bottom-[21%] right-[11%] h-[53%] w-[51%]'}`} style={{ borderColor: `${foreground}55` }}>{[[8,82],[20,70],[31,62],[44,48],[58,42],[69,28],[83,15],[55,75]].map(([left, bottom], index) => <span key={index} className="hyperframe-preview-point absolute h-2.5 w-2.5 rounded-full" style={{ left: `${left}%`, bottom: `${bottom}%`, backgroundColor: index === 7 ? accent : alt, '--point-delay': `${index * -0.18}s` }} />)}</div>;
+            return <div className="absolute inset-0"><div className={`absolute ${tall ? 'left-[11%] top-[12%] w-[76%]' : 'left-[10%] top-[27%] w-[40%]'}`}><div className="text-[7px] font-bold tracking-[.14em]" style={{ color: accent }}>{config.eyebrow}</div><div className="mt-2 text-[13px] font-black leading-tight" style={{ color: foreground }}>{config.headline}</div><div className="mt-2 text-[7px] leading-snug" style={{ color: `${foreground}a8` }}>{config.detail}</div><div className="mt-3 text-[10px] font-black" style={{ color: accent }}>{config.metric}</div></div>{visual}</div>;
+        }
+        if (asset.assetType === 'aster-orbit') return <div className="absolute inset-0"><div className={`hyperframe-preview-orbit absolute rounded-full border-[7px] ${tall ? 'left-[26%] top-[20%] h-[42%] w-[48%]' : 'right-[12%] top-[19%] h-[54%] w-[30%]'}`} style={{ borderColor: `${foreground}24`, borderTopColor: accent, borderRightColor: accent }} /><div className={`hyperframe-preview-metric absolute text-center ${tall ? 'left-[29%] top-[35%] w-[42%]' : 'right-[9%] top-[39%] w-[36%]'}`}><div className="text-lg font-black" style={{ color: foreground }}>{config.headline}</div><div className="text-[8px] font-bold" style={{ color: accent }}>{config.metric}</div></div><div className={`absolute ${tall ? 'left-[13%] top-[70%] w-[74%]' : 'left-[11%] top-[31%] w-[46%]'}`}><div className="text-[7px] font-bold tracking-[.14em]" style={{ color: accent }}>{config.eyebrow}</div><div className="mt-2 text-[10px] font-extrabold leading-tight" style={{ color: foreground }}>{config.detail}</div></div></div>;
+        if (asset.assetType === 'harbor-cascade') return <div className={`absolute ${tall ? 'inset-x-[16%] top-[16%] space-y-3' : 'inset-x-[12%] bottom-[20%] flex items-end gap-2'}`}>{[36, 58, 45, 75].map((value, index) => <div key={index} className={`hyperframe-preview-bar rounded-md ${tall ? 'h-7' : 'flex-1'}`} style={{ height: tall ? undefined : `${value}px`, width: tall ? `${value}%` : undefined, backgroundColor: index === 3 ? accent : `${alt}${['99', 'cc', '88'][index % 3]}`, '--bar-delay': `${index * -0.15}s` }} />)}<div className={`font-black ${tall ? 'pt-2 text-lg' : 'ml-2 text-sm'}`} style={{ color: foreground }}>{config.metric}</div></div>;
+        if (['aperture-open', 'aperture-close', 'margin-note', 'folded-proof'].includes(asset.assetType)) return <div className="absolute inset-0"><div className={`hyperframe-preview-paper absolute rounded-[28px] ${tall ? 'right-[10%] top-[5%] h-[84%] w-[27%]' : 'right-[13%] top-[-19%] h-[138%] w-[22%]'}`} style={{ backgroundColor: `${alt}64`, transform: 'rotate(-18deg)' }} /><div className={`hyperframe-preview-copy absolute ${tall ? 'left-[12%] top-[24%] w-[72%]' : 'left-[12%] top-[27%] w-[60%]'}`}><div className="hyperframe-preview-rule h-1 w-12 rounded-full" style={{ backgroundColor: accent }} /><div className="mt-3 text-[7px] font-bold tracking-[.15em]" style={{ color: accent }}>{config.eyebrow}</div><div className="mt-2 text-[13px] font-black leading-tight" style={{ color: foreground }}>{config.headline}</div><div className="mt-2 text-[7px] leading-snug" style={{ color: `${foreground}a8` }}>{config.detail}</div>{asset.assetType === 'folded-proof' && <div className="hyperframe-preview-proof mt-3 rounded-md px-2 py-1 text-[7px] font-black" style={{ backgroundColor: `${preset.surface}ee`, color: accent }}>{config.secondary}</div>}</div></div>;
+        return <div className="hyperframe-preview-caption absolute inset-x-[10%] top-[30%] rounded-xl border p-3" style={{ backgroundColor: `${preset.background}e8`, borderColor: `${foreground}45` }}><div className="text-[7px] font-bold tracking-[.14em]" style={{ color: accent }}>{config.eyebrow}</div><div className="mt-2 text-[12px] font-black leading-tight" style={{ color: foreground }}>{config.headline}</div><div className="hyperframe-preview-caption-detail mt-2 text-[8px] font-medium" style={{ color: asset.assetType === 'dual-rail' ? alt : `${foreground}a8` }}>{config.detail}</div></div>;
+    };
+    if (asset.assetType === 'generated-scene') return (
+        <div className={`hyperframe-asset-preview relative overflow-hidden ${stageMode ? 'rounded-none border-0' : 'rounded-xl border border-white/10'} ${className}`} style={{ backgroundColor: preset.background }} aria-label={`${asset.nameZh} AI 原創動態預覽`}>
+            <GeneratedScenePreview config={config} palette={preset} />
+            {!stageMode && <div className="absolute right-3 top-2 z-50 rounded-full border border-white/10 bg-black/45 px-1.5 py-0.5 font-mono text-[6px] tracking-[0.12em] text-white/60">NEW SCENE</div>}
+            {!stageMode && <div className="absolute bottom-2 left-3 z-50 rounded bg-black/45 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">AI 原創 · {config.elements.length} 圖層</div>}
+            {!stageMode && <div className="absolute bottom-2 right-3 z-50 rounded border border-white/10 bg-black/40 px-1.5 py-0.5 font-mono text-[7px] font-bold text-white/70">{asset.aspectRatio || '16:9'}</div>}
+        </div>
+    );
+    if (asset.assetType === 'brand-transition') return (
+        <div className={`hyperframe-asset-preview relative overflow-hidden ${stageMode ? 'rounded-none border-0' : 'rounded-xl border border-white/10'} ${className}`} style={{ backgroundColor: preset.background }} aria-label={`${asset.nameZh} 動態預覽`}>
+            {renderBrandTransition()}
+            {!stageMode && <div className="absolute right-3 top-2 z-20 rounded-full border border-white/10 bg-black/40 px-1.5 py-0.5 font-mono text-[6px] tracking-[0.12em] text-white/60">{catalogLabel}</div>}
+            {!stageMode && <div className="absolute bottom-2 left-3 z-20 rounded bg-black/45 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">品牌轉場</div>}
+            {!stageMode && <div className="absolute bottom-2 right-3 z-20 rounded border border-white/10 bg-black/40 px-1.5 py-0.5 font-mono text-[7px] font-bold text-white/70">{asset.aspectRatio || '16:9'}</div>}
+        </div>
+    );
+    if (asset.assetType === 'logo-fill') return (
+        <div className={`hyperframe-asset-preview relative overflow-hidden ${stageMode ? 'rounded-none border-0' : 'rounded-xl border border-black/10'} ${className}`} style={{ backgroundColor: preset.background }} aria-label={`${asset.nameZh} 動態預覽`}>
+            {renderLogoFill()}
+        </div>
+    );
     return (
-        <div className={`hyperframe-asset-preview relative overflow-hidden rounded-xl border border-white/10 ${className}`} style={{ backgroundColor: preset.background, '--hyperframe-accent': preset.accent, '--hyperframe-alt': preset.accentAlt, '--hyperframe-foreground': preset.foreground }} aria-label={`${asset.nameZh} 動態預覽`}>
+        <div className={`hyperframe-asset-preview relative overflow-hidden ${stageMode ? 'rounded-none border-0' : 'rounded-xl border border-white/10'} ${className}`} style={{ backgroundColor: preset.background, '--hyperframe-accent': preset.accent, '--hyperframe-alt': preset.accentAlt, '--hyperframe-foreground': preset.foreground }} aria-label={`${asset.nameZh} 動態預覽`}>
             <div className="hyperframe-asset-glow absolute -right-6 -top-8 h-28 w-28 rounded-full blur-2xl" style={{ backgroundColor: `${preset.accent}55` }} />
-            <div className="absolute right-3 top-2 z-10 rounded-full border border-white/10 bg-black/20 px-1.5 py-0.5 font-mono text-[6px] tracking-[0.12em] text-white/50">{catalogLabel}</div>
+            {!stageMode && <div className="absolute right-3 top-2 z-10 rounded-full border border-white/10 bg-black/20 px-1.5 py-0.5 font-mono text-[6px] tracking-[0.12em] text-white/50">{catalogLabel}</div>}
             {asset.assetType === 'world-map' && renderWorldMap()}
             {asset.assetType === 'world-flow' && renderWorldMap(true)}
             {['data-chart', 'flowchart', 'release-roadmap'].includes(asset.assetType) && renderDiagram()}
             {['console', 'code-diff', 'code-typing', 'neon-code'].includes(asset.assetType) && renderCodeWindow()}
             {['app-showcase', 'device-reveal', 'liquid-glass'].includes(asset.assetType) && renderProduct()}
             {['social-follow', 'news-ticker', 'caption-highlight'].includes(asset.assetType) && renderSocialOrText()}
-            <div className="absolute bottom-2 left-3 rounded bg-black/35 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">{asset.category}</div>
+            {['stacked-bars', 'aster-orbit', 'harbor-cascade', 'pulse-radar', 'rank-ladder', 'tide-heatmap', 'constellation', 'aperture-open', 'aperture-close', 'margin-note', 'folded-proof', 'echo-caption', 'dual-rail'].includes(asset.assetType) && renderOriginalLibraryAsset()}
+            {!stageMode && <div className="absolute bottom-2 left-3 rounded bg-black/35 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-white/80">{asset.category}</div>}
+            {!stageMode && <div className="absolute bottom-2 right-3 rounded border border-white/10 bg-black/25 px-1.5 py-0.5 font-mono text-[7px] font-bold text-white/70">{asset.aspectRatio || '16:9'}</div>}
         </div>
     );
 }
@@ -1922,6 +2212,14 @@ function HyperframeAssetParameterEditor({ asset, value, onChange }) {
     if (type === 'social-follow') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">社群卡內容</div>{label('帳號', <input value={config.handle} onChange={(event) => set({ handle: event.target.value })} className={inputClass} />)}{label('按鈕文字', <input value={config.cta} onChange={(event) => set({ cta: event.target.value })} className={inputClass} />)}</div>;
     if (type === 'news-ticker') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">跑馬燈內容</div>{label('前綴', <input value={config.prefix} onChange={(event) => set({ prefix: event.target.value })} className={inputClass} />)}{label('訊息', <textarea value={config.message} onChange={(event) => set({ message: event.target.value })} className={`${inputClass} h-16 resize-y`} />)}</div>;
     if (type === 'caption-highlight') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">字幕內容</div>{label('一般文字', <input value={config.line} onChange={(event) => set({ line: event.target.value })} className={inputClass} />)}{label('高亮文字', <input value={config.highlight} onChange={(event) => set({ highlight: event.target.value })} className={inputClass} />)}</div>;
+    if (type === 'generated-scene') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="flex items-center justify-between"><div className="text-[11px] font-bold text-violet-100">AI 空白畫布場景</div><span className="rounded bg-cyan-300/10 px-1.5 py-0.5 text-[9px] text-cyan-100">{config.elements.length} 圖層</span></div><p className="text-[9px] leading-4 text-gray-400">每個圖層與關鍵影格都是本次提示新產生，沒有引用素材庫版型。</p>{config.elements.map((element, index) => <div key={element.id} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="mb-1.5 flex items-center justify-between text-[9px]"><span className="font-bold text-gray-200">{element.name}</span><span className="font-mono text-gray-500">{element.type} · {element.keyframes.length} poses</span></div>{element.type === 'text' && <input value={element.text} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, text: event.target.value } : item) })} className={inputClass} />}{element.type === 'image' && <input value={element.src} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, src: event.target.value } : item) })} className={inputClass} />}<div className="mt-1.5 grid grid-cols-3 gap-1"><input type="number" aria-label={`${element.name} X`} value={element.x} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, x: Number(event.target.value) } : item) })} className={inputClass} /><input type="number" aria-label={`${element.name} Y`} value={element.y} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, y: Number(event.target.value) } : item) })} className={inputClass} /><input aria-label={`${element.name} 顏色`} value={element.fill} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, fill: event.target.value } : item) })} className={inputClass} /></div></div>)}</div>;
+    if (type === 'brand-transition') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">品牌轉場編排</div>{label('品牌名稱', <input value={config.brandName} onChange={(event) => set({ brandName: event.target.value })} className={inputClass} />)}{label('Logo 圖檔網址', <input value={config.logoSrc} onChange={(event) => set({ logoSrc: event.target.value })} className={inputClass} />)}{label('品牌標語', <input value={config.tagline} onChange={(event) => set({ tagline: event.target.value })} className={inputClass} />)}<div className="grid grid-cols-2 gap-2">{label('進場', <select value={config.entrance} onChange={(event) => set({ entrance: event.target.value })} className={inputClass}><option value="diagonal-slices">斜切片段</option><option value="split-panels">雙面板夾入</option><option value="shutter">快門切入</option><option value="radial-burst">放射爆發</option></select>)}{label('Logo 揭露', <select value={config.reveal} onChange={(event) => set({ reveal: event.target.value })} className={inputClass}><option value="slice-assemble">切片重組</option><option value="mask-scan">掃描揭露</option><option value="scale-punch">縮放衝擊</option><option value="stroke-flash">輪廓閃現</option></select>)}{label('離場', <select value={config.exit} onChange={(event) => set({ exit: event.target.value })} className={inputClass}><option value="slash-wipe">斜線擦除</option><option value="split-away">分割退場</option><option value="glitch-cut">故障切斷</option><option value="iris">光圈收束</option></select>)}{label('方向', <select value={config.direction} onChange={(event) => set({ direction: event.target.value })} className={inputClass}><option value="left-to-right">由左到右</option><option value="right-to-left">由右到左</option><option value="top-to-bottom">由上到下</option><option value="bottom-to-top">由下到上</option></select>)}</div><div className="grid grid-cols-2 gap-2">{label('切片數', <input type="number" min="3" max="9" value={config.sliceCount} onChange={(event) => set({ sliceCount: Number(event.target.value) })} className={inputClass} />)}{label('斜切角度', <input type="number" min="-35" max="35" value={config.angle} onChange={(event) => set({ angle: Number(event.target.value) })} className={inputClass} />)}{label('動態強度', <input type="number" min="20" max="100" value={config.intensity} onChange={(event) => set({ intensity: Number(event.target.value) })} className={inputClass} />)}{label('Logo 尺寸', <input type="number" min="28" max="78" value={config.logoScale} onChange={(event) => set({ logoScale: Number(event.target.value) })} className={inputClass} />)}</div></div>;
+    if (type === 'logo-fill') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">Logo 填滿動畫</div>{label('品牌名稱', <input value={config.brandName} onChange={(event) => set({ brandName: event.target.value })} className={inputClass} />)}{label('Logo 圖檔網址', <input value={config.logoSrc} onChange={(event) => set({ logoSrc: event.target.value })} className={inputClass} />)}<p className="text-[9px] leading-4 text-gray-500">Facebook 等社群頁面不是圖片網址；請使用 PNG、SVG 或 WebP 的直接網址。ProArt 字樣已預載。</p>{label('下方文字', <input value={config.label} onChange={(event) => set({ label: event.target.value })} className={inputClass} />)}<div className="grid grid-cols-2 gap-2">{label('開始百分比', <input type="number" min="0" max="99" value={config.startPercent} onChange={(event) => set({ startPercent: Number(event.target.value) })} className={inputClass} />)}{label('結束百分比', <input type="number" min="1" max="100" value={config.endPercent} onChange={(event) => set({ endPercent: Number(event.target.value) })} className={inputClass} />)}</div>{label('填滿方向', <select value={config.direction} onChange={(event) => set({ direction: event.target.value })} className={inputClass}><option value="left-to-right">由左到右</option><option value="right-to-left">由右到左</option></select>)}</div>;
+    if (type === 'stacked-bars') {
+        const updateSeries = (index, patch) => set({ series: config.series.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) });
+        return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">堆疊直條圖資料</div>{label('章節／標籤', <input value={config.eyebrow} onChange={(event) => set({ eyebrow: event.target.value })} className={inputClass} />)}{label('主標', <input value={config.headline} onChange={(event) => set({ headline: event.target.value })} className={inputClass} />)}{label('補充文字', <textarea value={config.detail} onChange={(event) => set({ detail: event.target.value })} className={`${inputClass} h-16 resize-y`} />)}{label('數字／次標', <input value={config.metric} onChange={(event) => set({ metric: event.target.value })} className={inputClass} />)}{label('X 軸標籤（逗號分隔）', <input value={config.categories.join(', ')} onChange={(event) => set({ categories: event.target.value.split(/[,，]/).map(item => item.trim()).filter(Boolean) })} className={inputClass} />)}<div className="space-y-2 rounded-xl border border-white/10 bg-black/20 p-2">{config.series.map((item, index) => <div key={index} className="grid grid-cols-[.8fr_1.2fr] gap-2">{label(`系列 ${index + 1}`, <input value={item.label} onChange={(event) => updateSeries(index, { label: event.target.value })} className={inputClass} />)}{label('數值（逗號分隔）', <input value={item.values.join(', ')} onChange={(event) => updateSeries(index, { values: event.target.value.split(/[,，]/).map(value => Number(value.trim()) || 0) })} className={inputClass} />)}</div>)}</div></div>;
+    }
+    if (['aster-orbit', 'harbor-cascade', 'pulse-radar', 'rank-ladder', 'tide-heatmap', 'constellation', 'aperture-open', 'aperture-close', 'margin-note', 'folded-proof', 'echo-caption', 'dual-rail'].includes(type)) return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">原創素材內容</div>{label('章節／標籤', <input value={config.eyebrow} onChange={(event) => set({ eyebrow: event.target.value })} className={inputClass} />)}{label('主標', <input value={config.headline} onChange={(event) => set({ headline: event.target.value })} className={inputClass} />)}{label(type === 'dual-rail' ? '第二語言／輔助句' : '補充文字', <textarea value={config.detail} onChange={(event) => set({ detail: event.target.value })} className={`${inputClass} h-16 resize-y`} />)}{label('數字／次標', <input value={config.metric} onChange={(event) => set({ metric: event.target.value })} className={inputClass} />)}</div>;
     return null;
 }
 
@@ -2066,6 +2364,7 @@ export default function App() {
         () => getCanvasDimensions(settings.resolution, settings.aspectRatio),
         [settings.resolution, settings.aspectRatio]
     );
+    const contentAspectRatio = canvasDimensions.isPortrait ? '9:16' : '16:9';
     // A vertical edit needs a fundamentally different workspace: keeping a tall
     // monitor in the middle starves the timeline.  Shorts therefore uses the
     // left monitor + centre asset browser arrangement instead of the long-form
@@ -2128,6 +2427,12 @@ export default function App() {
     const [browserTutorialStatus, setBrowserTutorialStatus] = useState('');
     const [agentEditRequestStatus, setAgentEditRequestStatus] = useState(null);
     const [aiEditorPrompt, setAiEditorPrompt] = useState('');
+    const [aiDesignMode, setAiDesignMode] = useState('video');
+    const [aiMaterialPrompt, setAiMaterialPrompt] = useState('');
+    const [aiMaterialRatioMode, setAiMaterialRatioMode] = useState('both');
+    const [aiMaterialBusy, setAiMaterialBusy] = useState(false);
+    const [aiMaterialDraft, setAiMaterialDraft] = useState([]);
+    const [aiMaterialStatus, setAiMaterialStatus] = useState('');
     const [aiEditorListening, setAiEditorListening] = useState(false);
     const [aiEditorVoiceStatus, setAiEditorVoiceStatus] = useState('');
     const [aiEditorProviderStatus, setAiEditorProviderStatus] = useState({
@@ -2140,6 +2445,7 @@ export default function App() {
     const aiEditorRecognitionRef = useRef(null);
     const aiEditorVoiceBaseRef = useRef('');
     const aiEditorPlanAbortRef = useRef(null);
+    const workspaceDirectoryRef = useRef(null);
     const [aiEditorElapsedSeconds, setAiEditorElapsedSeconds] = useState(0);
     const [aiEditorMessages, setAiEditorMessages] = useState(() => [{
         role: 'assistant',
@@ -2741,7 +3047,15 @@ export default function App() {
                 hyperframeTemplateId: defaults.templateId || prev.motionDesign?.hyperframeTemplateId || DEFAULT_MOTION_DESIGN.hyperframeTemplateId,
                 cardDuration: defaults.cardDuration || prev.motionDesign?.cardDuration || DEFAULT_MOTION_DESIGN.cardDuration,
                 enabled: defaults.designEnabled === false ? false : prev.motionDesign?.enabled,
-                aiAutoEnabled: defaults.designEnabled === false ? false : prev.motionDesign?.aiAutoEnabled
+                aiAutoEnabled: defaults.designEnabled === false ? false : prev.motionDesign?.aiAutoEnabled,
+                manualCards: (prev.motionDesign?.manualCards || []).map(card => {
+                    const asset = HYPERFRAME_ASSETS.find(item => item.id === card?.assetId);
+                    if (!asset || asset.aspectRatio !== defaults.aspectRatio) return card;
+                    return {
+                        ...card,
+                        layout: { x: 0, y: 0, w: 100, h: 100, opacity: card?.layout?.opacity ?? 100 }
+                    };
+                })
             }
         }));
     }, [setProjectState]);
@@ -2804,7 +3118,7 @@ export default function App() {
         subtitleHidden: [false, false],
         audioMuted: false,
         bgmMuted: false,
-        videoHidden: [false, false, false],
+        videoHidden: Array(12).fill(false),
         designHidden: false
     });
 
@@ -2814,6 +3128,13 @@ export default function App() {
     const motionDesign = useMemo(
         () => getMotionDesignSettings(projectState.motionDesign),
         [projectState.motionDesign]
+    );
+    const visibleHyperframeAssets = useMemo(
+        () => [
+            ...((motionDesign.generatedAssets || []).filter(asset => (asset.aspectRatio || '16:9') === contentAspectRatio)),
+            ...HYPERFRAME_ASSETS.filter(asset => (asset.aspectRatio || '16:9') === contentAspectRatio)
+        ],
+        [contentAspectRatio, motionDesign.generatedAssets]
     );
     const motionDesignFallbackTitle = useMemo(() => (
         projectState.articleTopic
@@ -2826,8 +3147,9 @@ export default function App() {
         [motionDesign, motionDesignFallbackTitle]
     );
     const motionDesignLayers = useMemo(
-        () => trackState.designHidden ? [] : getMotionDesignLayers({ design: motionDesign, time: currentTime, duration: totalDuration, subtitles: projectState.subtitles }),
-        [motionDesign, currentTime, totalDuration, projectState.subtitles, trackState.designHidden]
+        () => trackState.designHidden ? [] : getMotionDesignLayers({ design: motionDesign, time: currentTime, duration: totalDuration, subtitles: projectState.subtitles })
+            .filter(layer => !projectState.visualTrackMeta?.[Math.max(0, Number(layer.visualTrackIndex) || 0)]?.hidden),
+        [motionDesign, currentTime, totalDuration, projectState.subtitles, projectState.visualTrackMeta, trackState.designHidden]
     );
 
     const [selectedIds, setSelectedIds] = useState([]);
@@ -2887,10 +3209,10 @@ export default function App() {
         const outroDuration = Math.min(totalDuration, motionDesign.outroDuration);
 
         if (introEnabled && introDuration > 0) {
-            items.push({ id: 'design-intro', kind: 'intro', startAt: 0, endAt: introDuration, label: '片頭 · Intro' });
+            items.push({ id: 'design-intro', kind: 'intro', trackIndex: 0, visualTrackIndex: 0, startAt: 0, endAt: introDuration, label: '片頭 · Intro' });
         }
         if (outroEnabled && outroDuration > 0) {
-            items.push({ id: 'design-outro', kind: 'outro', startAt: Math.max(0, totalDuration - outroDuration), endAt: totalDuration, label: '片尾 · Outro' });
+            items.push({ id: 'design-outro', kind: 'outro', trackIndex: 0, visualTrackIndex: 0, startAt: Math.max(0, totalDuration - outroDuration), endAt: totalDuration, label: '片尾 · Outro' });
         }
         if (autoEnabled && motionDesign.includeLowerThird && !narrationLedEdit) {
             projectState.subtitles
@@ -2899,6 +3221,8 @@ export default function App() {
                 .forEach(sub => items.push({
                     id: `design-auto-card-${sub.id}`,
                     kind: 'auto-card',
+                    trackIndex: 0,
+                    visualTrackIndex: Math.max(0, Number(sub.visualTrackIndex) || 0),
                     startAt: sub.startAt,
                     endAt: Math.min(sub.endAt, sub.startAt + motionDesign.cardDuration),
                     label: `AI 字卡 · ${sub.text}`
@@ -2910,6 +3234,8 @@ export default function App() {
             items.push({
                 id: card.id,
                 kind: asset ? 'content' : 'card',
+                trackIndex: Math.max(0, Number(card.trackIndex) || 0),
+                visualTrackIndex: Math.max(0, Number(card.visualTrackIndex) || 0),
                 startAt: card.startAt,
                 endAt: card.endAt,
                 label: asset ? `Contents · ${asset.nameZh}` : `字卡 · ${card.text}`
@@ -2927,25 +3253,36 @@ export default function App() {
         () => selectedDesignTimelineItem ? motionDesign.manualCards.find(card => card.id === selectedDesignTimelineItem.id) || null : null,
         [motionDesign.manualCards, selectedDesignTimelineItem]
     );
+    const designTrackIndexes = useMemo(
+        () => Array.from({ length: Math.max(1, motionDesign.designTrackCount || 1) }, (_, index) => index),
+        [motionDesign.designTrackCount]
+    );
+    const visualTrackIndexes = useMemo(
+        () => projectState.tracks.map((_, index) => index).reverse(),
+        [projectState.tracks]
+    );
     const selectedTimelineTrackKey = useMemo(() => {
         const primarySelectedId = selectedIds[0];
         if (!primarySelectedId) return null;
 
         for (let trackIndex = 0; trackIndex < SUBTITLE_TRACKS.length; trackIndex += 1) {
             if ((subtitlesByTrack[trackIndex] || []).some(item => item.id === primarySelectedId)) {
-                return `subtitle-${trackIndex}`;
+                const selectedSubtitle = (subtitlesByTrack[trackIndex] || []).find(item => item.id === primarySelectedId);
+                return `visual-${Math.max(0, Number(selectedSubtitle?.visualTrackIndex) || 0)}`;
             }
             if ((subtitleTransitionsByTrack[trackIndex] || []).some(item => item.id === primarySelectedId)) {
-                return `subtitle-${trackIndex}`;
+                const selectedTransition = (subtitleTransitionsByTrack[trackIndex] || []).find(item => item.id === primarySelectedId);
+                return `visual-${Math.max(0, Number(selectedTransition?.visualTrackIndex) || 0)}`;
             }
         }
-        if (designTimelineItems.some(item => item.id === primarySelectedId)) return 'design';
-        for (let trackIndex = 0; trackIndex < 3; trackIndex += 1) {
+        const selectedDesignItem = designTimelineItems.find(item => item.id === primarySelectedId);
+        if (selectedDesignItem) return `visual-${Math.max(0, Number(selectedDesignItem.visualTrackIndex) || 0)}`;
+        for (let trackIndex = 0; trackIndex < projectState.tracks.length; trackIndex += 1) {
             if ((projectState.tracks[trackIndex] || []).some(item => item.id === primarySelectedId)) {
-                return `video-${trackIndex}`;
+                return `visual-${trackIndex}`;
             }
             if ((projectState.videoTransitions?.[trackIndex] || []).some(item => item.id === primarySelectedId)) {
-                return `video-${trackIndex}`;
+                return `visual-${trackIndex}`;
             }
         }
         for (let trackIndex = 0; trackIndex < 2; trackIndex += 1) {
@@ -2967,6 +3304,132 @@ export default function App() {
     const getTimelineTrackStyle = (trackKey, expandedHeight) => ({
         height: `${isTimelineTrackExpanded(trackKey) ? expandedHeight : 32}px`
     });
+    const getVisualTrackStyle = (trackIndex) => ({
+        height: `${selectedTimelineTrackKey === `visual-${trackIndex}`
+            ? Math.max(72, Number(projectState.visualTrackMeta?.[trackIndex]?.height) || 32)
+            : 32}px`
+    });
+    const addVisualTrack = useCallback(() => {
+        setProjectState(prev => {
+            if ((prev.tracks || []).length >= 12) return prev;
+            const nextIndex = (prev.tracks || []).length;
+            return {
+                ...prev,
+                tracks: [...(prev.tracks || []), []],
+                videoTransitions: [...(prev.videoTransitions || []), []],
+                visualTrackMeta: [
+                    ...(prev.visualTrackMeta || []),
+                    { id: `visual-track-${Date.now()}`, name: `V${nextIndex + 1}`, height: 32, hidden: false, locked: false }
+                ]
+            };
+        });
+    }, [setProjectState]);
+    const updateVisualTrackMeta = useCallback((trackIndex, patch) => {
+        setProjectState(prev => ({
+            ...prev,
+            visualTrackMeta: (prev.visualTrackMeta || []).map((meta, index) => index === trackIndex ? { ...meta, ...patch } : meta)
+        }));
+    }, [setProjectState]);
+    const handleVisualTrackHeightMouseDown = useCallback((event, trackIndex) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const startY = event.clientY;
+        const startHeight = Math.max(32, Number(projectStateRef.current.visualTrackMeta?.[trackIndex]?.height) || 32);
+        const handleMove = moveEvent => {
+            const height = Math.max(32, Math.min(180, startHeight + moveEvent.clientY - startY));
+            setProjectState(prev => ({
+                ...prev,
+                visualTrackMeta: (prev.visualTrackMeta || []).map((meta, index) => index === trackIndex ? { ...meta, height } : meta)
+            }), { recordHistory: false });
+        };
+        const handleUp = () => {
+            window.removeEventListener('mousemove', handleMove);
+            window.removeEventListener('mouseup', handleUp);
+        };
+        window.addEventListener('mousemove', handleMove);
+        window.addEventListener('mouseup', handleUp);
+    }, [setProjectState]);
+    const reorderVisualTrack = useCallback((trackIndex, direction) => {
+        setProjectState(prev => {
+            const targetIndex = trackIndex + direction;
+            if (targetIndex < 0 || targetIndex >= prev.tracks.length) return prev;
+            const swap = (items) => {
+                const next = [...items];
+                [next[trackIndex], next[targetIndex]] = [next[targetIndex], next[trackIndex]];
+                return next;
+            };
+            const remap = value => value === trackIndex ? targetIndex : value === targetIndex ? trackIndex : value;
+            return {
+                ...prev,
+                tracks: swap(prev.tracks),
+                videoTransitions: swap(prev.videoTransitions || prev.tracks.map(() => [])),
+                visualTrackMeta: swap(prev.visualTrackMeta || prev.tracks.map((_, index) => ({ id: `visual-track-${index + 1}`, name: `V${index + 1}`, height: 32 }))),
+                subtitles: prev.subtitles.map(sub => ({ ...sub, visualTrackIndex: remap(Math.max(0, Number(sub.visualTrackIndex) || 0)) })),
+                subtitleTransitions: (prev.subtitleTransitions || []).map(item => ({ ...item, visualTrackIndex: remap(Math.max(0, Number(item.visualTrackIndex) || 0)) })),
+                motionDesign: {
+                    ...(prev.motionDesign || {}),
+                    manualCards: (prev.motionDesign?.manualCards || []).map(card => ({ ...card, visualTrackIndex: remap(Math.max(0, Number(card.visualTrackIndex) || 0)) }))
+                }
+            };
+        });
+    }, [setProjectState]);
+    const moveVisualTrackTo = useCallback((fromIndex, toIndex) => {
+        setProjectState(prev => {
+            if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= prev.tracks.length || toIndex >= prev.tracks.length) return prev;
+            const move = (items) => {
+                const next = [...items];
+                const [moved] = next.splice(fromIndex, 1);
+                next.splice(toIndex, 0, moved);
+                return next;
+            };
+            const remap = oldIndex => {
+                if (oldIndex === fromIndex) return toIndex;
+                if (fromIndex < toIndex && oldIndex > fromIndex && oldIndex <= toIndex) return oldIndex - 1;
+                if (fromIndex > toIndex && oldIndex >= toIndex && oldIndex < fromIndex) return oldIndex + 1;
+                return oldIndex;
+            };
+            return {
+                ...prev,
+                tracks: move(prev.tracks),
+                videoTransitions: move(prev.videoTransitions || prev.tracks.map(() => [])),
+                visualTrackMeta: move(prev.visualTrackMeta || prev.tracks.map((_, index) => ({ id: `visual-track-${index + 1}`, name: `V${index + 1}`, height: 32 }))),
+                subtitles: prev.subtitles.map(sub => ({ ...sub, visualTrackIndex: remap(Math.max(0, Number(sub.visualTrackIndex) || 0)) })),
+                subtitleTransitions: (prev.subtitleTransitions || []).map(item => ({ ...item, visualTrackIndex: remap(Math.max(0, Number(item.visualTrackIndex) || 0)) })),
+                motionDesign: {
+                    ...(prev.motionDesign || {}),
+                    manualCards: (prev.motionDesign?.manualCards || []).map(card => ({ ...card, visualTrackIndex: remap(Math.max(0, Number(card.visualTrackIndex) || 0)) }))
+                }
+            };
+        });
+    }, [setProjectState]);
+    const removeVisualTrack = useCallback((trackIndex) => {
+        setProjectState(prev => {
+            if (prev.tracks.length <= 1 || trackIndex < 0 || trackIndex >= prev.tracks.length) return prev;
+            const targetOldIndex = trackIndex === 0 ? 1 : trackIndex - 1;
+            const targetNewIndex = targetOldIndex > trackIndex ? targetOldIndex - 1 : targetOldIndex;
+            const removedClips = prev.tracks[trackIndex] || [];
+            const removedTransitions = prev.videoTransitions?.[trackIndex] || [];
+            const tracks = prev.tracks.filter((_, index) => index !== trackIndex).map(track => [...track]);
+            const videoTransitions = (prev.videoTransitions || prev.tracks.map(() => []))
+                .filter((_, index) => index !== trackIndex)
+                .map(track => [...track]);
+            tracks[targetNewIndex] = [...tracks[targetNewIndex], ...removedClips];
+            videoTransitions[targetNewIndex] = [...videoTransitions[targetNewIndex], ...removedTransitions];
+            const remap = oldIndex => oldIndex === trackIndex ? targetNewIndex : oldIndex > trackIndex ? oldIndex - 1 : oldIndex;
+            return {
+                ...prev,
+                tracks,
+                videoTransitions,
+                visualTrackMeta: (prev.visualTrackMeta || []).filter((_, index) => index !== trackIndex),
+                subtitles: prev.subtitles.map(sub => ({ ...sub, visualTrackIndex: remap(Math.max(0, Number(sub.visualTrackIndex) || 0)) })),
+                subtitleTransitions: (prev.subtitleTransitions || []).map(item => ({ ...item, visualTrackIndex: remap(Math.max(0, Number(item.visualTrackIndex) || 0)) })),
+                motionDesign: {
+                    ...(prev.motionDesign || {}),
+                    manualCards: (prev.motionDesign?.manualCards || []).map(card => ({ ...card, visualTrackIndex: remap(Math.max(0, Number(card.visualTrackIndex) || 0)) }))
+                }
+            };
+        });
+    }, [setProjectState]);
     const updateManualDesignCard = useCallback((cardId, patch) => {
         setProjectState(prev => ({
             ...prev,
@@ -3004,7 +3467,7 @@ export default function App() {
         width: `${isShortsEditingWorkspace ? Math.min(leftPanelWidth, 340) : leftPanelWidth}px`
     };
     const workspaceInspectorClass = isShortsEditingWorkspace
-        ? 'order-3 shrink-0 bg-gray-800 border-l border-gray-700 flex flex-col z-10 shadow-xl'
+        ? 'col-start-4 row-start-1 min-h-0 shrink-0 bg-gray-800 border-l border-gray-700 flex flex-col z-10 shadow-xl'
         : 'shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-10 shadow-xl';
     const [libraryTab, setLibraryTab] = useState('hyperframes');
     const [mediaLibraryVisibleCount, setMediaLibraryVisibleCount] = useState(80);
@@ -3016,11 +3479,16 @@ export default function App() {
         const text = manualCardText.trim() || String(subtitleAtPlayhead?.text || '').trim() || '輸入這段影片的重點';
         const startAt = Math.max(0, Number(currentTime.toFixed(2)));
         const endAt = Number(Math.max(startAt + 0.5, Math.min(totalDuration || startAt + motionDesign.cardDuration, startAt + motionDesign.cardDuration)).toFixed(2));
+        const availableTrackIndex = designTrackIndexes.find(trackIndex => !(motionDesign.manualCards || []).some(card => (
+            (Number(card.trackIndex) || 0) === trackIndex && Number(card.startAt) < endAt && Number(card.endAt) > startAt
+        ))) ?? 0;
         const newCard = {
             id: `manual_card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             text,
             creator: motionDesign.creator,
             presetId,
+            trackIndex: availableTrackIndex,
+            visualTrackIndex: Math.max(0, projectState.tracks.length - 1),
             startAt,
             endAt,
             layout: { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 }
@@ -3034,20 +3502,30 @@ export default function App() {
             }
         }));
         setManualCardText('');
-    }, [currentTime, manualCardText, motionDesign.cardDuration, motionDesign.creator, motionDesign.presetId, projectState.subtitles, setProjectState, totalDuration]);
+    }, [currentTime, designTrackIndexes, manualCardText, motionDesign.cardDuration, motionDesign.creator, motionDesign.manualCards, motionDesign.presetId, projectState.subtitles, projectState.tracks.length, setProjectState, totalDuration]);
     const addHyperframeAsset = useCallback((asset) => {
+        const assetAspectRatio = asset.aspectRatio || '16:9';
+        if (assetAspectRatio !== settings.aspectRatio) return;
         const startAt = Math.max(0, Number(currentTime.toFixed(2)));
         const duration = Math.max(0.8, Math.min(10, Number(asset.duration) || 4));
         const endAt = Number(Math.max(startAt + 0.5, Math.min(totalDuration || startAt + duration, startAt + duration)).toFixed(2));
+        const availableTrackIndex = designTrackIndexes.find(trackIndex => !(motionDesign.manualCards || []).some(card => (
+            (Number(card.trackIndex) || 0) === trackIndex && Number(card.startAt) < endAt && Number(card.endAt) > startAt
+        ))) ?? 0;
         const newAssetLayer = {
             id: `hyperframe_asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             text: asset.nameZh,
             creator: 'HYPERFRAMES',
             presetId: asset.presetId || motionDesign.presetId,
             assetId: asset.id,
+            assetDefinition: asset.generated ? asset : undefined,
+            assetConfig: asset.config,
+            trackIndex: availableTrackIndex,
+            visualTrackIndex: Math.max(0, projectState.tracks.length - 1),
             startAt,
             endAt,
-            layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+            source: asset.generated ? 'ai-material' : 'manual',
+            layout: { x: 0, y: 0, w: 100, h: 100, opacity: 100 }
         };
         setProjectState(prev => ({
             ...prev,
@@ -3057,7 +3535,147 @@ export default function App() {
                 manualCards: [...(prev.motionDesign?.manualCards || []), newAssetLayer]
             }
         }));
-    }, [currentTime, motionDesign.presetId, setProjectState, totalDuration]);
+        setSelectedIds([newAssetLayer.id]);
+        setCurrentTime(Number((startAt + Math.min(0.2, duration * 0.08)).toFixed(2)));
+    }, [currentTime, designTrackIndexes, motionDesign.manualCards, motionDesign.presetId, projectState.tracks.length, setProjectState, settings.aspectRatio, totalDuration]);
+    const saveAiMaterialAssetsToWorkspace = useCallback(async (assets, options = {}) => {
+        const list = (Array.isArray(assets) ? assets : []).map(normalizeStoredAiMaterial).filter(Boolean);
+        if (!list.length) return false;
+        if (!('showDirectoryPicker' in window)) {
+            setAiMaterialStatus('此瀏覽器不支援寫入工作資料夾；請改用 Chromium 系瀏覽器。');
+            return false;
+        }
+        try {
+            let folder = workspaceDirectoryRef.current;
+            if (folder) {
+                const permission = typeof folder.queryPermission === 'function'
+                    ? await folder.queryPermission({ mode: 'readwrite' })
+                    : 'prompt';
+                if (permission !== 'granted' && options.promptIfMissing !== false && typeof folder.requestPermission === 'function') {
+                    const requested = await folder.requestPermission({ mode: 'readwrite' });
+                    if (requested !== 'granted') folder = null;
+                } else if (permission !== 'granted') {
+                    return false;
+                }
+            }
+            if (!folder && options.promptIfMissing !== false) {
+                folder = await window.showDirectoryPicker({ mode: 'readwrite' });
+                workspaceDirectoryRef.current = folder;
+            }
+            if (!folder) return false;
+            const materialFolder = await folder.getDirectoryHandle('OpenViscribe_AI_Materials', { create: true });
+            const baseName = String(list[0].nameZh || 'AI_Material')
+                .replace(/[（(]直式[）)]/g, '')
+                .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+                .replace(/^_+|_+$/g, '')
+                .slice(0, 48) || 'AI_Material';
+            const fileName = `${baseName}_${String(list[0].id).replace(/[^a-z0-9_-]+/gi, '-').slice(-18)}.hyperframe.json`;
+            const fileHandle = await materialFolder.getFileHandle(fileName, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(JSON.stringify({
+                kind: 'openviscribe-hyperframe-material',
+                version: 1,
+                savedAt: new Date().toISOString(),
+                assets: list
+            }, null, 2));
+            await writable.close();
+            setAiMaterialStatus(`已存到工作資料夾：OpenViscribe_AI_Materials/${fileName}`);
+            return true;
+        } catch (error) {
+            if (error?.name !== 'AbortError') {
+                setAiMaterialStatus(`儲存失敗：${String(error?.message || '無法寫入資料夾')}`);
+            }
+            return false;
+        }
+    }, []);
+    const generateAiMaterial = useCallback(async () => {
+        const prompt = aiMaterialPrompt.trim();
+        if (!prompt || aiMaterialBusy) return;
+        const referenceUrls = prompt.match(/https?:\/\/[^\s]+/gi) || [];
+        const directImageUrl = prompt.match(/https?:\/\/[^\s"'<>]+\.(?:png|jpe?g|webp|svg)(?:\?[^\s"'<>]*)?/i)?.[0] || '';
+        const resolvedPromptImage = resolveGeneratedScenePromptImage(prompt, directImageUrl);
+        const referenceHint = referenceUrls.length
+            ? `參考來源：${referenceUrls.join(', ')}。網址只用來理解或作為 image 圖層的 src，不可顯示成畫面文字。${resolvedPromptImage ? `必須在場景中使用來源圖片：${resolvedPromptImage}` : ''}`
+            : '';
+        setAiMaterialBusy(true);
+        setAiMaterialDraft([]);
+        setAiMaterialStatus(`正在請 ${articleProviderLabel}／${articleModelLabel} 從空白畫布創作圖層與關鍵影格…`);
+        const wideFallbackScene = buildProceduralScene(prompt, { imageSrc: resolvedPromptImage, aspectRatio: '16:9' });
+        const tallFallbackScene = buildProceduralScene(prompt, { imageSrc: resolvedPromptImage, aspectRatio: '9:16' });
+        const fallback = {
+            nameZh: prompt.split(/[,.!，。！\n]/)[0].replace(/https?:\/\/\S+/gi, '').trim().slice(0, 24) || 'AI 原創動態素材',
+            description: `從空白畫布依「${prompt.slice(0, 56)}」建立的新場景。`,
+            assetType: 'generated-scene',
+            duration: 4.2,
+            presetId: 'signal',
+            palette: /\brog\b|rog-brandlogo/i.test(prompt)
+                ? { background: '#050609', surface: '#15171d', foreground: '#ffffff', muted: '#858b96', accent: '#ff003c', accentAlt: '#e4002b' }
+                : { background: '#0b1020', surface: '#17233b', foreground: '#f8fafc', muted: '#9aa8bd', accent: '#5eead4', accentAlt: '#fb7185' },
+            config: { scenes: { wide: wideFallbackScene, tall: tallFallbackScene } }
+        };
+        let rawDesign = fallback;
+        let usedFallback = false;
+        const systemText = `你是 motion designer，不是模板選擇器。每次都從空白畫布創作全新的場景圖層、構圖與關鍵影格；禁止選用、模仿或提及既有素材庫骨架。輸出純 JSON，不要 Markdown。
+
+根物件：nameZh, description, narrativeReason, assetType 必須固定為 "generated-scene", duration(2.4-8), presetId(signal|editorial|creator), palette({background,surface,foreground,muted,accent,accentAlt}，全部 #RRGGBB), config({scenes:{wide,tall}})。wide 與 tall 必須分別重新構圖，不可只改比例。
+
+每個 scene：{background,designIntent,elements}。elements 需 6-16 個，由你自行決定，支援 rect,circle,text,image,line,polygon。每個 element：{id,name,type,x,y,w,h,fill,stroke,strokeWidth,radius,gradient,blendMode,shadow,text,src,objectFit,fontSize,fontWeight,letterSpacing,align,points,zIndex,keyframes}。x/y/w/h 都用畫布百分比；顏色可用 background|surface|foreground|muted|accent|accentAlt 或 #RRGGBB。gradient={type:linear|radial,angle,stops:[{at:0-1,color}]}。polygon points 使用元素內 0-100 座標。
+
+keyframes 每層 2-6 個：{at:0-1,ease:linear|out-cubic|in-cubic|in-out-cubic|out-back,x,y,w,h,scale,scaleX,scaleY,rotate,opacity,blur,clipX,clipY,radius}，只需填會改變的通道。必須設計至少三個真正的空間／遮罩／形狀動作，不能只做全體 fade。動作需有 build、主動作、可讀停留、resolve；最後姿態也是設計的一部分。文字用繁體中文。若有直接圖片網址，必須建立 image 圖層使用它。${referenceHint}`;
+        const materialUserText = `${prompt}${referenceHint ? `\n\n參考解讀：${referenceHint}` : ''}`;
+        try {
+            let raw = '';
+            if (articleProvider === 'azure' && azureChatEndpoint && azureChatKey && azureChatDeployment) {
+                const response = await fetchWithTimeout(`${azureChatEndpoint.replace(/\/+$/, '')}/openai/deployments/${azureChatDeployment}/chat/completions?api-version=2024-02-15-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'api-key': azureChatKey },
+                    body: JSON.stringify({ messages: [{ role: 'system', content: systemText }, { role: 'user', content: materialUserText }], temperature: 0.82, response_format: { type: 'json_object' } })
+                }, 30000);
+                if (!response.ok) throw new Error(`AI 素材設計 HTTP ${response.status}`);
+                raw = (await response.json()).choices?.[0]?.message?.content || '';
+            } else if (articleProvider === 'gemini' && settings.apiKey?.trim() && settings.model?.trim()) {
+                const response = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${encodeURIComponent(settings.apiKey.trim())}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contents: [{ parts: [{ text: `${systemText}\n\n使用者要求：${materialUserText}` }] }], generationConfig: { temperature: 0.82, responseMimeType: 'application/json', maxOutputTokens: 5000 } })
+                }, 30000);
+                if (!response.ok) throw new Error(`AI 素材設計 HTTP ${response.status}`);
+                raw = (await response.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
+            } else if (articleProvider === 'lmstudio' && lmStudioEndpoint && settings.lmStudioChatModel?.trim()) {
+                raw = await callLmStudioChat({ endpoint: lmStudioEndpoint, apiKey: lmStudioApiKey, model: settings.lmStudioChatModel.trim(), prompt: `${systemText}\n\n使用者要求：${materialUserText}`, temperature: 0.82, format: 'json', timeoutMs: lmStudioTimeoutMs });
+            } else if (articleProvider === 'ollama' && ollamaEndpoint && settings.ollamaChatModel?.trim()) {
+                raw = await callOllamaChat({ endpoint: ollamaEndpoint, model: settings.ollamaChatModel.trim(), prompt: `${systemText}\n\n使用者要求：${materialUserText}`, temperature: 0.82, format: 'json', think: false, numPredict: 5000, timeoutMs: ollamaTimeoutMs });
+            } else {
+                usedFallback = true;
+            }
+            if (raw) rawDesign = { ...fallback, ...parseModelJsonObject(raw) };
+        } catch (error) {
+            console.warn('AI scene generation failed; using blank-canvas procedural draft', error);
+            usedFallback = true;
+        }
+        const assets = createAiMaterialPair(rawDesign, prompt, aiMaterialRatioMode);
+        setProjectState(prev => {
+            const merged = new Map((prev.motionDesign?.generatedAssets || []).map(asset => [asset.id, asset]));
+            assets.forEach(asset => merged.set(asset.id, asset));
+            return {
+                ...prev,
+                motionDesign: {
+                    ...DEFAULT_MOTION_DESIGN,
+                    ...(prev.motionDesign || {}),
+                    generatedAssets: [...merged.values()]
+                }
+            };
+        });
+        setAiMaterialDraft(assets);
+        setAiMaterialPrompt('');
+        setAiMaterialStatus(usedFallback
+            ? '線上模型未完成；已建立本機程序式空白畫布草稿，沒有套用素材庫模板。'
+            : `已由 ${articleProviderLabel}／${articleModelLabel} 從空白畫布創作 ${assets.length} 個新場景，並加入專案素材庫。`);
+        setAiMaterialBusy(false);
+        if (workspaceDirectoryRef.current) {
+            void saveAiMaterialAssetsToWorkspace(assets, { promptIfMissing: false });
+        }
+    }, [aiMaterialBusy, aiMaterialPrompt, aiMaterialRatioMode, articleModelLabel, articleProvider, articleProviderLabel, azureChatDeployment, azureChatEndpoint, azureChatKey, lmStudioApiKey, lmStudioEndpoint, lmStudioTimeoutMs, ollamaEndpoint, ollamaTimeoutMs, saveAiMaterialAssetsToWorkspace, setProjectState, settings.apiKey, settings.lmStudioChatModel, settings.model, settings.ollamaChatModel]);
     const applyAutomaticContents = useCallback((briefOverride = '') => {
         const context = [
             briefOverride,
@@ -3065,14 +3683,15 @@ export default function App() {
             projectState.tutorialDescription,
             ...(projectState.automationScript?.steps || []).map(step => `${step.instruction || ''} ${step.expected || ''}`)
         ].join(' ').toLowerCase();
+        const catalogSuffix = settings.aspectRatio === '9:16' ? 'tall' : 'wide';
         const matchingRules = [
-            { assetId: 'hf-world-map', terms: ['global', 'world', 'region', '跨區', '全球', '地圖', '部署', '節點'], reason: '用地圖說明跨區範圍或節點關係' },
-            { assetId: 'hf-console', terms: ['console', 'terminal', 'cli', 'command', '指令', '終端機', '部署', 'health'], reason: '用終端機呈現可驗證的技術操作結果' },
-            { assetId: 'hf-code-diff', terms: ['diff', 'pr', 'release', '版本', '差異', '程式碼'], reason: '用差異視圖說明程式變更' },
-            { assetId: 'hf-data-chart', terms: ['metric', 'growth', 'data', 'chart', '數據', '成長', '圖表'], reason: '用圖表呈現可比較的數據' },
-            { assetId: 'hf-flowchart', terms: ['flow', 'process', 'workflow', '流程', '步驟'], reason: '用流程圖整理多步驟邏輯' },
-            { assetId: 'hf-device-reveal', terms: ['mobile', 'iphone', 'app', '手機', '行動'], reason: '用裝置畫面聚焦行動端操作' },
-            { assetId: 'hf-app-showcase', terms: ['product', 'dashboard', 'ui', '介面', '後台', '功能'], reason: '用產品畫面聚焦功能介面' }
+            ...(settings.aspectRatio === '16:9' ? [{ assetId: 'hf-world-map', terms: ['global', 'world', 'region', '跨區', '全球', '地圖', '部署', '節點'], reason: '用地圖說明跨區範圍或節點關係' }] : []),
+            { assetId: `hf-aster-orbit-${catalogSuffix}`, terms: ['metric', 'kpi', 'growth', 'data', 'chart', '數據', '成長', '圖表'], reason: '用核心指標與驅動因子聚焦數據重點' },
+            { assetId: `hf-harbor-cascade-${catalogSuffix}`, terms: ['change', 'conversion', '成本', '拆解', '轉換', '變化'], reason: '用瀑布比較拆解數字變化的原因' },
+            { assetId: `hf-pulse-radar-${catalogSuffix}`, terms: ['score', 'maturity', '評估', '能力', '成熟度'], reason: '用能力雷達呈現多面向評估' },
+            { assetId: `hf-rank-ladder-${catalogSuffix}`, terms: ['rank', '排行', '排名', 'top'], reason: '用階梯排行呈現領先差距' },
+            { assetId: `hf-tide-heatmap-${catalogSuffix}`, terms: ['weekly', 'time', 'active', '週期', '活躍', '熱度'], reason: '用熱度圖呈現週期與活躍時間' },
+            { assetId: `hf-constellation-${catalogSuffix}`, terms: ['correlation', 'relationship', '關聯', '關係', '投入'], reason: '用散點圖說明兩個變數的關係' }
         ];
         const selectedRules = matchingRules.filter(rule => rule.terms.some(term => context.includes(term))).slice(0, 2);
         const selectedAssets = selectedRules
@@ -3091,10 +3710,11 @@ export default function App() {
                 creator: `CONTENTS · ${reason}`,
                 presetId: asset.presetId || motionDesign.presetId,
                 assetId: asset.id,
+                trackIndex: Math.min(index, Math.max(0, motionDesign.designTrackCount - 1)),
                 startAt,
                 endAt: Number(Math.min(safeDuration - 1, startAt + duration).toFixed(2)),
                 source: 'auto-contents',
-                layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+                layout: { x: 0, y: 0, w: 100, h: 100, opacity: 100 }
             };
         });
         setProjectState(prev => ({
@@ -3109,11 +3729,11 @@ export default function App() {
             }
         }));
         return generatedCards.map(card => ({ assetId: card.assetId, reason: card.creator.replace('CONTENTS · ', '') }));
-    }, [motionDesign.presetId, projectState.articleTopic, projectState.automationScript?.steps, projectState.tutorialDescription, setProjectState, totalDuration]);
+    }, [motionDesign.presetId, projectState.articleTopic, projectState.automationScript?.steps, projectState.tutorialDescription, setProjectState, settings.aspectRatio, totalDuration]);
     const createDeploymentHyperframeDemo = useCallback(() => {
         const demoCards = [
-            { id: 'demo_world_map', text: '全球節點與區域流向', creator: 'DEPLOYMENT / MAP', presetId: 'signal', assetId: 'hf-world-map', startAt: 3.0, endAt: 7.5, layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 } },
-            { id: 'demo_console', text: '部署指令與健康檢查', creator: 'DEPLOYMENT / CONSOLE', presetId: 'signal', assetId: 'hf-console', startAt: 7.8, endAt: 12.2, layout: { x: 12, y: 17, w: 76, h: 66, opacity: 100 } }
+            { id: 'demo_world_map', text: '全球節點與區域流向', creator: 'DEPLOYMENT / MAP', presetId: 'signal', assetId: 'hf-world-map', trackIndex: 0, startAt: 3.0, endAt: 7.5, layout: { x: 0, y: 0, w: 100, h: 100, opacity: 100 } },
+            { id: 'demo_aster_orbit', text: '部署採用與完成率', creator: 'DEPLOYMENT / KPI', presetId: 'signal', assetId: 'hf-aster-orbit-wide', trackIndex: 0, startAt: 7.8, endAt: 12.2, layout: { x: 0, y: 0, w: 100, h: 100, opacity: 100 } }
         ];
         setProjectState(prev => ({
             ...prev,
@@ -3254,15 +3874,8 @@ export default function App() {
     const [timelineHeight, setTimelineHeight] = useState(() => getDefaultTimelineHeight());
     const [timelineZoom, setTimelineZoom] = useState(1);
     const [isResizingTimeline, setIsResizingTimeline] = useState(false);
-
-    useEffect(() => {
-        if (!isShortsEditingWorkspace || typeof window === 'undefined') return;
-        // Keep enough vertical room to read captions, graphics, picture and
-        // voice tracks together whenever the Shorts workspace is selected.
-        const available = Math.max(MIN_TIMELINE_HEIGHT, window.innerHeight - RESERVED_EDITOR_HEIGHT);
-        const preferred = Math.min(available, Math.max(360, Math.round(window.innerHeight * 0.44)));
-        setTimelineHeight(current => Math.max(current, preferred));
-    }, [isShortsEditingWorkspace]);
+    const [timelineLabelWidth, setTimelineLabelWidth] = useState(208);
+    const [isResizingTimelineLabels, setIsResizingTimelineLabels] = useState(false);
 
     const animationRef = useRef(null);
 
@@ -3330,13 +3943,23 @@ export default function App() {
 
     const handleDeleteItem = useCallback(() => {
         if (selectedIds.length === 0) return;
+        const selectedSet = new Set(selectedIds);
         setProjectState(prev => ({
             ...prev,
             tracks: prev.tracks.map(t => t.filter(c => !selectedIds.includes(c.id))),
             videoTransitions: (prev.videoTransitions || [[], [], []]).map(t => t.filter(item => !selectedIds.includes(item.id))),
             audioTracks: prev.audioTracks.map(t => t ? t.filter(a => !selectedIds.includes(a.id)) : []),
             subtitles: prev.subtitles.filter(s => !selectedIds.includes(s.id)),
-            subtitleTransitions: (prev.subtitleTransitions || []).filter(item => !selectedIds.includes(item.id))
+            subtitleTransitions: (prev.subtitleTransitions || []).filter(item => !selectedIds.includes(item.id)),
+            motionDesign: {
+                ...DEFAULT_MOTION_DESIGN,
+                ...(prev.motionDesign || {}),
+                manualCards: (prev.motionDesign?.manualCards || []).filter(card => !selectedSet.has(card.id)),
+                manualIntroEnabled: selectedSet.has('design-intro') ? false : prev.motionDesign?.manualIntroEnabled,
+                manualOutroEnabled: selectedSet.has('design-outro') ? false : prev.motionDesign?.manualOutroEnabled,
+                includeIntro: selectedSet.has('design-intro') ? false : prev.motionDesign?.includeIntro,
+                includeOutro: selectedSet.has('design-outro') ? false : prev.motionDesign?.includeOutro
+            }
         }));
         setSelectedIds([]);
     }, [selectedIds]);
@@ -3836,9 +4459,9 @@ export default function App() {
 
     const getPrimaryFrameCaptureMapping = useCallback((time, canvasWidth, canvasHeight) => {
         const activeCandidates = [];
-        [0, 1, 2].forEach(trackIdx => {
-            if (trackStateRef.current.videoHidden[trackIdx]) return;
-            (projectStateRef.current.tracks[trackIdx] || []).forEach((clip) => {
+        projectStateRef.current.tracks.forEach((track, trackIdx) => {
+            if (projectStateRef.current.visualTrackMeta?.[trackIdx]?.hidden || trackStateRef.current.videoHidden[trackIdx]) return;
+            (track || []).forEach((clip) => {
                 if (!(time >= clip.startAt && time < clip.startAt + clip.duration)) return;
                 const el = clip.type === 'video' ? videoRefs.current[clip.id] : imageRefs.current[clip.id];
                 if (!el) return;
@@ -3919,10 +4542,17 @@ export default function App() {
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = 'black';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const motionDuration = Math.max(
+            0,
+            ...projectStateRef.current.tracks.flat().map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
+            ...projectStateRef.current.audioTracks.flatMap(track => track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
+            ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0)),
+            ...(projectStateRef.current.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))
+        );
 
-        [0, 1, 2].forEach(trackIdx => {
-            if (trackStateRef.current.videoHidden[trackIdx]) return;
-            projectStateRef.current.tracks[trackIdx].forEach(clip => {
+        projectStateRef.current.tracks.forEach((track, trackIdx) => {
+            if (projectStateRef.current.visualTrackMeta?.[trackIdx]?.hidden || trackStateRef.current.videoHidden[trackIdx]) return;
+            track.forEach(clip => {
                 if (time >= clip.startAt && time < clip.startAt + clip.duration) {
                     const el = clip.type === 'video' ? videoRefs.current[clip.id] : imageRefs.current[clip.id];
                     if (el) {
@@ -3947,6 +4577,33 @@ export default function App() {
                     }
                 }
             });
+            if (!options.hideSubtitles) projectStateRef.current.subtitles.forEach(sub => {
+                const normalizedSub = normalizeSubtitle(sub);
+                if (Math.max(0, Number(normalizedSub.visualTrackIndex) || 0) !== trackIdx) return;
+                if (trackStateRef.current.subtitleHidden[normalizedSub.trackIndex]) return;
+                if (time < normalizedSub.startAt || time > normalizedSub.endAt) return;
+                const activeTransition = findActiveTransition(
+                    (projectStateRef.current.subtitleTransitions || []).filter(item => (Number.isInteger(item?.trackIndex) ? item.trackIndex : 1) === normalizedSub.trackIndex),
+                    time,
+                    normalizedSub.startAt,
+                    normalizedSub.endAt
+                );
+                const subtitleBounds = getSubtitleCanvasBounds(ctx, canvas, normalizedSub);
+                drawWithTransition(ctx, subtitleBounds, activeTransition, time, () => {
+                    drawSubtitleOnCanvas(ctx, canvas, normalizedSub);
+                });
+            });
+            if (!trackStateRef.current.designHidden) {
+                drawMotionDesignToCanvas(ctx, canvas, {
+                    design: projectStateRef.current.motionDesign,
+                    time,
+                    duration: motionDuration,
+                    subtitles: projectStateRef.current.subtitles,
+                    fallbackTitle: projectStateRef.current.articleTopic || projectStateRef.current.tutorialDescription || 'Untitled Tutorial',
+                    fallbackCreator: 'OPEN VISCRIBE',
+                    onlyVisualTrackIndex: trackIdx
+                });
+            }
         });
 
         if (includeClickRipple) {
@@ -3963,39 +4620,6 @@ export default function App() {
             });
         }
 
-        if (!options.hideSubtitles) projectStateRef.current.subtitles.forEach(sub => {
-            const normalizedSub = normalizeSubtitle(sub);
-            if (trackStateRef.current.subtitleHidden[normalizedSub.trackIndex]) return;
-            if (time >= normalizedSub.startAt && time <= normalizedSub.endAt) {
-                const activeTransition = findActiveTransition(
-                    (projectStateRef.current.subtitleTransitions || []).filter(item => (Number.isInteger(item?.trackIndex) ? item.trackIndex : 1) === normalizedSub.trackIndex),
-                    time,
-                    normalizedSub.startAt,
-                    normalizedSub.endAt
-                );
-                const subtitleBounds = getSubtitleCanvasBounds(ctx, canvas, normalizedSub);
-                drawWithTransition(ctx, subtitleBounds, activeTransition, time, () => {
-                    drawSubtitleOnCanvas(ctx, canvas, normalizedSub);
-                });
-            }
-        });
-
-        if (!trackStateRef.current.designHidden) {
-            drawMotionDesignToCanvas(ctx, canvas, {
-                design: projectStateRef.current.motionDesign,
-                time,
-                duration: Math.max(
-                    0,
-                    ...projectStateRef.current.tracks.flat().map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
-                    ...projectStateRef.current.audioTracks.flatMap(track => track || []).map(item => Number(item?.startAt || 0) + Number(item?.duration || 0)),
-                    ...projectStateRef.current.subtitles.map(item => Number(item?.endAt || 0)),
-                    ...(projectStateRef.current.motionDesign?.manualCards || []).map(item => Number(item?.endAt || 0))
-                ),
-                subtitles: projectStateRef.current.subtitles,
-                fallbackTitle: projectStateRef.current.articleTopic || projectStateRef.current.tutorialDescription || 'Untitled Tutorial',
-                fallbackCreator: 'OPEN VISCRIBE'
-            });
-        }
     }, []);
 
     const syncPlaybackElementsForTime = useCallback((targetTime, options = {}) => {
@@ -4008,7 +4632,7 @@ export default function App() {
         // muted here because their audio is already represented separately.
         let audibleVideoClipId = null;
         for (let trackIdx = projectStateRef.current.tracks.length - 1; trackIdx >= 0; trackIdx -= 1) {
-            if (trackStateRef.current.videoHidden[trackIdx]) continue;
+            if (projectStateRef.current.visualTrackMeta?.[trackIdx]?.hidden || trackStateRef.current.videoHidden[trackIdx]) continue;
             const activeClip = [...(projectStateRef.current.tracks[trackIdx] || [])]
                 .reverse()
                 .find(clip => clip?.type === 'video'
@@ -4027,7 +4651,7 @@ export default function App() {
                 if (!vEl) return;
 
                 const isActive = safeTime >= clip.startAt && safeTime < (clip.startAt + clip.duration);
-                const isHidden = trackStateRef.current.videoHidden[trackIdx];
+                const isHidden = Boolean(projectStateRef.current.visualTrackMeta?.[trackIdx]?.hidden || trackStateRef.current.videoHidden[trackIdx]);
                 const shouldMuteVideoAudio = !isActive
                     || isHidden
                     || Boolean(clip.linkedAudioId)
@@ -4818,16 +5442,16 @@ export default function App() {
             if (currentSelected.includes(a.id)) draggedItems.push({ ...a, originalTrackIdx: tIdx, itemType: 'audio' });
         }));
         projectState.subtitles.forEach(s => {
-            if (currentSelected.includes(s.id)) draggedItems.push({ ...s, itemType: 'subtitle' });
+            if (currentSelected.includes(s.id)) draggedItems.push({ ...s, originalTrackIdx: Math.max(0, Number(s.visualTrackIndex) || 0), itemType: 'subtitle' });
         });
         (projectState.videoTransitions || []).forEach((track, tIdx) => track.forEach(item => {
             if (currentSelected.includes(item.id)) draggedItems.push({ ...item, originalTrackIdx: tIdx, itemType: 'videoTransition' });
         }));
         (projectState.subtitleTransitions || []).forEach(item => {
-            if (currentSelected.includes(item.id)) draggedItems.push({ ...item, itemType: 'subtitleTransition' });
+            if (currentSelected.includes(item.id)) draggedItems.push({ ...item, originalTrackIdx: Math.max(0, Number(item.visualTrackIndex) || 0), itemType: 'subtitleTransition' });
         });
         motionDesign.manualCards.forEach(card => {
-            if (currentSelected.includes(card.id)) draggedItems.push({ ...card, itemType: 'design' });
+            if (currentSelected.includes(card.id)) draggedItems.push({ ...card, originalTrackIdx: Math.max(0, Number(card.visualTrackIndex) || 0), itemType: 'design' });
         });
 
         const primaryItem = draggedItems.find(i => i.id === item.id);
@@ -4855,7 +5479,7 @@ export default function App() {
                 const next = {
                     ...prev,
                     tracks: prev.tracks.map(t => [...t]),
-                    videoTransitions: (prev.videoTransitions || [[], [], []]).map(t => [...(t || [])]),
+                    videoTransitions: (prev.videoTransitions || prev.tracks.map(() => [])).map(t => [...(t || [])]),
                     audioTracks: prev.audioTracks.map(t => [...(t || [])]),
                     subtitles: [...prev.subtitles],
                     subtitleTransitions: [...(prev.subtitleTransitions || [])],
@@ -4876,10 +5500,10 @@ export default function App() {
 
                 if (dragData.action === 'move') {
                     let trackShift = 0;
-                    if (dragData.primaryItem.itemType === 'clip' || dragData.primaryItem.itemType === 'videoTransition') {
+                    if (['clip', 'videoTransition', 'subtitle', 'subtitleTransition', 'design'].includes(dragData.primaryItem.itemType)) {
                         const elements = document.elementsFromPoint(e.clientX, e.clientY);
-                        const trackEl = elements?.find(el => el && el.hasAttribute && el.hasAttribute('data-video-track'));
-                        if (trackEl) trackShift = parseInt(trackEl.getAttribute('data-video-track'), 10) - dragData.primaryItem.originalTrackIdx;
+                        const trackEl = elements?.find(el => el && el.hasAttribute && el.hasAttribute('data-visual-track'));
+                        if (trackEl) trackShift = parseInt(trackEl.getAttribute('data-visual-track'), 10) - dragData.primaryItem.originalTrackIdx;
                     } else if (dragData.primaryItem.itemType === 'audio') {
                         const elements = document.elementsFromPoint(e.clientX, e.clientY);
                         const trackEl = elements?.find(el => el && el.hasAttribute && el.hasAttribute('data-audio-track'));
@@ -4905,7 +5529,7 @@ export default function App() {
                     const finalDeltaTime = snappedPrimaryStart - dragData.primaryItem.startAt;
 
                     const cleanTracks = prev.tracks.map(t => t.filter(c => !draggedIds.includes(c.id)));
-                    const cleanVideoTransitions = (prev.videoTransitions || [[], [], []]).map(t => t.filter(item => !draggedIds.includes(item.id)));
+                    const cleanVideoTransitions = (prev.videoTransitions || prev.tracks.map(() => [])).map(t => t.filter(item => !draggedIds.includes(item.id)));
                     const cleanAudio = prev.audioTracks.map(t => t ? t.filter(a => !draggedIds.includes(a.id)) : []);
                     let cleanSubs = prev.subtitles.filter(s => !draggedIds.includes(s.id));
                     let cleanSubtitleTransitions = (prev.subtitleTransitions || []).filter(item => !draggedIds.includes(item.id));
@@ -4914,10 +5538,10 @@ export default function App() {
                     dragData.draggedItems.forEach(item => {
                         const newStart = Math.max(0, item.startAt + finalDeltaTime);
                         if (item.itemType === 'clip') {
-                            const newTrackIdx = Math.max(0, Math.min(2, item.originalTrackIdx + trackShift));
+                            const newTrackIdx = Math.max(0, Math.min(cleanTracks.length - 1, item.originalTrackIdx + trackShift));
                             cleanTracks[newTrackIdx].push({ ...item, startAt: newStart });
                         } else if (item.itemType === 'videoTransition') {
-                            const newTrackIdx = Math.max(0, Math.min(2, item.originalTrackIdx + trackShift));
+                            const newTrackIdx = Math.max(0, Math.min(cleanVideoTransitions.length - 1, item.originalTrackIdx + trackShift));
                             cleanVideoTransitions[newTrackIdx].push({ ...item, startAt: newStart });
                         } else if (item.itemType === 'audio') {
                             const newTrackIdx = Math.max(0, Math.min(1, item.originalTrackIdx + trackShift));
@@ -4925,12 +5549,15 @@ export default function App() {
                             cleanAudio[newTrackIdx].push({ ...item, startAt: newStart });
                         } else if (item.itemType === 'subtitle') {
                             const duration = item.endAt - item.startAt;
-                            cleanSubs.push({ ...item, startAt: newStart, endAt: newStart + duration });
+                            const newTrackIdx = Math.max(0, Math.min(cleanTracks.length - 1, item.originalTrackIdx + trackShift));
+                            cleanSubs.push({ ...item, visualTrackIndex: newTrackIdx, startAt: newStart, endAt: newStart + duration });
                         } else if (item.itemType === 'subtitleTransition') {
-                            cleanSubtitleTransitions.push({ ...item, startAt: newStart });
+                            const newTrackIdx = Math.max(0, Math.min(cleanTracks.length - 1, item.originalTrackIdx + trackShift));
+                            cleanSubtitleTransitions.push({ ...item, visualTrackIndex: newTrackIdx, startAt: newStart });
                         } else if (item.itemType === 'design') {
                             const duration = Math.max(0.2, Number(item.endAt) - Number(item.startAt));
-                            cleanDesignCards.push({ ...item, startAt: newStart, endAt: newStart + duration });
+                            const newTrackIndex = Math.max(0, Math.min(cleanTracks.length - 1, Number(item.originalTrackIdx || 0) + trackShift));
+                            cleanDesignCards.push({ ...item, visualTrackIndex: newTrackIndex, startAt: newStart, endAt: newStart + duration });
                         }
                     });
 
@@ -5126,7 +5753,7 @@ export default function App() {
         e.stopPropagation();
         if (e.button !== 0 || !layer?.manual) return;
         const layout = layer.layout || (layer.kind === 'hyperframe-asset'
-            ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+            ? { x: 0, y: 0, w: 100, h: 100, opacity: 100 }
             : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
         const rect = previewContainerRef.current.getBoundingClientRect();
         setSelectedIds([layer.id]);
@@ -5163,7 +5790,7 @@ export default function App() {
                         manualCards: (prev.motionDesign?.manualCards || []).map(card => {
                             if (card.id !== canvasDrag.id) return card;
                             const layout = card.layout || (card.assetId
-                                ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+                                ? { x: 0, y: 0, w: 100, h: 100, opacity: 100 }
                                 : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
                             const next = { ...layout };
                             if (canvasDrag.action === 'move') {
@@ -5313,6 +5940,28 @@ export default function App() {
             window.removeEventListener('mouseup', onUp);
         };
     }, [isResizingTimeline]);
+
+    useEffect(() => {
+        if (!isResizingTimelineLabels) return;
+
+        const onMove = (event) => {
+            const panelLeft = timelineLeftPanelRef.current?.getBoundingClientRect().left || 0;
+            setTimelineLabelWidth(clamp(event.clientX - panelLeft, 168, 440));
+        };
+
+        const onUp = () => setIsResizingTimelineLabels(false);
+
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        return () => {
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+        };
+    }, [isResizingTimelineLabels]);
 
     const captureUiDebugFrames = async (targetTimes) => {
         const allVideoClips = projectState.tracks
@@ -10906,7 +11555,9 @@ ${JSON.stringify(subtitlePayload)}
         try {
             setWorkspaceScanStatus('正在掃描工作資料夾…');
             const folder = await window.showDirectoryPicker({ mode: 'read' });
+            workspaceDirectoryRef.current = folder;
             const entries = [];
+            const materialEntries = [];
             let skippedEntries = 0;
             const walk = async (directory) => {
                 try {
@@ -10916,6 +11567,10 @@ ${JSON.stringify(subtitlePayload)}
                             if (entry.kind === 'directory') {
                                 await walk(entry);
                             } else if (entry.kind === 'file') {
+                                if (String(entry.name || '').toLowerCase().endsWith('.hyperframe.json')) {
+                                    materialEntries.push(entry);
+                                    continue;
+                                }
                                 // Filter by file name first.  This avoids opening every
                                 // unrelated file in a large work drive during discovery.
                                 if (getImportedMediaType({ name: entry.name, type: '' }) !== 'unknown') {
@@ -10931,18 +11586,49 @@ ${JSON.stringify(subtitlePayload)}
                 }
             };
             await walk(folder);
-            if (!entries.length) {
-                setWorkspaceScanStatus('找不到可用的影片、圖片或音訊檔。');
+            const importedMaterials = [];
+            for (const entry of materialEntries) {
+                try {
+                    const file = await entry.getFile();
+                    const parsed = JSON.parse(await file.text());
+                    const candidates = Array.isArray(parsed?.assets) ? parsed.assets : Array.isArray(parsed) ? parsed : [parsed?.asset || parsed];
+                    candidates.forEach((asset, index) => {
+                        const normalized = normalizeStoredAiMaterial(asset, index);
+                        if (normalized) importedMaterials.push(normalized);
+                    });
+                } catch (error) {
+                    skippedEntries += 1;
+                }
+            }
+            if (importedMaterials.length) {
+                setProjectState(prev => {
+                    const currentAssets = prev.motionDesign?.generatedAssets || [];
+                    const merged = new Map(currentAssets.map(asset => [asset.id, asset]));
+                    importedMaterials.forEach(asset => merged.set(asset.id, asset));
+                    return {
+                        ...prev,
+                        motionDesign: {
+                            ...DEFAULT_MOTION_DESIGN,
+                            ...(prev.motionDesign || {}),
+                            generatedAssets: [...merged.values()]
+                        }
+                    };
+                });
+            }
+            if (!entries.length && !importedMaterials.length) {
+                setWorkspaceScanStatus('找不到可用的影片、圖片、音訊或 HyperFrames 素材檔。');
                 return;
             }
-            setWorkspaceScanStatus(`找到 ${entries.length} 個媒體，正在建立外接素材索引…`);
-            const { assets: imported, unreadableCount } = await addWorkspaceHandlesToMediaLibrary(entries, {
-                selectNewAssets: false,
-                onProgress: (processed, total, importedCount) => setWorkspaceScanStatus(`正在建立外接素材索引… ${processed}/${total}（已可用 ${importedCount} 個）`)
-            });
+            setWorkspaceScanStatus(`找到 ${entries.length} 個媒體與 ${importedMaterials.length} 組 AI 動態素材，正在建立索引…`);
+            const { assets: imported, unreadableCount } = entries.length
+                ? await addWorkspaceHandlesToMediaLibrary(entries, {
+                    selectNewAssets: false,
+                    onProgress: (processed, total, importedCount) => setWorkspaceScanStatus(`正在建立外接素材索引… ${processed}/${total}（已可用 ${importedCount} 個）`)
+                })
+                : { assets: [], unreadableCount: 0 };
             const ignoredCount = skippedEntries + unreadableCount;
             setMediaLibraryVisibleCount(80);
-            setWorkspaceScanStatus(`已索引 ${imported.length} 個外接素材；檔案保留在原資料夾，不會複製到瀏覽器資料庫。${ignoredCount ? `略過 ${ignoredCount} 個無法讀取的項目。` : ''}`);
+            setWorkspaceScanStatus(`已索引 ${imported.length} 個外接媒體，並載入 ${importedMaterials.length} 組 AI 動態素材。${ignoredCount ? `略過 ${ignoredCount} 個無法讀取的項目。` : ''}`);
             setAiEditorMessages(prev => [...prev, {
                 role: 'assistant',
                 text: `工作資料夾已掃描完成，已建立 ${imported.length} 個外接素材索引。告訴我影片用途或直接說「幫我自動剪輯」，我會先提出剪輯方案。`
@@ -10953,7 +11639,7 @@ ${JSON.stringify(subtitlePayload)}
                 setWorkspaceScanStatus('掃描工作資料夾失敗，請再試一次。');
             }
         }
-    }, [addWorkspaceHandlesToMediaLibrary]);
+    }, [addWorkspaceHandlesToMediaLibrary, setProjectState]);
 
     const toggleAiEditorVoiceInput = useCallback(() => {
         const runningRecognition = aiEditorRecognitionRef.current;
@@ -11662,7 +12348,7 @@ ${JSON.stringify(subtitlePayload)}
         if (payload.kind === 'transition') {
             const newTransition = createTimelineTransitionItem(payload, dropTime);
             setProjectState(prev => {
-                const nextTransitions = [...(prev.videoTransitions || [[], [], []])];
+                const nextTransitions = [...(prev.videoTransitions || prev.tracks.map(() => []))];
                 nextTransitions[trackIndex] = [...(nextTransitions[trackIndex] || []), newTransition];
                 return { ...prev, videoTransitions: nextTransitions };
             });
@@ -12470,6 +13156,7 @@ ${JSON.stringify(subtitlePayload)}
                             creator: 'HYPERFRAMES',
                             presetId: input.presetId || requestedAsset.presetId,
                             assetId: requestedAsset.id,
+                            visualTrackIndex: Math.max(0, prev.tracks.length - 1),
                             startAt,
                             endAt,
                             assetConfig: getHyperframeAssetConfig(requestedAsset, input.assetConfig)
@@ -12659,7 +13346,14 @@ ${JSON.stringify(subtitlePayload)}
                 </div>
             </header>
 
-            <div className="flex flex-1 overflow-hidden relative">
+            <div
+                className={`flex-1 min-h-0 overflow-hidden ${isShortsEditingWorkspace ? 'grid' : 'flex flex-col'}`}
+                style={isShortsEditingWorkspace ? {
+                    gridTemplateColumns: `${clamp(leftPanelWidth, 320, 400)}px 8px minmax(420px, 1fr) auto`,
+                    gridTemplateRows: `minmax(0, 1fr) 8px ${timelineHeight}px`
+                } : undefined}
+            >
+            <div className={isShortsEditingWorkspace ? 'contents' : 'flex flex-1 overflow-hidden relative'}>
 
                 {isMultiSelect && !hasOnlySubtitleSelection ? (
                     <div style={workspaceInspectorStyle} className={workspaceInspectorClass}>
@@ -13831,14 +14525,14 @@ ${JSON.stringify(subtitlePayload)}
                 )}
 
                 <div
-                    className={`group relative w-2 shrink-0 cursor-col-resize bg-gray-800/70 transition hover:bg-blue-500/30 ${isShortsEditingWorkspace ? 'order-2 border-l border-gray-700/80' : 'border-r border-gray-700/80'} ${isResizingLeftPanel ? 'bg-blue-500/40' : ''}`}
+                    className={`group relative w-2 shrink-0 cursor-col-resize bg-gray-800/70 transition hover:bg-blue-500/30 ${isShortsEditingWorkspace ? 'col-start-2 row-start-1 row-span-3 border-r border-gray-700/80' : 'border-r border-gray-700/80'} ${isResizingLeftPanel ? 'bg-blue-500/40' : ''}`}
                     onMouseDown={() => setIsResizingLeftPanel(true)}
                     title="拖拉調整左側面板寬度"
                 >
                     <div className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-gray-500/80 group-hover:bg-blue-300" />
                 </div>
 
-                <div className={`${isShortsEditingWorkspace ? 'order-0 w-[360px] max-w-[32vw] shrink-0 flex-none border-r border-gray-700 p-4' : 'flex-1 p-8'} bg-[#12141A] flex flex-col items-center justify-center relative min-w-0 min-h-0`}>
+                <div className={`${isShortsEditingWorkspace ? 'col-start-1 row-start-1 row-span-3 h-full w-full p-4' : 'flex-1 p-8'} bg-[#12141A] flex flex-col items-center justify-center relative min-w-0 min-h-0`}>
 
                     {aiLoading && aiProgress && (
                         <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-[2500] min-w-[320px] max-w-[520px] text-white px-5 py-3 rounded-2xl shadow-2xl text-sm space-y-2 border pointer-events-auto ${activeTaskAccent.panel}`}>
@@ -13887,7 +14581,7 @@ ${JSON.stringify(subtitlePayload)}
 
                     <div
                         ref={previewContainerRef}
-                        className={`bg-black rounded-lg shadow-2xl overflow-hidden relative border border-gray-800 ${isShortsEditingWorkspace ? 'shrink min-h-0' : canvasDimensions.isPortrait || canvasDimensions.isSquare ? 'shrink-0' : 'w-full max-w-4xl'}`}
+                        className={`bg-black rounded-lg shadow-2xl overflow-hidden relative border border-gray-800 ${isShortsEditingWorkspace ? 'shrink min-h-0 max-h-full' : canvasDimensions.isPortrait || canvasDimensions.isSquare ? 'shrink-0' : 'w-full max-w-4xl'}`}
                         style={{ ...previewCanvasStyle, containerType: 'inline-size' }}
                     >
                         {isRecording && (
@@ -13908,7 +14602,7 @@ ${JSON.stringify(subtitlePayload)}
                             track.map(rawClip => {
                                 const clip = normalizeClipItem(rawClip);
                                 const isActive = currentTime >= clip.startAt && currentTime < (clip.startAt + clip.duration);
-                                const isHidden = trackState.videoHidden[trackIndex];
+                                const isHidden = Boolean(projectState.visualTrackMeta?.[trackIndex]?.hidden || trackState.videoHidden[trackIndex]);
                                 const isSelected = selectedIds.includes(clip.id);
                                 const activeTransitionForClip = findActiveTransition(
                                     projectState.videoTransitions?.[trackIndex],
@@ -13927,7 +14621,7 @@ ${JSON.stringify(subtitlePayload)}
                                             display: !isRecording && isActive && !isHidden ? 'block' : 'none',
                                             left: `${layout.x}%`, top: `${layout.y}%`,
                                             width: `${layout.w}%`, height: `${layout.h}%`,
-                                            zIndex: trackIndex === 0 ? 10 : (trackIndex === 1 ? 100 : 1000),
+                                            zIndex: 10 + trackIndex * 100,
                                             ...buildTransitionPreviewStyle(activeTransitionForClip, currentTime)
                                         }}
 
@@ -13968,17 +14662,18 @@ ${JSON.stringify(subtitlePayload)}
                             })
                         )}
 
-                        {projectState.tracks.flat().length === 0 && (
+                        {projectState.tracks.flat().length === 0 && motionDesignLayers.length === 0 && (
                             <div className="absolute inset-0 text-gray-600 flex flex-col items-center justify-center z-0">
                                 <MonitorPlay size={48} className="mb-4 opacity-20" />
                                 <p>點擊右上角「開始錄影」擷取操作畫面</p>
                             </div>
                         )}
 
-                        <div className="absolute inset-0 z-[1600]">
+                        <div className="absolute inset-0 pointer-events-none">
                             {projectState.subtitles.map(rawSub => {
                                 const sub = normalizeSubtitle(rawSub);
                                 if (trackState.subtitleHidden[sub.trackIndex]) return null;
+                                if (projectState.visualTrackMeta?.[Math.max(0, Number(sub.visualTrackIndex) || 0)]?.hidden) return null;
                                 const isSelected = selectedIds.includes(sub.id);
                                 const activeTransitionForSub = findActiveTransition(
                                     (projectState.subtitleTransitions || []).filter(item => (Number.isInteger(item?.trackIndex) ? item.trackIndex : 1) === sub.trackIndex),
@@ -13990,6 +14685,7 @@ ${JSON.stringify(subtitlePayload)}
                                     const subtitleStyle = {
                                         left: `${sub.x}%`,
                                         top: `${sub.y}%`,
+                                        zIndex: 60 + Math.max(0, Number(sub.visualTrackIndex) || 0) * 100,
                                         // Subtitle sizes are stored in output-canvas pixels.
                                         // Scale them to the responsive preview instead of
                                         // rendering a 56px export font as 56 CSS pixels.
@@ -14023,18 +14719,20 @@ ${JSON.stringify(subtitlePayload)}
                             const layerPreset = getMotionDesignPreset(layer.presetId || motionDesign.presetId);
                             const layerCreator = layer.creator || motionDesignCopy.creator;
                             if (layer.kind === 'hyperframe-asset') {
-                                const asset = HYPERFRAME_ASSETS.find(item => item.id === layer.assetId);
+                                const asset = HYPERFRAME_ASSETS.find(item => item.id === layer.assetId)
+                                    || layer.assetDefinition
+                                    || (motionDesign.generatedAssets || []).find(item => item.id === layer.assetId);
                                 if (!asset) return null;
-                                const layout = layer.layout || { x: 12, y: 17, w: 76, h: 66, opacity: 100 };
+                                const layout = layer.layout || { x: 0, y: 0, w: 100, h: 100, opacity: 100 };
                                 const isSelected = layer.manual && selectedIds.includes(layer.id);
                                 return (
                                     <div
                                         key={`motion_${layer.kind}_${layer.id}`}
-                                        className="absolute z-[1725] cursor-move"
-                                        style={{ left: `${layout.x}%`, top: `${layout.y}%`, width: `${layout.w}%`, height: `${layout.h}%`, opacity: easedProgress * (1 - (layer.exitProgress || 0)) * (layout.opacity / 100), transform: `translateY(${(1 - easedProgress + (layer.exitProgress || 0)) * 32}px)` }}
+                                        className="absolute cursor-move"
+                                        style={{ zIndex: 70 + Math.max(0, Number(layer.visualTrackIndex) || 0) * 100, left: `${layout.x}%`, top: `${layout.y}%`, width: `${layout.w}%`, height: `${layout.h}%`, opacity: easedProgress * (1 - (layer.exitProgress || 0)) * (layout.opacity / 100), transform: `translateY(${(1 - easedProgress + (layer.exitProgress || 0)) * 32}px)` }}
                                         onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'move')}
                                     >
-                                        <HyperframeAssetPreview asset={asset} config={layer.assetConfig} className="h-full w-full shadow-2xl" />
+                                        <HyperframeAssetPreview asset={asset} config={layer.assetConfig} stageMode className="h-full w-full" />
                                         {isSelected && (
                                             <div className="pointer-events-none absolute inset-0 border-2 border-violet-300 shadow-[0_0_0_2px_rgba(196,181,253,0.35)]">
                                                 <div className="pointer-events-auto absolute -left-1.5 -top-1.5 h-3 w-3 cursor-nwse-resize rounded-full bg-violet-300" onMouseDown={(event) => handleMotionCanvasMouseDown(event, layer, 'resize-tl')} />
@@ -14051,8 +14749,9 @@ ${JSON.stringify(subtitlePayload)}
                                 return (
                                     <div
                                         key={`motion_${layer.kind}_${layer.text}`}
-                                        className="absolute z-[1700] cursor-move overflow-hidden rounded-xl border border-white/10 shadow-2xl"
+                                        className="absolute cursor-move overflow-hidden rounded-xl border border-white/10 shadow-2xl"
                                         style={{
+                                            zIndex: 70 + Math.max(0, Number(layer.visualTrackIndex) || 0) * 100,
                                             backgroundColor: `${layerPreset.surface}ee`,
                                             borderLeft: `6px solid ${layerPreset.accent}`,
                                             left: `${layout.x}%`,
@@ -14142,7 +14841,7 @@ ${JSON.stringify(subtitlePayload)}
                     style={{
                         width: isLibraryOpen ? (isShortsEditingWorkspace ? undefined : `${libraryWidth}px`) : '0px'
                     }}
-                    className={`${isShortsEditingWorkspace ? 'order-1 flex-1 min-w-[420px] shrink' : 'shrink-0'} bg-gray-800 border-l border-gray-700 transition-[width] duration-300 flex flex-col overflow-hidden relative z-10`}
+                    className={`${isShortsEditingWorkspace ? 'col-start-3 row-start-1 min-h-0 min-w-[420px]' : 'shrink-0'} bg-gray-800 border-l border-gray-700 transition-[width] duration-300 flex flex-col overflow-hidden relative z-10`}
                 >
                     <button
                         onClick={() => setIsLibraryOpen(!isLibraryOpen)}
@@ -14195,11 +14894,27 @@ ${JSON.stringify(subtitlePayload)}
                             <div className="rounded-2xl border border-violet-300/45 bg-gradient-to-br from-violet-500/15 via-gray-900 to-cyan-500/10 p-3 shadow-lg">
                                 <div className="flex items-start justify-between gap-2">
                                     <div className="min-w-0"><div className="flex items-center gap-2 text-xs font-bold text-violet-100"><Sparkles size={14} /> 已選取設計素材</div><div className="mt-1 truncate text-[11px] text-white">{selectedDesignTimelineItem.label}</div></div>
-                                    <span className="shrink-0 rounded bg-violet-300/15 px-1.5 py-0.5 text-[9px] font-mono text-violet-100">{selectedDesignTimelineItem.startAt.toFixed(1)}–{selectedDesignTimelineItem.endAt.toFixed(1)}s</span>
+                                    <div className="flex shrink-0 items-center gap-1">
+                                        <span className="rounded bg-violet-300/15 px-1.5 py-0.5 text-[9px] font-mono text-violet-100">{selectedDesignTimelineItem.startAt.toFixed(1)}–{selectedDesignTimelineItem.endAt.toFixed(1)}s</span>
+                                        {selectedManualDesignCard && (
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    removeManualLowerThird(selectedManualDesignCard.id);
+                                                    setSelectedIds([]);
+                                                }}
+                                                className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-red-300/25 text-red-200 transition hover:bg-red-500/25 hover:text-white"
+                                                title="從時間軸移除這個設計素材"
+                                                aria-label="移除設計素材"
+                                            >
+                                                <Trash2 size={12} />
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
                                 {selectedManualDesignCard ? (() => {
                                     const layout = selectedManualDesignCard.layout || (selectedManualDesignCard.assetId
-                                        ? { x: 12, y: 17, w: 76, h: 66, opacity: 100 }
+                                        ? { x: 0, y: 0, w: 100, h: 100, opacity: 100 }
                                         : { x: 6.5, y: 73.5, w: 53, h: 15, opacity: 100 });
                                     const updateLayout = (key, value) => updateManualDesignCard(selectedManualDesignCard.id, card => ({
                                         layout: { ...layout, [key]: Number(value) }
@@ -14209,9 +14924,20 @@ ${JSON.stringify(subtitlePayload)}
                                         <label className="block text-[10px] text-gray-400">顯示標題<input value={selectedManualDesignCard.text} onChange={(event) => updateManualDesignCard(selectedManualDesignCard.id, { text: event.target.value.slice(0, 92) })} className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white focus:border-violet-300 focus:outline-none" /></label>
                                         <label className="block text-[10px] text-gray-400">副標／來源<input value={selectedManualDesignCard.creator || ''} onChange={(event) => updateManualDesignCard(selectedManualDesignCard.id, { creator: event.target.value.slice(0, 44) })} placeholder="例如：OPEN VISCRIBE" className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white placeholder:text-gray-600 focus:border-violet-300 focus:outline-none" /></label>
                                         {selectedManualDesignCard.assetId && (() => {
-                                            const asset = HYPERFRAME_ASSETS.find(item => item.id === selectedManualDesignCard.assetId);
+                                            const asset = HYPERFRAME_ASSETS.find(item => item.id === selectedManualDesignCard.assetId)
+                                                || (motionDesign.generatedAssets || []).find(item => item.id === selectedManualDesignCard.assetId)
+                                                || selectedManualDesignCard.assetDefinition;
                                             return asset ? <HyperframeAssetParameterEditor asset={asset} value={selectedManualDesignCard.assetConfig} onChange={(assetConfig) => updateManualDesignCard(selectedManualDesignCard.id, { assetConfig })} /> : null;
                                         })()}
+                                        <label className="block text-[10px] text-gray-400">所在視覺軌
+                                            <select
+                                                value={Math.max(0, Number(selectedManualDesignCard.visualTrackIndex) || 0)}
+                                                onChange={(event) => updateManualDesignCard(selectedManualDesignCard.id, { visualTrackIndex: Number(event.target.value) })}
+                                                className="mt-1 w-full rounded-lg border border-gray-600 bg-gray-950 px-2 py-1.5 text-xs text-white focus:border-violet-300 focus:outline-none"
+                                            >
+                                                {visualTrackIndexes.map(trackIndex => <option key={trackIndex} value={trackIndex}>{projectState.visualTrackMeta?.[trackIndex]?.name || `V${trackIndex + 1}`}</option>)}
+                                            </select>
+                                        </label>
                                         <div className="grid grid-cols-2 gap-2">{[['開始秒數', selectedManualDesignCard.startAt, (value) => updateManualDesignCard(selectedManualDesignCard.id, card => { const startAt = Math.max(0, Number(value) || 0); return { startAt, endAt: startAt + Math.max(0.2, card.endAt - card.startAt) }; })], ['持續秒數', Math.max(0.2, selectedManualDesignCard.endAt - selectedManualDesignCard.startAt), (value) => updateManualDesignCard(selectedManualDesignCard.id, card => ({ endAt: card.startAt + Math.max(0.2, Math.min(60, Number(value) || 0.2)) }))]].map(([label, value, onChange]) => <label key={label} className="rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[9px] text-gray-400">{label}<input type="number" min="0" max="600" step="0.1" value={Number(Number(value).toFixed(1))} onChange={(event) => onChange(event.target.value)} className="mt-1 w-full bg-transparent text-right text-xs text-white outline-none" /></label>)}</div>
                                         <div className="grid grid-cols-2 gap-2">{[['x', '左側 %', 0, 95], ['y', '頂部 %', 0, 95], ['w', '寬度 %', 8, 100], ['h', '高度 %', 6, 100]].map(([key, label, min, max]) => <label key={key} className="rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[9px] text-gray-400">{label}<input type="number" min={min} max={max} step="0.5" value={Number(layout[key].toFixed(1))} onChange={(event) => updateLayout(key, event.target.value)} className="mt-1 w-full bg-transparent text-right text-xs text-white outline-none" /></label>)}</div>
                                         <label className="block text-[10px] text-gray-400">不透明度 <span className="float-right text-white">{Math.round(layout.opacity)}%</span><input type="range" min="15" max="100" value={layout.opacity} onChange={(event) => updateLayout('opacity', event.target.value)} className="mt-1 w-full accent-violet-400" /></label>
@@ -14364,13 +15090,18 @@ ${JSON.stringify(subtitlePayload)}
                             <div className="space-y-3">
                                 <div className="rounded-2xl border border-violet-300/25 bg-gradient-to-br from-violet-500/15 via-slate-900 to-cyan-500/10 p-4">
                                     <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2 text-sm font-semibold text-white"><Sparkles size={16} className="text-violet-200" /> Contents 動態素材庫</div><button type="button" onClick={createDeploymentHyperframeDemo} className="rounded-lg bg-violet-300 px-2 py-1.5 text-[10px] font-bold text-gray-950 hover:bg-violet-200">建立部署教學示範</button></div>
-                                    <p className="mt-1 text-[11px] leading-5 text-gray-300">每個內容素材都有清楚的敘事用途與動態預覽；可手動加入，也能依主題自動挑選最多兩個必要視覺。</p>
+                                    <p className="mt-1 text-[11px] leading-5 text-gray-300">每個內容素材都有清楚的敘事用途與動態預覽；目前依畫布顯示 <span className="font-semibold text-violet-100">{contentAspectRatio}</span> 版本。切換到 Shorts／Reels 或社群廣告工作流時，會自動改為 9:16 素材與直式安全區。</p>
                                     <button type="button" onClick={() => applyAutomaticContents()} className="mt-3 w-full rounded-xl border border-violet-200/45 bg-violet-300/10 px-3 py-2 text-left text-[11px] font-semibold text-violet-100 transition hover:bg-violet-300 hover:text-gray-950">依目前主題自動加入 Contents <span className="ml-1 font-normal opacity-80">只選有敘事理由的素材</span></button>
                                 </div>
                                 <div>
-                                    <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-violet-100"><span>動態 Contents</span><span className="rounded bg-violet-400/10 px-2 py-0.5 text-violet-200">{HYPERFRAME_ASSETS.length} 種</span></div>
-                                    <div className="grid grid-cols-2 gap-2">
-                                        {HYPERFRAME_ASSETS.map(asset => (
+                                    <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-violet-100"><span>動態 Contents</span><span className="rounded bg-violet-400/10 px-2 py-0.5 text-violet-200">{contentAspectRatio} · {visibleHyperframeAssets.length} 種</span></div>
+                                    <div
+                                        className="grid gap-2"
+                                        style={isShortsEditingWorkspace
+                                            ? { gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))' }
+                                            : { gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}
+                                    >
+                                        {visibleHyperframeAssets.map(asset => (
                                             <button key={asset.id} type="button" onClick={() => addHyperframeAsset(asset)} className="overflow-hidden rounded-xl border border-gray-700 bg-gray-950/55 p-2 text-left transition hover:border-violet-300 hover:bg-violet-500/10" title={`加入播放頭：${asset.description}`}>
                                                 <HyperframeAssetPreview asset={asset} className="h-32 w-full" />
                                                 <div className="mt-2 flex items-center justify-between gap-2"><span className="truncate text-[12px] font-semibold text-white">{asset.nameZh}</span><span className="shrink-0 rounded bg-violet-400/10 px-1.5 py-0.5 text-[9px] text-violet-100">{asset.category}</span></div>
@@ -14408,21 +15139,47 @@ ${JSON.stringify(subtitlePayload)}
                             <div className="rounded-2xl border border-fuchsia-400/25 bg-gradient-to-br from-fuchsia-500/10 via-slate-900/70 to-cyan-500/10 p-4 space-y-4">
                                 <div className="flex items-start gap-3">
                                     <div className="rounded-xl bg-fuchsia-400/15 p-2 text-fuchsia-200"><Sparkles size={18} /></div>
-                                    <div><div className="text-sm font-semibold text-white">AI 自動設計</div><div className="mt-1 text-[11px] leading-5 text-gray-300">讀取影片主題與 AI 字幕，自動套用片頭、片尾及每段 lower third。</div></div>
+                                    <div><div className="text-sm font-semibold text-white">AI 設計工作室</div><div className="mt-1 text-[11px] leading-5 text-gray-300">可以設計整支影片，也可以用自然語言生成一個新的動態素材。</div></div>
                                 </div>
-                                <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
-                                    <div><div className="flex items-center gap-2 text-sm font-semibold text-white"><Wand2 size={15} className="text-fuchsia-300" /> 啟用 AI 自動套用</div><div className="mt-1 text-[11px] text-gray-400">手動 Cards 與 Intro / Outro 不受此開關影響。</div></div>
-                                    <input type="checkbox" checked={motionDesign.aiAutoEnabled} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), enabled: e.target.checked, aiAutoEnabled: e.target.checked } }))} className="h-4 w-4 shrink-0 rounded accent-fuchsia-500" />
-                                </label>
-                                <div className="grid grid-cols-3 gap-2 text-[11px]">{[['includeIntro', '片頭'], ['includeOutro', '片尾'], ['includeLowerThird', '字卡']].map(([key, label]) => <label key={key} className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-gray-700 bg-black/20 px-2 py-2 text-gray-300"><input type="checkbox" checked={motionDesign[key] !== false} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), [key]: e.target.checked } }))} className="h-3.5 w-3.5 rounded accent-fuchsia-500" />{label}</label>)}</div>
-                                <div className="space-y-3">
-                                    {MOTION_DESIGN_PRESETS.map(preset => (
+                                <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-black/25 p-1">
+                                    <button type="button" onClick={() => setAiDesignMode('video')} className={`rounded-lg px-3 py-2 text-[11px] font-bold transition ${aiDesignMode === 'video' ? 'bg-fuchsia-500 text-white' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}>整支影片</button>
+                                    <button type="button" onClick={() => setAiDesignMode('material')} className={`rounded-lg px-3 py-2 text-[11px] font-bold transition ${aiDesignMode === 'material' ? 'bg-cyan-300 text-gray-950' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}>生成新素材</button>
+                                </div>
+                                {aiDesignMode === 'video' ? <>
+                                    <button type="button" onClick={() => setShowAiEditor(true)} className="flex w-full items-center justify-between rounded-xl border border-fuchsia-300/30 bg-fuchsia-300/10 px-3 py-2.5 text-left transition hover:bg-fuchsia-300/20"><span><span className="block text-xs font-bold text-fuchsia-100">用自然語言規劃整支影片</span><span className="mt-1 block text-[9px] text-gray-400">開啟 AI 剪輯總監，確認方案後才套用時間軸</span></span><MessageCircle size={16} className="text-fuchsia-200" /></button>
+                                    <label className="flex cursor-pointer items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
+                                        <div><div className="flex items-center gap-2 text-sm font-semibold text-white"><Wand2 size={15} className="text-fuchsia-300" /> 啟用 AI 自動套用</div><div className="mt-1 text-[11px] text-gray-400">讀取主題與字幕，自動套用片頭、片尾與字卡。</div></div>
+                                        <input type="checkbox" checked={motionDesign.aiAutoEnabled} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), enabled: e.target.checked, aiAutoEnabled: e.target.checked } }))} className="h-4 w-4 shrink-0 rounded accent-fuchsia-500" />
+                                    </label>
+                                    <div className="grid grid-cols-3 gap-2 text-[11px]">{[['includeIntro', '片頭'], ['includeOutro', '片尾'], ['includeLowerThird', '字卡']].map(([key, label]) => <label key={key} className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-gray-700 bg-black/20 px-2 py-2 text-gray-300"><input type="checkbox" checked={motionDesign[key] !== false} onChange={(e) => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), [key]: e.target.checked } }))} className="h-3.5 w-3.5 rounded accent-fuchsia-500" />{label}</label>)}</div>
+                                    <div className="space-y-3">{MOTION_DESIGN_PRESETS.map(preset => (
                                         <button key={preset.id} type="button" onClick={() => setProjectState(prev => ({ ...prev, motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(prev.motionDesign || {}), presetId: preset.id } }))} className={`flex w-full items-center gap-3 overflow-hidden rounded-xl border p-2 text-left ${motionDesign.presetId === preset.id ? 'border-fuchsia-300 bg-white/10' : 'border-gray-700 bg-black/20 hover:border-fuchsia-300/60'}`}>
                                             <DesignMotionPreview preset={preset} variant="lower-third" duration={motionDesign.cardDuration} compact="half" />
                                             <div className="min-w-0"><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: preset.swatch }} /><span className="text-xs font-semibold text-white">{preset.name}</span><span className="mt-1 block text-[10px] text-gray-400">動態預覽</span></div>
                                         </button>
-                                    ))}
-                                </div>
+                                    ))}</div>
+                                </> : <>
+                                    <div className="rounded-xl border border-cyan-300/25 bg-cyan-300/5 p-3">
+                                        <div className="flex items-center gap-2 text-sm font-semibold text-cyan-100"><Wand2 size={15} /> 自然語言素材設計器</div>
+                                        <p className="mt-1 text-[10px] leading-4 text-cyan-100/70">請描述用途、動態、文字與顏色。AI 會產生可編輯的動態素材，不是靜態圖片。</p>
+                                        <textarea value={aiMaterialPrompt} onChange={(event) => setAiMaterialPrompt(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') void generateAiMaterial(); }} placeholder="例如：設計一個暗藍色的 SaaS 轉換率圖表，數值逐步上升，中間要有掃描線，節奏俐落。" className="mt-3 h-28 w-full resize-y rounded-xl border border-cyan-300/20 bg-slate-950/75 px-3 py-2 text-xs leading-5 text-white outline-none placeholder:text-gray-600 focus:border-cyan-300" />
+                                        <label className="mt-3 block text-[10px] text-gray-400">輸出畫布
+                                            <select value={aiMaterialRatioMode} onChange={(event) => setAiMaterialRatioMode(event.target.value)} className="mt-1 w-full rounded-lg border border-gray-700 bg-slate-950 px-2 py-2 text-xs text-white outline-none focus:border-cyan-300">
+                                                <option value="both">16:9 + 9:16（建議）</option>
+                                                <option value="16:9">只產生 16:9</option>
+                                                <option value="9:16">只產生 9:16</option>
+                                            </select>
+                                        </label>
+                                        <button type="button" onClick={() => void generateAiMaterial()} disabled={!aiMaterialPrompt.trim() || aiMaterialBusy} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-300 px-3 py-2.5 text-xs font-black text-gray-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-40">{aiMaterialBusy ? <><span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-900 border-t-transparent" /> AI 設計中…</> : <><Sparkles size={14} /> 生成動態素材</>}</button>
+                                        <div className="mt-2 text-[9px] text-gray-500">使用 {articleProviderLabel}／{articleModelLabel}；未設定時會使用本機動態設計語法。</div>
+                                    </div>
+                                    {aiMaterialStatus && <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-[10px] leading-4 text-gray-300">{aiMaterialStatus}</div>}
+                                    {aiMaterialDraft.length > 0 && <div className="space-y-2 rounded-xl border border-emerald-300/25 bg-emerald-300/5 p-3">
+                                        <div className="flex items-center justify-between gap-2"><span className="text-xs font-bold text-emerald-100">剛產生的素材</span><button type="button" onClick={() => void saveAiMaterialAssetsToWorkspace(aiMaterialDraft, { promptIfMissing: true })} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200/30 px-2 py-1 text-[9px] font-bold text-emerald-100 hover:bg-emerald-300 hover:text-gray-950"><Save size={11} /> 存到工作資料夾</button></div>
+                                        <div className="grid grid-cols-2 gap-2">{aiMaterialDraft.map(asset => <div key={asset.id} className="overflow-hidden rounded-lg border border-white/10 bg-slate-950/70 p-2"><HyperframeAssetPreview asset={asset} config={asset.config} className="h-28 w-full" /><div className="mt-2 flex items-center justify-between gap-1"><span className="truncate text-[10px] font-semibold text-white">{asset.nameZh}</span><button type="button" onClick={() => addHyperframeAsset(asset)} disabled={asset.aspectRatio !== settings.aspectRatio} className="shrink-0 rounded bg-emerald-300 px-1.5 py-1 text-[9px] font-bold text-gray-950 disabled:bg-gray-700 disabled:text-gray-500">加入</button></div></div>)}</div>
+                                    </div>}
+                                    {(motionDesign.generatedAssets || []).length > 0 && <div className="rounded-xl border border-white/10 bg-black/15 p-3"><div className="text-[10px] font-semibold text-gray-300">專案已儲存的 AI 素材：{(motionDesign.generatedAssets || []).length} 個原創場景</div><p className="mt-1 text-[9px] leading-4 text-gray-500">它們也會顯示在 Contents 素材庫；掃描工作資料夾時會自動載入 .hyperframe.json。</p></div>}
+                                </>}
                             </div>
                         )}
                     </div>
@@ -14432,7 +15189,7 @@ ${JSON.stringify(subtitlePayload)}
 
             {/* --- 分隔線 (Divider) --- */}
             <div
-                className="h-2 bg-gray-800 hover:bg-blue-600 cursor-row-resize transition-all z-50 flex items-center justify-center relative border-y border-gray-700"
+                className={`${isShortsEditingWorkspace ? 'col-start-3 col-span-2 row-start-2' : ''} h-2 bg-gray-800 hover:bg-blue-600 cursor-row-resize transition-all z-50 flex items-center justify-center relative border-y border-gray-700`}
                 onMouseDown={() => setIsResizingTimeline(true)}
             >
                 <div className="pointer-events-none absolute right-4 bottom-3 z-50 flex items-center rounded-xl border border-gray-600/80 bg-gray-900/90 p-1 shadow-[0_6px_18px_rgba(0,0,0,0.35)] backdrop-blur">
@@ -14491,23 +15248,26 @@ ${JSON.stringify(subtitlePayload)}
             {/* --- 時間軸 --- */}
             <div
                 style={{ height: `${timelineHeight}px` }}
-                className="shrink-0 bg-gray-900 border-t border-gray-700 flex flex-col relative z-20"
+                className={`${isShortsEditingWorkspace ? 'col-start-3 col-span-2 row-start-3 min-w-0' : ''} shrink-0 bg-gray-900 border-t border-gray-700 flex flex-col relative z-20`}
             >
 
                 <div className="flex flex-1 overflow-hidden relative">
 
-                    <div className="w-52 flex-shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-30 shadow-lg relative select-none">
+                    <div
+                        style={{ width: `${timelineLabelWidth}px` }}
+                        className="flex-shrink-0 bg-gray-800 border-r border-gray-700 flex flex-col z-30 shadow-lg relative select-none"
+                    >
                         <div className="h-8 shrink-0 border-b border-gray-700 flex items-center px-4 font-bold text-gray-200 text-xs bg-gradient-to-r from-gray-800 via-gray-800 to-gray-700/80 backdrop-blur">
                             時間軸軌道
                         </div>
 
-                        <div ref={timelineLeftPanelRef} className="flex-1 overflow-hidden flex flex-col">
+                        <div ref={timelineLeftPanelRef} className="flex-1 overflow-y-auto overflow-x-hidden flex flex-col [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
 
                         {SUBTITLE_TRACKS.map((track, trackIndex) => (
                             <div
                                 key={track.key}
                                 style={getTimelineTrackStyle(`subtitle-${trackIndex}`, 48)}
-                                className={`shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${
+                                className={`hidden shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${
                                     activeSubtitleTrackIndex === trackIndex
                                         ? 'bg-gray-700/70 text-white shadow-[inset_3px_0_0_rgba(249,115,22,0.95)]'
                                         : 'text-gray-400 hover:bg-gray-700/40'
@@ -14575,40 +15335,107 @@ ${JSON.stringify(subtitlePayload)}
                             </div>
                         ))}
 
-                        <div style={getTimelineTrackStyle('design', 56)} className={`shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${trackState.designHidden ? 'text-gray-500' : 'bg-violet-950/20 text-violet-100 hover:bg-violet-950/35'}`}>
-                            <div className="flex h-full items-center justify-between gap-2">
-                                <div className="flex min-w-0 items-center gap-2">
-                                    <span className={`flex shrink-0 items-center justify-center rounded-md border border-violet-400/35 bg-violet-400/10 ${isTimelineTrackExpanded('design') ? 'h-7 w-7' : 'h-5 w-5'}`}>
-                                        <Sparkles size={isTimelineTrackExpanded('design') ? 14 : 11} className="text-violet-200" />
-                                    </span>
-                                    <span className="min-w-0">
-                                        <span className={`block truncate whitespace-nowrap font-semibold leading-none ${isTimelineTrackExpanded('design') ? 'text-[12px]' : 'text-[11px]'}`}>設計素材</span>
-                                        {isTimelineTrackExpanded('design') && <span className="block whitespace-nowrap text-[9px] uppercase tracking-[0.14em] text-violet-200/65">GFX · Cards · Contents</span>}
-                                    </span>
+                        {designTrackIndexes.map((designTrackIndex) => {
+                            const trackKey = `design-${designTrackIndex}`;
+                            const expanded = isTimelineTrackExpanded(trackKey);
+                            return (
+                                <div key={trackKey} style={getTimelineTrackStyle(trackKey, 56)} className={`hidden shrink-0 overflow-hidden border-b border-gray-700 px-2 text-xs transition-[height,background-color,color] duration-200 ${trackState.designHidden ? 'text-gray-500' : 'bg-violet-950/20 text-violet-100 hover:bg-violet-950/35'}`}>
+                                    <div className="flex h-full items-center justify-between gap-1.5">
+                                        <div className="flex min-w-0 items-center gap-2">
+                                            <span className={`flex shrink-0 items-center justify-center rounded-md border border-violet-400/35 bg-violet-400/10 ${expanded ? 'h-7 w-7' : 'h-5 w-5'}`}>
+                                                <Sparkles size={expanded ? 14 : 11} className="text-violet-200" />
+                                            </span>
+                                            <span className="min-w-0">
+                                                <span className={`block truncate whitespace-nowrap font-semibold leading-none ${expanded ? 'text-[12px]' : 'text-[11px]'}`}>設計 G{designTrackIndex + 1}</span>
+                                                {expanded && <span className="block whitespace-nowrap text-[9px] uppercase tracking-[0.14em] text-violet-200/65">GFX · Cards · Contents</span>}
+                                            </span>
+                                        </div>
+                                        <div className="flex shrink-0 items-center gap-1">
+                                            {designTrackIndex === 0 && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setProjectState(prev => ({
+                                                        ...prev,
+                                                        motionDesign: {
+                                                            ...DEFAULT_MOTION_DESIGN,
+                                                            ...(prev.motionDesign || {}),
+                                                            designTrackCount: Math.min(8, Math.max(1, Number(prev.motionDesign?.designTrackCount) || 1) + 1)
+                                                        }
+                                                    }))}
+                                                    disabled={designTrackIndexes.length >= 8}
+                                                    className={`flex h-6 w-6 items-center justify-center rounded-md border transition ${designTrackIndexes.length >= 8 ? 'cursor-not-allowed border-gray-700 text-gray-600' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/20'}`}
+                                                    title={designTrackIndexes.length >= 8 ? '最多 8 條設計軌' : '新增一條可疊加的設計軌'}
+                                                >
+                                                    <Plus size={13} />
+                                                </button>
+                                            )}
+                                            {designTrackIndex === 0 && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setTrackState(prev => ({ ...prev, designHidden: !prev.designHidden }))}
+                                                    className={`flex h-6 w-6 items-center justify-center rounded-md border transition ${trackState.designHidden ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/10'}`}
+                                                    title={trackState.designHidden ? '顯示所有設計素材軌' : '隱藏所有設計素材軌與輸出中的設計素材'}
+                                                >
+                                                    {trackState.designHidden ? <EyeOff size={14} /> : <Eye size={14} />}
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
                                 </div>
-                                <button
-                                    type="button"
-                                    onClick={() => setTrackState(prev => ({ ...prev, designHidden: !prev.designHidden }))}
-                                    className={`flex shrink-0 items-center justify-center rounded-md border transition ${isTimelineTrackExpanded('design') ? 'h-7 w-7' : 'h-6 w-6'} ${trackState.designHidden ? 'border-gray-600 text-gray-500 hover:border-gray-500 hover:text-gray-200' : 'border-violet-300/50 text-violet-100 hover:border-violet-200 hover:bg-violet-400/10'}`}
-                                    title={trackState.designHidden ? '顯示設計素材軌' : '隱藏設計素材軌與輸出中的設計素材'}
-                                >
-                                    {trackState.designHidden ? <EyeOff size={14} /> : <Eye size={14} />}
-                                </button>
-                            </div>
-                        </div>
+                            );
+                        })}
 
-                        {[2, 1, 0].map(i => (
-                            <div key={i} style={getTimelineTrackStyle(`video-${i}`, 64)} className="shrink-0 border-b border-gray-700 flex items-center justify-between px-3 text-xs text-gray-400 hover:bg-gray-700/50 transition-[height,background-color] duration-200">
-                                <div className="flex items-center">
-                                    {i === 0 ? <MonitorPlay size={14} className="mr-1.5 text-blue-400" /> : <FileVideo size={14} className="mr-1.5 text-blue-400" />} V{i + 1}
+                        {visualTrackIndexes.map(i => (
+                            <div
+                                key={projectState.visualTrackMeta?.[i]?.id || i}
+                                onDragOver={(event) => event.preventDefault()}
+                                onDrop={(event) => {
+                                    event.preventDefault();
+                                    const fromIndex = Number(event.dataTransfer.getData('application/x-openviscribe-track-index'));
+                                    if (Number.isInteger(fromIndex)) moveVisualTrackTo(fromIndex, i);
+                                }}
+                                style={getVisualTrackStyle(i)}
+                                className={`group relative shrink-0 border-b border-gray-700 flex items-center justify-between px-2 text-xs transition-colors ${selectedTimelineTrackKey === `visual-${i}` ? 'bg-blue-950/45 text-white' : 'text-gray-400 hover:bg-gray-700/50'}`}
+                            >
+                                <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                                    <span
+                                        draggable
+                                        onDragStart={(event) => event.dataTransfer.setData('application/x-openviscribe-track-index', String(i))}
+                                        className="shrink-0 cursor-grab text-gray-500"
+                                        title="拖曳調整軌道順序"
+                                    ><GripVertical size={13} /></span>
+                                    {i === 0 ? <MonitorPlay size={14} className="shrink-0 text-blue-400" /> : <FileVideo size={14} className="shrink-0 text-blue-400" />}
+                                    <input
+                                        value={projectState.visualTrackMeta?.[i]?.name || `V${i + 1}`}
+                                        onChange={(event) => updateVisualTrackMeta(i, { name: event.target.value })}
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        className="min-w-0 flex-1 truncate bg-transparent font-semibold text-gray-200 outline-none focus:text-white"
+                                        aria-label={`視覺軌 ${i + 1} 名稱`}
+                                    />
                                 </div>
-                                <button onClick={() => setTrackState(prev => {
-                                    const newHidden = [...prev.videoHidden];
-                                    newHidden[i] = !newHidden[i];
-                                    return { ...prev, videoHidden: newHidden };
-                                })} className="p-1 hover:text-white transition">
-                                    {trackState.videoHidden[i] ? <EyeOff size={14} /> : <Eye size={14} />}
-                                </button>
+                                <div className="flex items-center gap-1">
+                                    {i === visualTrackIndexes[visualTrackIndexes.length - 1] && (
+                                        <button type="button" onMouseDown={(event) => { event.stopPropagation(); addVisualTrack(); }} disabled={projectState.tracks.length >= 12} className="flex h-6 w-6 items-center justify-center rounded border border-blue-400/35 text-blue-200 hover:bg-blue-500/15 disabled:opacity-30" title="新增視覺軌"><Plus size={12} /></button>
+                                    )}
+                                    <button type="button" onClick={() => reorderVisualTrack(i, 1)} disabled={i >= projectState.tracks.length - 1} className="h-6 w-6 rounded border border-gray-600 text-[10px] hover:bg-gray-700 disabled:opacity-25" title="圖層上移">↑</button>
+                                    <button type="button" onClick={() => reorderVisualTrack(i, -1)} disabled={i <= 0} className="h-6 w-6 rounded border border-gray-600 text-[10px] hover:bg-gray-700 disabled:opacity-25" title="圖層下移">↓</button>
+                                    <button type="button" onClick={() => removeVisualTrack(i)} disabled={projectState.tracks.length <= 1} className="flex h-6 w-6 items-center justify-center rounded border border-gray-600 text-gray-400 hover:border-red-400/60 hover:bg-red-500/15 hover:text-red-200 disabled:opacity-25" title="移除軌道（內容會移到相鄰軌道）"><Trash2 size={11} /></button>
+                                    <button
+                                        type="button"
+                                        onClick={() => updateVisualTrackMeta(i, { hidden: !projectState.visualTrackMeta?.[i]?.hidden })}
+                                        className="flex h-6 w-6 items-center justify-center rounded border border-gray-600 hover:bg-gray-700"
+                                        title={projectState.visualTrackMeta?.[i]?.hidden ? '顯示軌道' : '隱藏軌道'}
+                                    >
+                                        {projectState.visualTrackMeta?.[i]?.hidden ? <EyeOff size={13} /> : <Eye size={13} />}
+                                    </button>
+                                </div>
+                                <div
+                                    role="separator"
+                                    aria-label={`調整${projectState.visualTrackMeta?.[i]?.name || `V${i + 1}`}高度`}
+                                    onMouseDown={(event) => handleVisualTrackHeightMouseDown(event, i)}
+                                    className="absolute -bottom-1 left-0 z-20 h-2 w-full cursor-ns-resize bg-blue-400/0 transition group-hover:bg-blue-400/35"
+                                    title="上下拖曳調整軌道高度"
+                                />
                             </div>
                         ))}
 
@@ -14627,6 +15454,29 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
 
                         </div>{/* end timelineLeftPanelRef wrapper */}
+                        <div
+                            role="separator"
+                            aria-orientation="vertical"
+                            aria-label="調整時間軸名稱欄寬度"
+                            aria-valuemin={168}
+                            aria-valuemax={440}
+                            aria-valuenow={Math.round(timelineLabelWidth)}
+                            tabIndex={0}
+                            onMouseDown={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                setIsResizingTimelineLabels(true);
+                            }}
+                            onKeyDown={(event) => {
+                                if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+                                event.preventDefault();
+                                setTimelineLabelWidth(width => clamp(width + (event.key === 'ArrowRight' ? 16 : -16), 168, 440));
+                            }}
+                            className={`group absolute inset-y-0 -right-1 z-50 w-2 cursor-col-resize outline-none ${isResizingTimelineLabels ? 'bg-blue-400/25' : ''}`}
+                            title="左右拖拉以調整時間軸名稱欄寬度"
+                        >
+                            <span className={`absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors ${isResizingTimelineLabels ? 'bg-blue-300' : 'bg-gray-500 group-hover:bg-blue-300 group-focus:bg-blue-300'}`} />
+                        </div>
                     </div>
 
                     <div className="flex-1 min-w-0 relative bg-gray-900 track-bg">
@@ -14755,7 +15605,7 @@ ${JSON.stringify(subtitlePayload)}
                                 <div
                                     key={`subtitle-track-${track.key}`}
                                     style={getTimelineTrackStyle(`subtitle-${trackIndex}`, 48)}
-                                    className={`shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackIndex === 0 ? 'bg-cyan-950/10' : 'bg-amber-950/10'} ${trackState.subtitleHidden[trackIndex] ? 'opacity-30' : ''}`}
+                                    className={`hidden shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackIndex === 0 ? 'bg-cyan-950/10' : 'bg-amber-950/10'} ${trackState.subtitleHidden[trackIndex] ? 'opacity-30' : ''}`}
                                     onDragOver={(e) => e.preventDefault()}
                                     onDrop={(e) => handleDropOnSubtitleTrack(e, trackIndex)}
                                 >
@@ -14799,13 +15649,18 @@ ${JSON.stringify(subtitlePayload)}
                                 </div>
                             ))}
 
-                            <div style={getTimelineTrackStyle('design', 56)} className={`shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackState.designHidden ? 'opacity-30' : 'bg-violet-950/15'}`}>
-                                {isTimelineTrackExpanded('design') && designTimelineItems.length === 0 ? (
+                            {designTrackIndexes.map((designTrackIndex) => {
+                                const trackKey = `design-${designTrackIndex}`;
+                                const itemsOnTrack = designTimelineItems.filter(item => (Number(item.trackIndex) || 0) === designTrackIndex);
+                                return (
+                            <div key={trackKey} data-design-track={designTrackIndex} style={getTimelineTrackStyle(trackKey, 56)} className={`hidden shrink-0 border-b border-gray-800 relative transition-[height,opacity] duration-200 ${trackState.designHidden ? 'opacity-30' : 'bg-violet-950/15'}`}>
+                                {isTimelineTrackExpanded(trackKey) && itemsOnTrack.length === 0 ? (
                                     <div className="absolute inset-0 flex items-center px-3 text-[11px] text-violet-200/50">
-                                        加入 Cards、Intro / Outro 或 Contents 後，設計素材會顯示在這條 GFX 軌道。
+                                        {designTrackIndex === 0 ? '加入 Cards、Intro / Outro 或 Contents，或把素材拖到這條設計軌。' : `把設計素材拖到 G${designTrackIndex + 1}，即可與其他軌道疊加。`}
                                     </div>
-                                ) : designTimelineItems.map(item => {
+                                ) : itemsOnTrack.map(item => {
                                     const isSelected = selectedIds.includes(item.id);
+                                    const isResizableDesignItem = motionDesign.manualCards.some(card => card.id === item.id);
                                     const classByKind = item.kind === 'content'
                                         ? 'border-cyan-300/70 bg-cyan-500/35 text-cyan-50'
                                         : item.kind === 'intro' || item.kind === 'outro'
@@ -14825,20 +15680,41 @@ ${JSON.stringify(subtitlePayload)}
                                             }}
                                             className={`timeline-item absolute top-1 bottom-1 flex items-center overflow-hidden rounded border px-2 text-left text-[10px] font-semibold shadow-sm transition hover:brightness-125 ${item.kind === 'content' || item.kind === 'card' ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} ${isSelected ? 'ring-2 ring-white/80 ring-offset-1 ring-offset-gray-900 z-20' : 'z-10'} ${classByKind}`}
                                             style={{ left: `${item.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${Math.max(14, (item.endAt - item.startAt) * pixelsPerSecond)}px` }}
-                                            title={`${item.label}｜${item.startAt.toFixed(1)}s–${item.endAt.toFixed(1)}s${item.kind === 'content' || item.kind === 'card' ? '（可拖曳調整時間）' : ''}`}
+                                            title={`${item.label}｜${item.startAt.toFixed(1)}s–${item.endAt.toFixed(1)}s${isResizableDesignItem ? '（拖曳移動；選取後拉左右兩側調整長度）' : ''}`}
                                         >
+                                            {selectedIds.length === 1 && isSelected && isResizableDesignItem && (
+                                                <div
+                                                    className="absolute inset-y-0 left-0 z-50 flex w-2.5 cursor-ew-resize items-center justify-center bg-white/10 hover:bg-white/35"
+                                                    onMouseDown={(event) => handleItemMouseDown(event, item, 'design', 0, 'resizeLeft')}
+                                                    title="向左拖曳調整開始時間與持續長度"
+                                                >
+                                                    <span className="h-4 w-0.5 rounded bg-white/85" />
+                                                </div>
+                                            )}
                                             <Sparkles size={11} className="mr-1 shrink-0 opacity-85" />
                                             <span className="truncate">{item.label}</span>
+                                            {selectedIds.length === 1 && isSelected && isResizableDesignItem && (
+                                                <div
+                                                    className="absolute inset-y-0 right-0 z-50 flex w-2.5 cursor-ew-resize items-center justify-center bg-white/10 hover:bg-white/35"
+                                                    onMouseDown={(event) => handleItemMouseDown(event, item, 'design', 0, 'resizeRight')}
+                                                    title="向右拖曳調整持續長度"
+                                                >
+                                                    <span className="h-4 w-0.5 rounded bg-white/85" />
+                                                </div>
+                                            )}
                                         </button>
                                     );
                                 })}
                             </div>
+                                );
+                            })}
 
-                            {[2, 1, 0].map(trackIndex => {
+                            {visualTrackIndexes.map(trackIndex => {
                                 const track = projectState.tracks[trackIndex];
-                                const isExpanded = isTimelineTrackExpanded(`video-${trackIndex}`);
+                                const isExpanded = selectedTimelineTrackKey === `visual-${trackIndex}`;
+                                const visualTrackHidden = Boolean(projectState.visualTrackMeta?.[trackIndex]?.hidden);
                                 return (
-                                    <div key={trackIndex} data-video-track={trackIndex} style={getTimelineTrackStyle(`video-${trackIndex}`, 64)} className={`shrink-0 border-b border-gray-800 relative bg-gray-800/20 transition-[height,opacity] duration-200 ${trackState.videoHidden[trackIndex] ? 'opacity-30' : ''}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnTrack(e, trackIndex)}>
+                                    <div key={projectState.visualTrackMeta?.[trackIndex]?.id || trackIndex} data-video-track={trackIndex} data-visual-track={trackIndex} style={getVisualTrackStyle(trackIndex)} className={`shrink-0 border-b border-gray-800 relative bg-gray-800/20 transition-[height,opacity] duration-200 ${visualTrackHidden ? 'opacity-30' : ''}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => handleDropOnTrack(e, trackIndex)}>
                                         {(projectState.videoTransitions?.[trackIndex] || []).map(item => (
                                             <div
                                                 key={item.id}
@@ -14887,6 +15763,50 @@ ${JSON.stringify(subtitlePayload)}
                                                 </div>
                                             );
                                         })}
+                                        {projectState.subtitles
+                                            .map(normalizeSubtitle)
+                                            .filter(sub => Math.max(0, Number(sub.visualTrackIndex) || 0) === trackIndex)
+                                            .map(sub => {
+                                                const isSelected = selectedIds.includes(sub.id);
+                                                const subtitleTrack = SUBTITLE_TRACKS[sub.trackIndex] || SUBTITLE_TRACKS[0];
+                                                return (
+                                                    <div
+                                                        key={sub.id}
+                                                        data-id={sub.id}
+                                                        onMouseDown={(event) => handleItemMouseDown(event, sub, 'subtitle')}
+                                                        className={`timeline-item absolute bottom-1 z-30 flex h-6 cursor-grab items-center overflow-hidden rounded border text-[10px] shadow-md active:cursor-grabbing ${isSelected ? 'border-white bg-orange-500/95 ring-1 ring-white' : sub.trackIndex === 0 ? 'border-cyan-300/70 bg-cyan-700/90' : 'border-amber-300/70 bg-amber-700/90'}`}
+                                                        style={{ left: `${sub.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${Math.max(14, (sub.endAt - sub.startAt) * pixelsPerSecond)}px` }}
+                                                        title={`${subtitleTrack.shortLabel} · ${sub.text}`}
+                                                    >
+                                                        {selectedIds.length === 1 && isSelected && <div className="absolute inset-y-0 left-0 z-50 w-2 cursor-ew-resize hover:bg-white/40" onMouseDown={(event) => handleItemMouseDown(event, sub, 'subtitle', trackIndex, 'resizeLeft')} />}
+                                                        <Type size={10} className="ml-2 mr-1 shrink-0" />
+                                                        <span className="truncate pr-2 text-white">{sub.text}</span>
+                                                        {selectedIds.length === 1 && isSelected && <div className="absolute inset-y-0 right-0 z-50 w-2 cursor-ew-resize hover:bg-white/40" onMouseDown={(event) => handleItemMouseDown(event, sub, 'subtitle', trackIndex, 'resizeRight')} />}
+                                                    </div>
+                                                );
+                                            })}
+                                        {designTimelineItems
+                                            .filter(item => Math.max(0, Number(item.visualTrackIndex) || 0) === trackIndex)
+                                            .map(item => {
+                                                const isSelected = selectedIds.includes(item.id);
+                                                const isManual = motionDesign.manualCards.some(card => card.id === item.id);
+                                                return (
+                                                    <button
+                                                        key={item.id}
+                                                        type="button"
+                                                        data-id={item.id}
+                                                        onMouseDown={(event) => isManual && handleItemMouseDown(event, item, 'design')}
+                                                        onClick={() => { setCurrentTime(item.startAt); setSelectedIds([item.id]); }}
+                                                        className={`timeline-item absolute top-1 z-40 flex h-6 items-center overflow-hidden rounded border px-2 text-[10px] font-semibold shadow-md ${isManual ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'} ${isSelected ? 'border-white bg-orange-500/95 ring-1 ring-white' : item.kind === 'content' ? 'border-cyan-300/70 bg-cyan-500/80 text-cyan-50' : 'border-violet-300/70 bg-violet-600/85 text-violet-50'}`}
+                                                        style={{ left: `${item.startAt * pixelsPerSecond + TIMELINE_OFFSET}px`, width: `${Math.max(14, (item.endAt - item.startAt) * pixelsPerSecond)}px` }}
+                                                        title={item.label}
+                                                    >
+                                                        {selectedIds.length === 1 && isSelected && isManual && <span className="absolute inset-y-0 left-0 z-50 w-2 cursor-ew-resize hover:bg-white/40" onMouseDown={(event) => handleItemMouseDown(event, item, 'design', trackIndex, 'resizeLeft')} />}
+                                                        <Sparkles size={10} className="mr-1 shrink-0" /><span className="truncate">{item.label}</span>
+                                                        {selectedIds.length === 1 && isSelected && isManual && <span className="absolute inset-y-0 right-0 z-50 w-2 cursor-ew-resize hover:bg-white/40" onMouseDown={(event) => handleItemMouseDown(event, item, 'design', trackIndex, 'resizeRight')} />}
+                                                    </button>
+                                                );
+                                            })}
                                     </div>
                                 );
                             })}
@@ -14935,6 +15855,7 @@ ${JSON.stringify(subtitlePayload)}
                         </div>
                     </div>
                 </div>
+            </div>
             </div>
 
             {/* Export Modal */}

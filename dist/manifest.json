@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OpenViscribe",
-  "version": "2.0.14",
+  "version": "2.0.18",
   "description": "OpenViscribe browser extension.",
   "permissions": [
     "storage",

@@ -11,8 +11,9 @@ import { clamp, normalizeSubtitle } from './subtitleUtils';
 
 export function createEmptyProjectState() {
     return {
-        tracks: [[], [], []],
-        videoTransitions: [[], [], []],
+        tracks: [[]],
+        videoTransitions: [[]],
+        visualTrackMeta: [{ id: 'visual-track-1', name: 'V1', height: 32, hidden: false, locked: false }],
         audioTracks: [[], []],
         subtitles: [],
         subtitleTransitions: [],
@@ -63,7 +64,7 @@ export function roundTimelineSnapshotValue(value) {
 }
 
 export function createAiSubtitleTimelineSnapshot(state) {
-    const videoTracks = [0, 1, 2].map(trackIndex => (
+    const videoTracks = (Array.isArray(state?.tracks) ? state.tracks : []).map((_, trackIndex) => (
         Array.isArray(state?.tracks?.[trackIndex])
             ? state.tracks[trackIndex]
                 .filter(clip => clip?.type === 'video')
@@ -81,7 +82,7 @@ export function createAiSubtitleTimelineSnapshot(state) {
             : []
     ));
 
-    const videoTransitions = [0, 1, 2].map(trackIndex => (
+    const videoTransitions = (Array.isArray(state?.videoTransitions) ? state.videoTransitions : []).map((_, trackIndex) => (
         Array.isArray(state?.videoTransitions?.[trackIndex])
             ? state.videoTransitions[trackIndex]
                 .map(item => ({
@@ -265,7 +266,27 @@ export function normalizeClipItem(clip) {
 
 export function normalizeProjectState(state) {
     const safe = state || {};
-    const normalizedSubtitles = Array.isArray(safe.subtitles) ? safe.subtitles.map(normalizeSubtitle) : [];
+    const sourceTracks = Array.isArray(safe.tracks) ? safe.tracks : [];
+    const sourceTransitions = Array.isArray(safe.videoTransitions) ? safe.videoTransitions : [];
+    const sourceVisualMeta = Array.isArray(safe.visualTrackMeta) ? safe.visualTrackMeta : [];
+    const sourceManualCards = Array.isArray(safe.motionDesign?.manualCards) ? safe.motionDesign.manualCards : [];
+    const sourceSubtitles = Array.isArray(safe.subtitles) ? safe.subtitles : [];
+    const highestUsedTrackIndex = Math.max(
+        0,
+        sourceTracks.reduce((highest, track, index) => Array.isArray(track) && track.length > 0 ? Math.max(highest, index) : highest, -1),
+        sourceTransitions.reduce((highest, track, index) => Array.isArray(track) && track.length > 0 ? Math.max(highest, index) : highest, -1),
+        sourceSubtitles.reduce((highest, subtitle) => Number.isInteger(subtitle?.visualTrackIndex) ? Math.max(highest, Number(subtitle.visualTrackIndex)) : highest, -1),
+        sourceManualCards.reduce((highest, card) => {
+            const visualIndex = Number.isInteger(card?.visualTrackIndex) ? Number(card.visualTrackIndex) : Number(card?.trackIndex);
+            return Number.isFinite(visualIndex) ? Math.max(highest, visualIndex) : highest;
+        }, -1),
+        sourceVisualMeta.length - 1
+    );
+    const visualTrackCount = Math.max(1, Math.min(12, highestUsedTrackIndex + 1));
+    const normalizedSubtitles = sourceSubtitles.map(item => ({
+        ...normalizeSubtitle(item),
+        visualTrackIndex: clamp(Number.isInteger(item?.visualTrackIndex) ? Number(item.visualTrackIndex) : 0, 0, visualTrackCount - 1)
+    }));
     const normalizedSubtitleTransitions = Array.isArray(safe.subtitleTransitions)
         ? safe.subtitleTransitions.map(item => ({
             ...item,
@@ -275,13 +296,31 @@ export function normalizeProjectState(state) {
     return {
         ...createEmptyProjectState(),
         ...safe,
-        tracks: [0, 1, 2].map(index => Array.isArray(safe.tracks?.[index]) ? safe.tracks[index].map(normalizeClipItem) : []),
-        videoTransitions: [0, 1, 2].map(index => Array.isArray(safe.videoTransitions?.[index]) ? safe.videoTransitions[index] : []),
+        tracks: Array.from({ length: visualTrackCount }, (_, index) => Array.isArray(sourceTracks[index]) ? sourceTracks[index].map(normalizeClipItem) : []),
+        videoTransitions: Array.from({ length: visualTrackCount }, (_, index) => Array.isArray(sourceTransitions[index]) ? sourceTransitions[index] : []),
+        visualTrackMeta: Array.from({ length: visualTrackCount }, (_, index) => ({
+            id: String(sourceVisualMeta[index]?.id || `visual-track-${index + 1}`),
+            name: String(sourceVisualMeta[index]?.name || `V${index + 1}`).slice(0, 18),
+            height: clamp(Number(sourceVisualMeta[index]?.height) || 32, 32, 180),
+            hidden: Boolean(sourceVisualMeta[index]?.hidden),
+            locked: Boolean(sourceVisualMeta[index]?.locked)
+        })),
         audioTracks: [0, 1].map(index => Array.isArray(safe.audioTracks?.[index]) ? safe.audioTracks[index] : []),
         subtitles: normalizedSubtitles,
         subtitleTransitions: normalizedSubtitleTransitions,
         assets: Array.isArray(safe.assets) ? safe.assets : [],
-        motionDesign: { ...DEFAULT_MOTION_DESIGN, ...(safe.motionDesign || {}) },
+        motionDesign: {
+            ...DEFAULT_MOTION_DESIGN,
+            ...(safe.motionDesign || {}),
+            manualCards: sourceManualCards.map(card => ({
+                ...card,
+                visualTrackIndex: clamp(
+                    Number.isInteger(card?.visualTrackIndex) ? Number(card.visualTrackIndex) : (Number(card?.trackIndex) || 0),
+                    0,
+                    visualTrackCount - 1
+                )
+            }))
+        },
         clickEventLog: Array.isArray(safe.clickEventLog) ? safe.clickEventLog : [],
         debugEventLog: Array.isArray(safe.debugEventLog) ? safe.debugEventLog : [],
         recordingSessions: safe.recordingSessions && typeof safe.recordingSessions === 'object'
