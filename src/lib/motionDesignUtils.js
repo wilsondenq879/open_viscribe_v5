@@ -472,7 +472,20 @@ function drawHyperframeAsset(ctx, canvas, layer, preset) {
         const sceneW = width * (layout.w / 100);
         const sceneH = height * (layout.h / 100);
         ctx.globalAlpha = layerOpacity;
-        ctx.fillStyle = resolveGeneratedSceneColor(assetConfig.background, preset);
+        if (assetConfig.backgroundGradient?.stops?.length) {
+            const backgroundGradient = assetConfig.backgroundGradient.type === 'radial'
+                ? ctx.createRadialGradient(sceneX + sceneW * .5, sceneY + sceneH * .45, 0, sceneX + sceneW * .5, sceneY + sceneH * .45, Math.max(sceneW, sceneH) * .72)
+                : (() => {
+                    const radians = (assetConfig.backgroundGradient.angle * Math.PI) / 180;
+                    const dx = Math.cos(radians) * sceneW * .5;
+                    const dy = Math.sin(radians) * sceneH * .5;
+                    return ctx.createLinearGradient(sceneX + sceneW * .5 - dx, sceneY + sceneH * .5 - dy, sceneX + sceneW * .5 + dx, sceneY + sceneH * .5 + dy);
+                })();
+            assetConfig.backgroundGradient.stops.forEach(stop => backgroundGradient.addColorStop(stop.at, resolveGeneratedSceneColor(stop.color, preset)));
+            ctx.fillStyle = backgroundGradient;
+        } else {
+            ctx.fillStyle = resolveGeneratedSceneColor(assetConfig.background, preset);
+        }
         ctx.fillRect(sceneX, sceneY, sceneW, sceneH);
         const elements = [...assetConfig.elements].sort((a, b) => a.zIndex - b.zIndex);
         elements.forEach(element => {
@@ -490,8 +503,10 @@ function drawHyperframeAsset(ctx, canvas, layer, preset) {
             ctx.scale(state.scale * state.scaleX, state.scale * state.scaleY);
             ctx.filter = state.blur > 0 ? `blur(${state.blur}px)` : 'none';
             if (element.shadow > 0) {
-                ctx.shadowColor = resolveGeneratedSceneColor(element.fill, preset);
+                ctx.shadowColor = resolveGeneratedSceneColor(element.shadowColor || element.fill, preset);
                 ctx.shadowBlur = element.shadow * (sceneW / 320);
+                ctx.shadowOffsetX = (element.shadowX || 0) * (sceneW / 320);
+                ctx.shadowOffsetY = (element.shadowY || 0) * (sceneH / 180);
             }
             const left = -elementW / 2;
             const top = -elementH / 2;
@@ -516,6 +531,8 @@ function drawHyperframeAsset(ctx, canvas, layer, preset) {
             ctx.fillStyle = fillStyle;
             ctx.strokeStyle = resolveGeneratedSceneColor(element.stroke, preset);
             ctx.lineWidth = element.strokeWidth * (sceneW / 320);
+            ctx.lineCap = element.lineCap || 'round';
+            ctx.lineJoin = element.lineJoin || 'round';
             if (element.type === 'text') {
                 const fontSize = Math.max(8, sceneW * (element.fontSize / 100));
                 ctx.font = `${element.fontWeight} ${fontSize}px Arial, sans-serif`;
@@ -549,6 +566,18 @@ function drawHyperframeAsset(ctx, canvas, layer, preset) {
                 ctx.closePath();
                 ctx.fill();
                 if (element.strokeWidth > 0) ctx.stroke();
+            } else if (element.type === 'path') {
+                try {
+                    const path = new Path2D(element.path || 'M0 100 L50 0 L100 100 Z');
+                    ctx.save();
+                    ctx.translate(left, top);
+                    ctx.scale(elementW / 100, elementH / 100);
+                    ctx.fill(path);
+                    if (element.strokeWidth > 0) ctx.stroke(path);
+                    ctx.restore();
+                } catch (error) {
+                    // A malformed AI path should not abort the frame export.
+                }
             } else if (element.type === 'line') {
                 ctx.fillRect(left, -Math.max(1, elementH) / 2, elementW, Math.max(1, elementH));
             } else {

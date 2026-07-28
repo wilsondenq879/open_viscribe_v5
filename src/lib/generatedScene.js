@@ -6,7 +6,7 @@ const finite = (value, fallback, min, max) => Number.isFinite(Number(value)) ? c
 const cleanText = (value, fallback = '', max = 160) => String(value ?? fallback).replace(/\s+/g, ' ').trim().slice(0, max);
 const choice = (value, fallback, values) => values.includes(value) ? value : fallback;
 
-export const GENERATED_SCENE_ELEMENT_TYPES = ['rect', 'circle', 'text', 'image', 'line', 'polygon'];
+export const GENERATED_SCENE_ELEMENT_TYPES = ['rect', 'circle', 'text', 'image', 'line', 'polygon', 'path'];
 export const GENERATED_SCENE_EASES = ['linear', 'out-cubic', 'in-cubic', 'in-out-cubic', 'out-back'];
 export const GENERATED_SCENE_COLOR_TOKENS = ['background', 'surface', 'foreground', 'muted', 'accent', 'accentAlt', 'transparent'];
 
@@ -88,6 +88,10 @@ const normalizeElement = (value, index) => {
         gradient: normalizeGradient(raw.gradient),
         blendMode: choice(raw.blendMode, 'normal', ['normal', 'screen', 'multiply', 'overlay', 'lighten']),
         shadow: finite(raw.shadow, 0, 0, 60),
+        shadowColor: normalizeColor(raw.shadowColor, 'background'),
+        shadowX: finite(raw.shadowX, 0, -40, 40),
+        shadowY: finite(raw.shadowY, 0, -40, 40),
+        role: choice(raw.role, 'midground', ['background', 'midground', 'foreground', 'subject', 'highlight', 'shadow', 'detail']),
         text: cleanText(raw.text, type === 'text' ? 'AI ORIGINAL' : '', 180),
         src: String(raw.src || '').trim().slice(0, 700),
         objectFit: choice(raw.objectFit, 'contain', ['contain', 'cover']),
@@ -95,7 +99,10 @@ const normalizeElement = (value, index) => {
         fontWeight: Math.round(finite(raw.fontWeight, 800, 300, 950)),
         letterSpacing: finite(raw.letterSpacing, 0, -0.08, 1.2),
         align: choice(raw.align, 'left', ['left', 'center', 'right']),
-        points: (Array.isArray(raw.points) ? raw.points : []).slice(0, 12).map(point => [finite(point?.[0], 0, -100, 200), finite(point?.[1], 0, -100, 200)]),
+        points: (Array.isArray(raw.points) ? raw.points : []).slice(0, 24).map(point => [finite(point?.[0], 0, -100, 200), finite(point?.[1], 0, -100, 200)]),
+        path: String(raw.path || '').replace(/[^AaCcHhLlMmQqSsTtVvZz0-9eE.,+\-\s]/g, '').trim().slice(0, 4000),
+        lineCap: choice(raw.lineCap, 'round', ['butt', 'round', 'square']),
+        lineJoin: choice(raw.lineJoin, 'round', ['miter', 'round', 'bevel']),
         zIndex: Math.round(finite(raw.zIndex, index, -50, 100)),
         keyframes
     };
@@ -103,9 +110,10 @@ const normalizeElement = (value, index) => {
 
 export function normalizeGeneratedSceneConfig(value) {
     const raw = value && typeof value === 'object' ? value : {};
-    const elements = (Array.isArray(raw.elements) ? raw.elements : []).slice(0, 24).map(normalizeElement);
+    const elements = (Array.isArray(raw.elements) ? raw.elements : []).slice(0, 48).map(normalizeElement);
     return {
         background: normalizeColor(raw.background, 'background'),
+        backgroundGradient: normalizeGradient(raw.backgroundGradient),
         elements: elements.length ? elements : normalizeGeneratedSceneConfig(buildProceduralScene('AI 原創動態素材')).elements,
         designIntent: cleanText(raw.designIntent, '由 AI 從空白畫布建立的圖層與關鍵影格。', 180)
     };

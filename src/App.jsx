@@ -1117,6 +1117,206 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 60000, externalSi
     }
 }
 
+const materialResearchPrompt = (prompt, referenceUrls = []) => `請先搜尋公開網路，研究下列動態素材主題，再提供給 motion designer 使用的繁體中文視覺研究摘要：
+
+使用者原始要求：${prompt}
+${referenceUrls.length ? `使用者提供的參考網址：${referenceUrls.join(', ')}` : ''}
+
+研究重點：
+1. 正確辨認主體，不可只根據名稱猜測。
+2. 真實外觀、輪廓、比例、層次、材質、顏色與最具辨識度的結構。
+3. 哪些特徵一定要保留，哪些常見畫錯方式必須避免。
+4. 可轉譯成 3–8 秒過場動畫的動作意象，但不要直接套用現成動畫模板。
+5. 摘要必須具體到設計師可以用幾何圖層重建主體。
+
+只輸出研究摘要，不要輸出場景 JSON。`;
+
+function normalizeResearchSources(sources) {
+    const seen = new Set();
+    return (Array.isArray(sources) ? sources : []).map(source => {
+        const url = String(source?.url || source?.uri || '').trim();
+        const title = String(source?.title || '').trim();
+        let parsedUrl;
+        try { parsedUrl = new URL(url); } catch { return null; }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol) || seen.has(url)) return null;
+        seen.add(url);
+        return { title: title || parsedUrl.hostname || '網路來源', url };
+    }).filter(Boolean).slice(0, 8);
+}
+
+function extractAzureResponseResearch(payload) {
+    const textParts = [];
+    const sources = [];
+    let searched = false;
+    (Array.isArray(payload?.output) ? payload.output : []).forEach(item => {
+        if (item?.type === 'web_search_call') {
+            searched = true;
+            (item.action?.sources || []).forEach(source => sources.push(source));
+        }
+        (Array.isArray(item?.content) ? item.content : []).forEach(content => {
+            if (content?.type === 'output_text' && content.text) textParts.push(content.text);
+            (content?.annotations || []).forEach(annotation => {
+                if (annotation?.url) sources.push({ title: annotation.title, url: annotation.url });
+            });
+        });
+    });
+    return {
+        summary: String(payload?.output_text || textParts.join('\n')).trim(),
+        sources: normalizeResearchSources(sources),
+        queries: [],
+        searched
+    };
+}
+
+function buildAzureResponsesUrl(endpoint) {
+    const clean = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (/\/openai\/v1$/i.test(clean)) return `${clean}/responses`;
+    if (/\/openai$/i.test(clean)) return `${clean}/v1/responses`;
+    return `${clean}/openai/v1/responses`;
+}
+
+async function researchMaterialWithAzure({ endpoint, apiKey, deployment, prompt, referenceUrls }) {
+    const response = await fetchWithTimeout(buildAzureResponsesUrl(endpoint), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': apiKey },
+        body: JSON.stringify({
+            model: deployment,
+            tools: [{
+                type: 'web_search',
+                user_location: { type: 'approximate', country: 'TW', city: 'Taipei', region: 'Taiwan', timezone: 'Asia/Taipei' }
+            }],
+            tool_choice: 'auto',
+            include: ['web_search_call.action.sources'],
+            input: materialResearchPrompt(prompt, referenceUrls)
+        })
+    }, 45000);
+    if (!response.ok) throw new Error(`Azure 網路研究 HTTP ${response.status}`);
+    const research = extractAzureResponseResearch(await response.json());
+    if (!research.summary) throw new Error('Azure 沒有回傳可用的網路研究摘要');
+    if (!research.searched) throw new Error('Azure 沒有實際執行 Web Search');
+    return { ...research, provider: 'Azure Web Search' };
+}
+
+async function researchMaterialWithGemini({ apiKey, model, prompt, referenceUrls }) {
+    const response = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: [{ parts: [{ text: materialResearchPrompt(prompt, referenceUrls) }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 1800 }
+        })
+    }, 45000);
+    if (!response.ok) throw new Error(`Gemini 網路研究 HTTP ${response.status}`);
+    const payload = await response.json();
+    const candidate = payload?.candidates?.[0];
+    const summary = (candidate?.content?.parts || []).map(part => part?.text || '').join('\n').trim();
+    const metadata = candidate?.groundingMetadata || {};
+    const sources = normalizeResearchSources((metadata.groundingChunks || []).map(chunk => chunk?.web));
+    if (!summary) throw new Error('Gemini 沒有回傳可用的網路研究摘要');
+    if (!(metadata.webSearchQueries || []).length && !sources.length) throw new Error('Gemini 沒有實際執行 Google Search grounding');
+    return {
+        summary,
+        sources,
+        queries: (metadata.webSearchQueries || []).map(String).slice(0, 8),
+        provider: 'Gemini Google Search'
+    };
+}
+
+async function researchMaterialWithWikipedia(prompt) {
+    const cleanPrompt = String(prompt || '')
+        .replace(/https?:\/\/\S+/gi, ' ')
+        .replace(/(?:請|幫我|設計|製作|建立|做|一個|一款|一支|動畫|動態|素材|過場|轉場|效果|風格|意象)/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 100);
+    if (!cleanPrompt) throw new Error('沒有可搜尋的主題關鍵字');
+    const params = new URLSearchParams({
+        action: 'query', generator: 'search', gsrsearch: cleanPrompt, gsrlimit: '4',
+        prop: 'extracts|info', exintro: '1', explaintext: '1', inprop: 'url',
+        redirects: '1', format: 'json', origin: '*'
+    });
+    const response = await fetchWithTimeout(`https://zh.wikipedia.org/w/api.php?${params.toString()}`, {}, 20000);
+    if (!response.ok) throw new Error(`公開百科研究 HTTP ${response.status}`);
+    const payload = await response.json();
+    const pages = Object.values(payload?.query?.pages || {}).sort((a, b) => (a.index || 99) - (b.index || 99)).slice(0, 4);
+    const useful = pages.filter(page => page?.extract);
+    if (!useful.length) throw new Error('公開百科找不到相關主題');
+    return {
+        summary: useful.map(page => `【${page.title}】${String(page.extract).slice(0, 1100)}`).join('\n\n'),
+        sources: normalizeResearchSources(useful.map(page => ({ title: page.title, url: page.fullurl }))),
+        queries: [cleanPrompt],
+        provider: 'Wikipedia 公開資料'
+    };
+}
+
+function getGeneratedSceneQualityIssues(scene, label = '場景') {
+    const issues = [];
+    if (!scene || !Array.isArray(scene.elements)) return [`${label} 缺少圖層資料`];
+    if (scene.elements.length < 14) issues.push(`${label} 只有 ${scene.elements.length} 層，需要至少 14 層`);
+    if (String(scene.designIntent || '').trim().length < 12) issues.push(`${label} 缺少具體設計意圖`);
+    const elements = getHyperframeAssetConfig({ assetType: 'generated-scene' }, scene).elements;
+    const motionChannels = ['x', 'y', 'w', 'h', 'scale', 'scaleX', 'scaleY', 'rotate', 'clipX', 'clipY', 'radius'];
+    const movingLayers = elements.filter(element => {
+        const frames = Array.isArray(element?.keyframes) ? element.keyframes : [];
+        return motionChannels.some(channel => {
+            const values = frames.map(frame => Number(frame?.[channel])).filter(Number.isFinite);
+            return values.length >= 2 && Math.max(...values) - Math.min(...values) > 0.001;
+        });
+    }).length;
+    const structuralLayers = elements.filter(element => ['rect', 'polygon', 'path', 'line', 'image'].includes(element?.type)).length;
+    const illustrationLayers = elements.filter(element => ['polygon', 'path'].includes(element?.type)).length;
+    const renderedDepthRoles = new Set(elements.map(element => element?.role).filter(Boolean));
+    const dimensionalLayers = elements.filter(element => element?.gradient?.stops?.length >= 2 || Number(element?.shadow) >= 4).length;
+    const subjectLayers = elements.filter(element => ['subject', 'highlight', 'shadow', 'detail'].includes(element?.role));
+    if (!subjectLayers.length) return [...issues, `${label} 缺少主體圖層`];
+    const subjectBounds = subjectLayers.reduce((bounds, element) => ({
+        minX: Math.min(bounds.minX, Number(element.x) || 0),
+        minY: Math.min(bounds.minY, Number(element.y) || 0),
+        maxX: Math.max(bounds.maxX, (Number(element.x) || 0) + (Number(element.w) || 0)),
+        maxY: Math.max(bounds.maxY, (Number(element.y) || 0) + (Number(element.h) || 0))
+    }), { minX: 100, minY: 100, maxX: 0, maxY: 0 });
+    const subjectCoverage = Math.max(0, subjectBounds.maxX - subjectBounds.minX) * Math.max(0, subjectBounds.maxY - subjectBounds.minY);
+    const visibleHoldLayers = subjectLayers.filter(element => {
+        const state = evaluateGeneratedSceneElement(element, .55);
+        return state.opacity >= .55 && state.blur <= 10 && state.scale >= .55;
+    }).length;
+    if (movingLayers < 4) issues.push(`${label} 只有 ${movingLayers} 個空間動態層，需要至少 4 個`);
+    if (structuralLayers < 9) issues.push(`${label} 結構圖層不足`);
+    if (illustrationLayers < 4) issues.push(`${label} 自由輪廓不足`);
+    if (dimensionalLayers < 3) issues.push(`${label} 明暗或投影層不足`);
+    if (renderedDepthRoles.size < 4) issues.push(`${label} 景深角色不足`);
+    if (subjectLayers.length < 6) issues.push(`${label} 主體拆解不足`);
+    if (visibleHoldLayers < 6) issues.push(`${label} 停留畫面的可見主體不足`);
+    if (subjectCoverage < 900) issues.push(`${label} 主體佔畫面比例太小`);
+    return issues;
+}
+
+function validateResearchedGeneratedScene(scene) {
+    return getGeneratedSceneQualityIssues(scene).length === 0;
+}
+
+function generatedHexLuminance(value) {
+    if (!/^#[0-9a-f]{6}$/i.test(String(value || ''))) return null;
+    const channels = [1, 3, 5].map(index => parseInt(value.slice(index, index + 2), 16) / 255)
+        .map(channel => channel <= .03928 ? channel / 12.92 : Math.pow((channel + .055) / 1.055, 2.4));
+    return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
+}
+
+function generatedColorContrast(a, b) {
+    const first = generatedHexLuminance(a);
+    const second = generatedHexLuminance(b);
+    if (first === null || second === null) return 0;
+    return (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
+}
+
+function validateGeneratedPalette(palette) {
+    const colors = ['background', 'surface', 'foreground', 'muted', 'accent', 'accentAlt'].map(key => String(palette?.[key] || '').toLowerCase());
+    return new Set(colors).size >= 5
+        && generatedColorContrast(palette?.background, palette?.foreground) >= 4.5
+        && Math.max(generatedColorContrast(palette?.background, palette?.accent), generatedColorContrast(palette?.background, palette?.accentAlt)) >= 3;
+}
+
 // Local models vary in how strictly they follow JSON mode. Keep the editor
 // compatible with Qwen, Gemma, Llama and other Ollama families by accepting a
 // clean JSON object even when the model adds a short prose prefix or fence.
@@ -1193,7 +1393,83 @@ const normalizeMaterialHex = (value, fallback) => /^#[0-9a-f]{6}$/i.test(String(
     ? String(value).trim().toLowerCase()
     : fallback;
 
-function createAiMaterialPair(rawValue, prompt, ratioMode = 'both') {
+const AI_ART_DIRECTION_FALLBACK_PALETTE = {
+    background: '#111827',
+    surface: '#334155',
+    foreground: '#f8fafc',
+    muted: '#cbd5e1',
+    accent: '#f59e0b',
+    accentAlt: '#22d3ee'
+};
+
+function ensureGeneratedPaletteContrast(rawPalette = {}) {
+    const palette = {
+        background: normalizeMaterialHex(rawPalette.background, AI_ART_DIRECTION_FALLBACK_PALETTE.background),
+        surface: normalizeMaterialHex(rawPalette.surface, AI_ART_DIRECTION_FALLBACK_PALETTE.surface),
+        foreground: normalizeMaterialHex(rawPalette.foreground, AI_ART_DIRECTION_FALLBACK_PALETTE.foreground),
+        muted: normalizeMaterialHex(rawPalette.muted, AI_ART_DIRECTION_FALLBACK_PALETTE.muted),
+        accent: normalizeMaterialHex(rawPalette.accent, AI_ART_DIRECTION_FALLBACK_PALETTE.accent),
+        accentAlt: normalizeMaterialHex(rawPalette.accentAlt, AI_ART_DIRECTION_FALLBACK_PALETTE.accentAlt)
+    };
+    const used = new Set([palette.background]);
+    const pick = (current, candidates, minimumContrast = 0) => {
+        const available = [current, ...candidates]
+            .map(color => normalizeMaterialHex(color, ''))
+            .filter(color => color && !used.has(color));
+        const matching = available.find(color => generatedColorContrast(palette.background, color) >= minimumContrast);
+        const selected = matching || available.sort((a, b) => generatedColorContrast(palette.background, b) - generatedColorContrast(palette.background, a))[0] || current;
+        used.add(selected);
+        return selected;
+    };
+    palette.surface = pick(palette.surface, ['#334155', '#475569', '#e2e8f0']);
+    palette.foreground = pick(palette.foreground, ['#f8fafc', '#ffffff', '#111827', '#000000'], 4.5);
+    palette.muted = pick(palette.muted, ['#cbd5e1', '#94a3b8', '#64748b', '#475569']);
+    palette.accent = pick(palette.accent, ['#f59e0b', '#22d3ee', '#f43f5e', '#84cc16', '#8b5cf6'], 3);
+    palette.accentAlt = pick(palette.accentAlt, ['#22d3ee', '#f59e0b', '#f43f5e', '#a3e635', '#c084fc'], 2.2);
+    return validateGeneratedPalette(palette) ? palette : { ...AI_ART_DIRECTION_FALLBACK_PALETTE };
+}
+
+function normalizeArtDirection(rawValue) {
+    const raw = rawValue && typeof rawValue === 'object' ? rawValue : {};
+    const rawPalette = raw.palette && typeof raw.palette === 'object' ? raw.palette : {};
+    const composition = raw.composition && typeof raw.composition === 'object' ? raw.composition : {};
+    const subjectConstruction = [
+        raw.subjectConstruction,
+        raw.subjectComponents,
+        raw.components,
+        raw.subject?.components
+    ].find(Array.isArray) || [];
+    const normalizedPalette = ensureGeneratedPaletteContrast({
+        background: normalizeMaterialHex(rawPalette.background || rawPalette.bg || rawPalette.base, AI_ART_DIRECTION_FALLBACK_PALETTE.background),
+        surface: normalizeMaterialHex(rawPalette.surface || rawPalette.panel || rawPalette.secondary, AI_ART_DIRECTION_FALLBACK_PALETTE.surface),
+        foreground: normalizeMaterialHex(rawPalette.foreground || rawPalette.text || rawPalette.ink, AI_ART_DIRECTION_FALLBACK_PALETTE.foreground),
+        muted: normalizeMaterialHex(rawPalette.muted || rawPalette.subtle || rawPalette.neutral, AI_ART_DIRECTION_FALLBACK_PALETTE.muted),
+        accent: normalizeMaterialHex(rawPalette.accent || rawPalette.primary || rawPalette.focus, AI_ART_DIRECTION_FALLBACK_PALETTE.accent),
+        accentAlt: normalizeMaterialHex(rawPalette.accentAlt || rawPalette.accent_alt || rawPalette.highlight || rawPalette.tertiary, AI_ART_DIRECTION_FALLBACK_PALETTE.accentAlt)
+    });
+    return {
+        ...raw,
+        palette: normalizedPalette,
+        subjectConstruction: subjectConstruction.filter(Boolean).slice(0, 24),
+        composition: {
+            ...composition,
+            wide: composition.wide || composition['16:9'] || composition.landscape || composition.horizontal || null,
+            tall: composition.tall || composition['9:16'] || composition.portrait || composition.vertical || null
+        }
+    };
+}
+
+function getArtDirectionIssues(artDirection) {
+    const issues = [];
+    if (!Array.isArray(artDirection?.subjectConstruction) || artDirection.subjectConstruction.length < 8) {
+        issues.push(`主體部件只有 ${artDirection?.subjectConstruction?.length || 0} 個，需要至少 8 個`);
+    }
+    if (!artDirection?.composition?.wide) issues.push('缺少 16:9 構圖');
+    if (!artDirection?.composition?.tall) issues.push('缺少 9:16 構圖');
+    return issues;
+}
+
+function createAiMaterialPair(rawValue, prompt, ratioMode = 'both', research = null, artDirection = null) {
     const raw = rawValue && typeof rawValue === 'object' ? rawValue : {};
     const directImageUrl = String(prompt || '').match(/https?:\/\/[^\s"'<>]+\.(?:png|jpe?g|webp|svg)(?:\?[^\s"'<>]*)?/i)?.[0] || '';
     const resolvedPromptImage = resolveGeneratedScenePromptImage(prompt, directImageUrl);
@@ -1202,14 +1478,14 @@ function createAiMaterialPair(rawValue, prompt, ratioMode = 'both') {
     const description = String(raw.description || `根據「${String(prompt || '').trim().slice(0, 52)}」生成的專案動態素材。`).trim().slice(0, 120);
     const duration = Math.max(2.4, Math.min(8, Number(raw.duration) || 4.2));
     const presetId = ['signal', 'editorial', 'creator'].includes(raw.presetId) ? raw.presetId : 'signal';
-    const palette = {
+    const palette = ensureGeneratedPaletteContrast({
         background: normalizeMaterialHex(raw.palette?.background, '#0b1020'),
         surface: normalizeMaterialHex(raw.palette?.surface, '#17233b'),
         foreground: normalizeMaterialHex(raw.palette?.foreground, '#f8fafc'),
         muted: normalizeMaterialHex(raw.palette?.muted, '#9aa8bd'),
         accent: normalizeMaterialHex(raw.palette?.accent, '#5eead4'),
         accentAlt: normalizeMaterialHex(raw.palette?.accentAlt, '#fb7185')
-    };
+    });
     const stamp = Date.now().toString(36);
     const ratios = ratioMode === 'both' ? ['16:9', '9:16'] : [ratioMode === '9:16' ? '9:16' : '16:9'];
     return ratios.map((aspectRatio) => {
@@ -1249,6 +1525,13 @@ function createAiMaterialPair(rawValue, prompt, ratioMode = 'both') {
         config,
         palette,
         prompt: String(prompt || '').trim().slice(0, 800),
+        research: research?.summary ? {
+            summary: String(research.summary).slice(0, 8000),
+            provider: String(research.provider || '網路研究').slice(0, 80),
+            queries: (research.queries || []).map(String).slice(0, 8),
+            sources: normalizeResearchSources(research.sources)
+        } : null,
+        artDirection: artDirection && typeof artDirection === 'object' ? artDirection : null,
         generated: true,
         generatedAt: new Date().toISOString()
         };
@@ -1932,6 +2215,7 @@ function DesignMotionPreview({ preset, variant = 'lower-third', duration = 4.2, 
 
 function GeneratedSceneElementPreview({ element, progress, palette }) {
     const state = evaluateGeneratedSceneElement(element, progress);
+    const gradientId = useId().replace(/:/g, '');
     const fill = element.gradient ? generatedSceneGradientCss(element.gradient, palette) : resolveGeneratedSceneColor(element.fill, palette);
     const stroke = resolveGeneratedSceneColor(element.stroke, palette);
     const commonStyle = {
@@ -1942,7 +2226,7 @@ function GeneratedSceneElementPreview({ element, progress, palette }) {
         opacity: state.opacity,
         transform: `rotate(${state.rotate}deg) scale(${state.scale}) scaleX(${state.scaleX}) scaleY(${state.scaleY})`,
         transformOrigin: 'center center',
-        filter: `blur(${state.blur}px) drop-shadow(0 0 ${element.shadow}px ${resolveGeneratedSceneColor(element.fill, palette)})`,
+        filter: `blur(${state.blur}px) drop-shadow(${element.shadowX || 0}px ${element.shadowY || 0}px ${element.shadow}px ${resolveGeneratedSceneColor(element.shadowColor || element.fill, palette)})`,
         clipPath: `inset(0 ${100 - state.clipX}% ${100 - state.clipY}% 0)`,
         mixBlendMode: element.blendMode,
         zIndex: element.zIndex,
@@ -1952,7 +2236,18 @@ function GeneratedSceneElementPreview({ element, progress, palette }) {
     };
     if (element.type === 'text') return <div className="absolute flex items-center overflow-hidden whitespace-pre-wrap leading-[1.02]" style={{ ...commonStyle, justifyContent: element.align === 'center' ? 'center' : element.align === 'right' ? 'flex-end' : 'flex-start', color: fill, background: 'transparent', textAlign: element.align, fontSize: `${element.fontSize * .2}rem`, fontWeight: element.fontWeight, letterSpacing: `${element.letterSpacing}em` }}>{element.text}</div>;
     if (element.type === 'image') return <div className="absolute overflow-hidden" style={{ ...commonStyle, background: 'transparent' }}><img src={element.src} alt={element.name} className="h-full w-full" style={{ objectFit: element.objectFit }} /></div>;
-    if (element.type === 'polygon') return <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute overflow-visible" style={{ ...commonStyle, background: 'transparent', border: undefined }} aria-hidden="true"><polygon points={(element.points.length ? element.points : [[0, 0], [100, 0], [100, 100], [0, 100]]).map(point => point.join(',')).join(' ')} fill={fill} stroke={stroke} strokeWidth={element.strokeWidth} /></svg>;
+    if (element.type === 'polygon' || element.type === 'path') {
+        const svgFill = element.gradient ? `url(#${gradientId})` : resolveGeneratedSceneColor(element.fill, palette);
+        return <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute overflow-visible" style={{ ...commonStyle, background: 'transparent', border: undefined }} aria-hidden="true">
+            {element.gradient && <defs>{element.gradient.type === 'radial'
+                ? <radialGradient id={gradientId}>{element.gradient.stops.map((stop, index) => <stop key={index} offset={`${stop.at * 100}%`} stopColor={resolveGeneratedSceneColor(stop.color, palette)} />)}</radialGradient>
+                : <linearGradient id={gradientId} x1="0" y1="0" x2="1" y2="1" gradientTransform={`rotate(${element.gradient.angle} .5 .5)`}>{element.gradient.stops.map((stop, index) => <stop key={index} offset={`${stop.at * 100}%`} stopColor={resolveGeneratedSceneColor(stop.color, palette)} />)}</linearGradient>}
+            </defs>}
+            {element.type === 'path'
+                ? <path d={element.path || 'M0 100 L50 0 L100 100 Z'} fill={svgFill} stroke={stroke} strokeWidth={element.strokeWidth} strokeLinecap={element.lineCap} strokeLinejoin={element.lineJoin} vectorEffect="non-scaling-stroke" />
+                : <polygon points={(element.points.length ? element.points : [[0, 0], [100, 0], [100, 100], [0, 100]]).map(point => point.join(',')).join(' ')} fill={svgFill} stroke={stroke} strokeWidth={element.strokeWidth} strokeLinecap={element.lineCap} strokeLinejoin={element.lineJoin} vectorEffect="non-scaling-stroke" />}
+        </svg>;
+    }
     if (element.type === 'line') return <div className="absolute" style={{ ...commonStyle, height: `${Math.max(.15, state.h)}%`, border: undefined, borderRadius: 999 }} />;
     return <div className="absolute" style={commonStyle} />;
 }
@@ -1972,7 +2267,7 @@ function GeneratedScenePreview({ config, palette }) {
         frameId = requestAnimationFrame(tick);
         return () => cancelAnimationFrame(frameId);
     }, []);
-    return <div className="absolute inset-0 overflow-hidden" style={{ background: resolveGeneratedSceneColor(config.background, palette) }}>
+    return <div className="absolute inset-0 overflow-hidden" style={{ background: config.backgroundGradient ? generatedSceneGradientCss(config.backgroundGradient, palette) : resolveGeneratedSceneColor(config.background, palette) }}>
         {config.elements.map(element => <GeneratedSceneElementPreview key={element.id} element={element} progress={progress} palette={palette} />)}
     </div>;
 }
@@ -2212,7 +2507,7 @@ function HyperframeAssetParameterEditor({ asset, value, onChange }) {
     if (type === 'social-follow') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">社群卡內容</div>{label('帳號', <input value={config.handle} onChange={(event) => set({ handle: event.target.value })} className={inputClass} />)}{label('按鈕文字', <input value={config.cta} onChange={(event) => set({ cta: event.target.value })} className={inputClass} />)}</div>;
     if (type === 'news-ticker') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">跑馬燈內容</div>{label('前綴', <input value={config.prefix} onChange={(event) => set({ prefix: event.target.value })} className={inputClass} />)}{label('訊息', <textarea value={config.message} onChange={(event) => set({ message: event.target.value })} className={`${inputClass} h-16 resize-y`} />)}</div>;
     if (type === 'caption-highlight') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">字幕內容</div>{label('一般文字', <input value={config.line} onChange={(event) => set({ line: event.target.value })} className={inputClass} />)}{label('高亮文字', <input value={config.highlight} onChange={(event) => set({ highlight: event.target.value })} className={inputClass} />)}</div>;
-    if (type === 'generated-scene') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="flex items-center justify-between"><div className="text-[11px] font-bold text-violet-100">AI 空白畫布場景</div><span className="rounded bg-cyan-300/10 px-1.5 py-0.5 text-[9px] text-cyan-100">{config.elements.length} 圖層</span></div><p className="text-[9px] leading-4 text-gray-400">每個圖層與關鍵影格都是本次提示新產生，沒有引用素材庫版型。</p>{config.elements.map((element, index) => <div key={element.id} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="mb-1.5 flex items-center justify-between text-[9px]"><span className="font-bold text-gray-200">{element.name}</span><span className="font-mono text-gray-500">{element.type} · {element.keyframes.length} poses</span></div>{element.type === 'text' && <input value={element.text} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, text: event.target.value } : item) })} className={inputClass} />}{element.type === 'image' && <input value={element.src} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, src: event.target.value } : item) })} className={inputClass} />}<div className="mt-1.5 grid grid-cols-3 gap-1"><input type="number" aria-label={`${element.name} X`} value={element.x} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, x: Number(event.target.value) } : item) })} className={inputClass} /><input type="number" aria-label={`${element.name} Y`} value={element.y} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, y: Number(event.target.value) } : item) })} className={inputClass} /><input aria-label={`${element.name} 顏色`} value={element.fill} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, fill: event.target.value } : item) })} className={inputClass} /></div></div>)}</div>;
+    if (type === 'generated-scene') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="flex items-center justify-between"><div className="text-[11px] font-bold text-violet-100">AI 分層向量場景</div><span className="rounded bg-cyan-300/10 px-1.5 py-0.5 text-[9px] text-cyan-100">{config.elements.length} 圖層</span></div><p className="text-[9px] leading-4 text-gray-400">每個圖層與關鍵姿勢都是本次提示新產生，包含主體、明暗、細節與景深角色。</p><div className="rounded-lg border border-violet-200/10 bg-violet-200/5 px-2 py-1.5 text-[9px] leading-4 text-violet-100/80">{config.designIntent}</div>{config.elements.map((element, index) => <div key={element.id} className="rounded-lg border border-white/10 bg-black/20 p-2"><div className="mb-1.5 flex items-center justify-between text-[9px]"><span className="font-bold text-gray-200">{element.name}</span><span className="font-mono text-gray-500">{element.role} · {element.type} · {element.keyframes.length} poses</span></div>{element.type === 'text' && <input value={element.text} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, text: event.target.value } : item) })} className={inputClass} />}{element.type === 'image' && <input value={element.src} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, src: event.target.value } : item) })} className={inputClass} />}{element.type === 'path' && <textarea value={element.path} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, path: event.target.value } : item) })} className={`${inputClass} h-16 resize-y font-mono`} />}<div className="mt-1.5 grid grid-cols-3 gap-1"><input type="number" aria-label={`${element.name} X`} value={element.x} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, x: Number(event.target.value) } : item) })} className={inputClass} /><input type="number" aria-label={`${element.name} Y`} value={element.y} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, y: Number(event.target.value) } : item) })} className={inputClass} /><input aria-label={`${element.name} 顏色`} value={element.fill} onChange={(event) => set({ elements: config.elements.map((item, itemIndex) => itemIndex === index ? { ...item, fill: event.target.value } : item) })} className={inputClass} /></div></div>)}</div>;
     if (type === 'brand-transition') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">品牌轉場編排</div>{label('品牌名稱', <input value={config.brandName} onChange={(event) => set({ brandName: event.target.value })} className={inputClass} />)}{label('Logo 圖檔網址', <input value={config.logoSrc} onChange={(event) => set({ logoSrc: event.target.value })} className={inputClass} />)}{label('品牌標語', <input value={config.tagline} onChange={(event) => set({ tagline: event.target.value })} className={inputClass} />)}<div className="grid grid-cols-2 gap-2">{label('進場', <select value={config.entrance} onChange={(event) => set({ entrance: event.target.value })} className={inputClass}><option value="diagonal-slices">斜切片段</option><option value="split-panels">雙面板夾入</option><option value="shutter">快門切入</option><option value="radial-burst">放射爆發</option></select>)}{label('Logo 揭露', <select value={config.reveal} onChange={(event) => set({ reveal: event.target.value })} className={inputClass}><option value="slice-assemble">切片重組</option><option value="mask-scan">掃描揭露</option><option value="scale-punch">縮放衝擊</option><option value="stroke-flash">輪廓閃現</option></select>)}{label('離場', <select value={config.exit} onChange={(event) => set({ exit: event.target.value })} className={inputClass}><option value="slash-wipe">斜線擦除</option><option value="split-away">分割退場</option><option value="glitch-cut">故障切斷</option><option value="iris">光圈收束</option></select>)}{label('方向', <select value={config.direction} onChange={(event) => set({ direction: event.target.value })} className={inputClass}><option value="left-to-right">由左到右</option><option value="right-to-left">由右到左</option><option value="top-to-bottom">由上到下</option><option value="bottom-to-top">由下到上</option></select>)}</div><div className="grid grid-cols-2 gap-2">{label('切片數', <input type="number" min="3" max="9" value={config.sliceCount} onChange={(event) => set({ sliceCount: Number(event.target.value) })} className={inputClass} />)}{label('斜切角度', <input type="number" min="-35" max="35" value={config.angle} onChange={(event) => set({ angle: Number(event.target.value) })} className={inputClass} />)}{label('動態強度', <input type="number" min="20" max="100" value={config.intensity} onChange={(event) => set({ intensity: Number(event.target.value) })} className={inputClass} />)}{label('Logo 尺寸', <input type="number" min="28" max="78" value={config.logoScale} onChange={(event) => set({ logoScale: Number(event.target.value) })} className={inputClass} />)}</div></div>;
     if (type === 'logo-fill') return <div className="space-y-2 border-t border-violet-200/15 pt-3"><div className="text-[11px] font-bold text-violet-100">Logo 填滿動畫</div>{label('品牌名稱', <input value={config.brandName} onChange={(event) => set({ brandName: event.target.value })} className={inputClass} />)}{label('Logo 圖檔網址', <input value={config.logoSrc} onChange={(event) => set({ logoSrc: event.target.value })} className={inputClass} />)}<p className="text-[9px] leading-4 text-gray-500">Facebook 等社群頁面不是圖片網址；請使用 PNG、SVG 或 WebP 的直接網址。ProArt 字樣已預載。</p>{label('下方文字', <input value={config.label} onChange={(event) => set({ label: event.target.value })} className={inputClass} />)}<div className="grid grid-cols-2 gap-2">{label('開始百分比', <input type="number" min="0" max="99" value={config.startPercent} onChange={(event) => set({ startPercent: Number(event.target.value) })} className={inputClass} />)}{label('結束百分比', <input type="number" min="1" max="100" value={config.endPercent} onChange={(event) => set({ endPercent: Number(event.target.value) })} className={inputClass} />)}</div>{label('填滿方向', <select value={config.direction} onChange={(event) => set({ direction: event.target.value })} className={inputClass}><option value="left-to-right">由左到右</option><option value="right-to-left">由右到左</option></select>)}</div>;
     if (type === 'stacked-bars') {
@@ -2428,11 +2723,12 @@ export default function App() {
     const [agentEditRequestStatus, setAgentEditRequestStatus] = useState(null);
     const [aiEditorPrompt, setAiEditorPrompt] = useState('');
     const [aiDesignMode, setAiDesignMode] = useState('video');
-    const [aiMaterialPrompt, setAiMaterialPrompt] = useState('');
+    const [aiMaterialPrompt, setAiMaterialPrompt] = useState(() => localStorage.getItem('openviscribe_ai_material_prompt') || '');
     const [aiMaterialRatioMode, setAiMaterialRatioMode] = useState('both');
     const [aiMaterialBusy, setAiMaterialBusy] = useState(false);
     const [aiMaterialDraft, setAiMaterialDraft] = useState([]);
     const [aiMaterialStatus, setAiMaterialStatus] = useState('');
+    const [aiMaterialResearch, setAiMaterialResearch] = useState(null);
     const [aiEditorListening, setAiEditorListening] = useState(false);
     const [aiEditorVoiceStatus, setAiEditorVoiceStatus] = useState('');
     const [aiEditorProviderStatus, setAiEditorProviderStatus] = useState({
@@ -2460,6 +2756,7 @@ export default function App() {
     useEffect(() => { localStorage.setItem('openviscribe_ai_editor_source', aiEditorSource); }, [aiEditorSource]);
     useEffect(() => { localStorage.setItem('openviscribe_ai_editor_agent', aiEditorAgent); }, [aiEditorAgent]);
     useEffect(() => { localStorage.setItem('openviscribe_ai_editor_mcp_mode', aiEditorMcpMode); }, [aiEditorMcpMode]);
+    useEffect(() => { localStorage.setItem('openviscribe_ai_material_prompt', aiMaterialPrompt); }, [aiMaterialPrompt]);
     const azureVisionEndpoint = (settings.azureVisionEndpoint || settings.azureEndpoint || '').trim();
     const azureChatEndpoint = (settings.azureChatEndpoint || settings.azureEndpoint || settings.azureVisionEndpoint || '').trim();
     const azureTtsEndpoint = (settings.azureTtsEndpoint || settings.azureVisionEndpoint || settings.azureEndpoint || '').trim();
@@ -3536,7 +3833,9 @@ export default function App() {
             }
         }));
         setSelectedIds([newAssetLayer.id]);
-        setCurrentTime(Number((startAt + Math.min(0.2, duration * 0.08)).toFixed(2)));
+        // Land on the designed hold frame so the first inspection shows the
+        // finished composition instead of an intentionally sparse build frame.
+        setCurrentTime(Number(Math.min(endAt - 0.05, startAt + duration * 0.55).toFixed(2)));
     }, [currentTime, designTrackIndexes, motionDesign.manualCards, motionDesign.presetId, projectState.tracks.length, setProjectState, settings.aspectRatio, totalDuration]);
     const saveAiMaterialAssetsToWorkspace = useCallback(async (assets, options = {}) => {
         const list = (Array.isArray(assets) ? assets : []).map(normalizeStoredAiMaterial).filter(Boolean);
@@ -3599,61 +3898,210 @@ export default function App() {
             : '';
         setAiMaterialBusy(true);
         setAiMaterialDraft([]);
-        setAiMaterialStatus(`正在請 ${articleProviderLabel}／${articleModelLabel} 從空白畫布創作圖層與關鍵影格…`);
-        const wideFallbackScene = buildProceduralScene(prompt, { imageSrc: resolvedPromptImage, aspectRatio: '16:9' });
-        const tallFallbackScene = buildProceduralScene(prompt, { imageSrc: resolvedPromptImage, aspectRatio: '9:16' });
-        const fallback = {
+        setAiMaterialResearch(null);
+        setAiMaterialStatus(`正在請 ${articleProviderLabel}／${articleModelLabel} 搜尋網路，確認主體的真實外觀與辨識特徵…`);
+        let webResearch = null;
+        let primaryResearchError = null;
+        try {
+            if (articleProvider === 'azure' && azureChatEndpoint && azureChatKey && azureChatDeployment) {
+                webResearch = await researchMaterialWithAzure({
+                    endpoint: azureChatEndpoint,
+                    apiKey: azureChatKey,
+                    deployment: azureChatDeployment,
+                    prompt,
+                    referenceUrls
+                });
+            } else if (articleProvider === 'gemini' && settings.apiKey?.trim() && settings.model?.trim()) {
+                webResearch = await researchMaterialWithGemini({
+                    apiKey: settings.apiKey.trim(),
+                    model: settings.model.trim(),
+                    prompt,
+                    referenceUrls
+                });
+            }
+        } catch (error) {
+            primaryResearchError = error;
+            console.warn('AI web research failed; trying public knowledge fallback', error);
+        }
+        if (!webResearch) {
+            try {
+                webResearch = await researchMaterialWithWikipedia(prompt);
+            } catch (fallbackError) {
+                const reason = String(primaryResearchError?.message || fallbackError?.message || '無法取得網路資料');
+                setAiMaterialStatus(`網路研究失敗，因此沒有開始生成：${reason}。原始 prompt 已保留，可直接重試。`);
+                setAiMaterialBusy(false);
+                return;
+            }
+        }
+        setAiMaterialResearch(webResearch);
+        setAiMaterialStatus(`已完成 ${webResearch.provider} 研究（${webResearch.sources.length} 個來源）；正在建立美術指導與分層插畫規格…`);
+        const researchContext = `網路研究提供者：${webResearch.provider}\n研究摘要：\n${String(webResearch.summary).slice(0, 8000)}\n研究來源：${webResearch.sources.map(source => `${source.title}: ${source.url}`).join('；')}`;
+        const callMaterialJsonStage = async ({ system, user, temperature = 0.7, maxTokens = 5000, timeoutMs = 60000 }) => {
+            if (articleProvider === 'azure' && azureChatEndpoint && azureChatKey && azureChatDeployment) {
+                const azureUrl = `${azureChatEndpoint.replace(/\/+$/, '')}/openai/deployments/${azureChatDeployment}/chat/completions?api-version=2024-02-15-preview`;
+                const requestBody = { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature, max_tokens: maxTokens, response_format: { type: 'json_object' } };
+                let response = await fetchWithTimeout(azureUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'api-key': azureChatKey },
+                    body: JSON.stringify(requestBody)
+                }, timeoutMs);
+                if (response.status === 400) {
+                    const errorText = await response.clone().text();
+                    if (/max_tokens|max_completion_tokens|unsupported parameter/i.test(errorText)) {
+                        const { max_tokens: ignored, ...compatibleBody } = requestBody;
+                        response = await fetchWithTimeout(azureUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'api-key': azureChatKey },
+                            body: JSON.stringify(compatibleBody)
+                        }, timeoutMs);
+                    }
+                }
+                if (!response.ok) throw new Error(`AI 美術設計 HTTP ${response.status}`);
+                return (await response.json()).choices?.[0]?.message?.content || '';
+            }
+            if (articleProvider === 'gemini' && settings.apiKey?.trim() && settings.model?.trim()) {
+                const response = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${encodeURIComponent(settings.apiKey.trim())}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contents: [{ parts: [{ text: `${system}\n\n${user}` }] }], generationConfig: { temperature, responseMimeType: 'application/json', maxOutputTokens: maxTokens } })
+                }, timeoutMs);
+                if (!response.ok) throw new Error(`AI 美術設計 HTTP ${response.status}`);
+                return (await response.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
+            }
+            if (articleProvider === 'lmstudio' && lmStudioEndpoint && settings.lmStudioChatModel?.trim()) {
+                return await callLmStudioChat({ endpoint: lmStudioEndpoint, apiKey: lmStudioApiKey, model: settings.lmStudioChatModel.trim(), prompt: `${system}\n\n${user}`, temperature, format: 'json', maxTokens, timeoutMs: Math.max(timeoutMs, lmStudioTimeoutMs) });
+            }
+            if (articleProvider === 'ollama' && ollamaEndpoint && settings.ollamaChatModel?.trim()) {
+                return await callOllamaChat({ endpoint: ollamaEndpoint, model: settings.ollamaChatModel.trim(), prompt: `${system}\n\n${user}`, temperature, format: 'json', think: false, numPredict: maxTokens, timeoutMs: Math.max(timeoutMs, ollamaTimeoutMs) });
+            }
+            throw new Error(`${articleProviderLabel} 的設計模型尚未設定完成`);
+        };
+        let artDirection;
+        try {
+            const artDirectionRaw = await callMaterialJsonStage({
+                system: `你是資深 motion art director。你的工作不是畫 JSON 場景，而是先把研究與使用者要求擴寫成一份能達到商業向量插畫品質的美術指導。輸出純 JSON，不要 Markdown。
+
+禁止 AI 常見懶惰設計：深藍底配低對比青色、空洞線框、幾個半透明矩形、微小文字、置中的單一符號、沒有明暗面的扁平剪影、把影片畫面當網頁卡片。
+
+主體必須是第一視覺焦點，完成度需接近專業 editorial vector illustration：完整可辨識輪廓、清楚比例、至少三個色階、亮面／暗面／投影、結構細節、背景氣氛與前景點綴。色彩要有可見主色與焦點色，不能全部壓在 10% 亮度。16:9 與 9:16 必須各自安排主體佔比與視線路徑。`,
+                user: `原始 prompt：${prompt}\n\n${researchContext}\n\n輸出欄位：visualThesis、illustrationStyle、palette({background,surface,foreground,muted,accent,accentAlt})、subjectConstruction（10-18 個具名部件，每個包含 name,geometry,depth,colorRole,recognitionReason）、depthPlan({background,midground,foreground})、composition({wide,tall})、lighting({key,fill,shadow,highlight})、choreography({build,breathe,resolve})、negativePrompt（陣列）。不要輸出場景 elements。`,
+                temperature: 0.68,
+                maxTokens: 4200,
+                timeoutMs: 60000
+            });
+            artDirection = normalizeArtDirection(parseModelJsonObject(artDirectionRaw));
+            let artDirectionIssues = getArtDirectionIssues(artDirection);
+            if (artDirectionIssues.length) {
+                setAiMaterialStatus(`美術指導初稿缺少 ${artDirectionIssues.join('、')}；正在自動修稿，不需要重新輸入 prompt…`);
+                const repairRaw = await callMaterialJsonStage({
+                    system: `你是 motion art director 的品質修稿者。請修正提供的美術指導 JSON，完整保留已經正確且與研究相符的內容，並補齊檢查指出的缺漏。只輸出一個完整 JSON 物件，不要 Markdown。
+
+必要欄位：visualThesis、illustrationStyle、palette({background,surface,foreground,muted,accent,accentAlt}，一律 #RRGGBB 且前景／背景清楚可讀)、subjectConstruction（至少 10 個具名部件，每個包含 name,geometry,depth,colorRole,recognitionReason）、depthPlan({background,midground,foreground})、composition({wide,tall})、lighting({key,fill,shadow,highlight})、choreography({build,breathe,resolve})、negativePrompt。wide 與 tall 都必須是具體構圖說明。`,
+                    user: `原始 prompt：${prompt}\n\n${researchContext}\n\n檢查問題：${artDirectionIssues.join('；')}\n\n待修稿 JSON：${JSON.stringify(artDirection)}`,
+                    temperature: 0.38,
+                    maxTokens: 5200,
+                    timeoutMs: 70000
+                });
+                const repaired = parseModelJsonObject(repairRaw);
+                artDirection = normalizeArtDirection({
+                    ...artDirection,
+                    ...repaired,
+                    palette: { ...artDirection.palette, ...(repaired.palette || {}) },
+                    composition: { ...artDirection.composition, ...(repaired.composition || {}) },
+                    depthPlan: { ...(artDirection.depthPlan || {}), ...(repaired.depthPlan || {}) },
+                    lighting: { ...(artDirection.lighting || {}), ...(repaired.lighting || {}) },
+                    choreography: { ...(artDirection.choreography || {}), ...(repaired.choreography || {}) }
+                });
+                artDirectionIssues = getArtDirectionIssues(artDirection);
+            }
+            if (artDirectionIssues.length) {
+                throw new Error(`自動修稿後仍有：${artDirectionIssues.join('、')}`);
+            }
+        } catch (error) {
+            console.warn('AI art direction failed', error);
+            setAiMaterialStatus(`網路研究已完成，但美術指導失敗，因此沒有產生低品質素材：${String(error?.message || '無法建立完整美術規格')}。原始 prompt 已保留。`);
+            setAiMaterialBusy(false);
+            return;
+        }
+        setAiMaterialStatus('美術指導已完成；正在製作高密度分層向量插畫與動態關鍵姿勢…');
+        const designDefaults = {
             nameZh: prompt.split(/[,.!，。！\n]/)[0].replace(/https?:\/\/\S+/gi, '').trim().slice(0, 24) || 'AI 原創動態素材',
             description: `從空白畫布依「${prompt.slice(0, 56)}」建立的新場景。`,
             assetType: 'generated-scene',
             duration: 4.2,
             presetId: 'signal',
-            palette: /\brog\b|rog-brandlogo/i.test(prompt)
-                ? { background: '#050609', surface: '#15171d', foreground: '#ffffff', muted: '#858b96', accent: '#ff003c', accentAlt: '#e4002b' }
-                : { background: '#0b1020', surface: '#17233b', foreground: '#f8fafc', muted: '#9aa8bd', accent: '#5eead4', accentAlt: '#fb7185' },
-            config: { scenes: { wide: wideFallbackScene, tall: tallFallbackScene } }
+            palette: { background: '#0b1020', surface: '#17233b', foreground: '#f8fafc', muted: '#9aa8bd', accent: '#5eead4', accentAlt: '#fb7185' }
         };
-        let rawDesign = fallback;
-        let usedFallback = false;
-        const systemText = `你是 motion designer，不是模板選擇器。每次都從空白畫布創作全新的場景圖層、構圖與關鍵影格；禁止選用、模仿或提及既有素材庫骨架。輸出純 JSON，不要 Markdown。
+        let rawDesign = null;
+        const systemText = `你是兼具向量插畫能力的資深 motion designer，不是模板選擇器。每次都從空白畫布創作全新的高完成度場景；禁止選用、模仿或提及既有素材庫骨架。輸出緊湊純 JSON，不要 Markdown。
+
+你必須逐項執行提供的 art direction，並以網路研究作為視覺事實。若主題是建築、地標、產品、Logo、人物或其他具名主體，先用 path、polygon、rect、line、image 建立完整主體，再增加亮面、暗面、反光、投影與細節；不能把它簡化成無關的抽象尖塔、圓圈、低對比方塊或 UI placeholder。主體在 hold frame 必須一眼可辨識，不能靠旁邊文字才知道是什麼。designIntent 要列出採用的研究特徵與美術處理。
+
+畫面必須有 BG／MG／FG 深度，至少兩個視覺焦點，並填滿影片畫面。嚴禁所有元素都置中、所有顏色都接近背景、空白超過畫面 55%、只有外框沒有填色、用小字代替插畫。主體需使用至少三個明度層次；重要元素在 breathe/hold 階段 opacity 不得低於 0.65。
 
 根物件：nameZh, description, narrativeReason, assetType 必須固定為 "generated-scene", duration(2.4-8), presetId(signal|editorial|creator), palette({background,surface,foreground,muted,accent,accentAlt}，全部 #RRGGBB), config({scenes:{wide,tall}})。wide 與 tall 必須分別重新構圖，不可只改比例。
 
-每個 scene：{background,designIntent,elements}。elements 需 6-16 個，由你自行決定，支援 rect,circle,text,image,line,polygon。每個 element：{id,name,type,x,y,w,h,fill,stroke,strokeWidth,radius,gradient,blendMode,shadow,text,src,objectFit,fontSize,fontWeight,letterSpacing,align,points,zIndex,keyframes}。x/y/w/h 都用畫布百分比；顏色可用 background|surface|foreground|muted|accent|accentAlt 或 #RRGGBB。gradient={type:linear|radial,angle,stops:[{at:0-1,color}]}。polygon points 使用元素內 0-100 座標。
+每個 scene：{background,backgroundGradient,designIntent,elements}。elements 需 16-30 個，由你自行決定。支援 rect,circle,text,image,line,polygon,path。path 使用 0 0 100 100 viewBox 的 SVG path 指令。每個 element：{id,name,role,type,x,y,w,h,fill,stroke,strokeWidth,radius,gradient,blendMode,shadow,shadowColor,shadowX,shadowY,lineCap,lineJoin,text,src,objectFit,fontSize,fontWeight,letterSpacing,align,points,path,zIndex,keyframes}。role 必須是 background|midground|foreground|subject|highlight|shadow|detail。x/y/w/h 都用畫布百分比；顏色可用 background|surface|foreground|muted|accent|accentAlt 或 #RRGGBB。gradient={type:linear|radial,angle,stops:[{at:0-1,color}]}。polygon points 使用元素內 0-100 座標，最多 24 點。
+
+每種比例至少需要：6 個 subject/highlight/shadow/detail 主體圖層、4 個 polygon/path 自由輪廓、3 個有 gradient 或 shadow 的立體圖層、2-5 個背景氣氛層、2 個前景點綴。文字不是主體，除非使用者明確要求字卡。
 
 keyframes 每層 2-6 個：{at:0-1,ease:linear|out-cubic|in-cubic|in-out-cubic|out-back,x,y,w,h,scale,scaleX,scaleY,rotate,opacity,blur,clipX,clipY,radius}，只需填會改變的通道。必須設計至少三個真正的空間／遮罩／形狀動作，不能只做全體 fade。動作需有 build、主動作、可讀停留、resolve；最後姿態也是設計的一部分。文字用繁體中文。若有直接圖片網址，必須建立 image 圖層使用它。${referenceHint}`;
-        const materialUserText = `${prompt}${referenceHint ? `\n\n參考解讀：${referenceHint}` : ''}`;
+        const materialUserText = `原始 prompt（必須完整遵守）：\n${prompt}${referenceHint ? `\n\n參考解讀：${referenceHint}` : ''}\n\n${researchContext}\n\n核准的美術指導：\n${JSON.stringify(artDirection)}`;
         try {
-            let raw = '';
-            if (articleProvider === 'azure' && azureChatEndpoint && azureChatKey && azureChatDeployment) {
-                const response = await fetchWithTimeout(`${azureChatEndpoint.replace(/\/+$/, '')}/openai/deployments/${azureChatDeployment}/chat/completions?api-version=2024-02-15-preview`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'api-key': azureChatKey },
-                    body: JSON.stringify({ messages: [{ role: 'system', content: systemText }, { role: 'user', content: materialUserText }], temperature: 0.82, response_format: { type: 'json_object' } })
-                }, 30000);
-                if (!response.ok) throw new Error(`AI 素材設計 HTTP ${response.status}`);
-                raw = (await response.json()).choices?.[0]?.message?.content || '';
-            } else if (articleProvider === 'gemini' && settings.apiKey?.trim() && settings.model?.trim()) {
-                const response = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${encodeURIComponent(settings.apiKey.trim())}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ contents: [{ parts: [{ text: `${systemText}\n\n使用者要求：${materialUserText}` }] }], generationConfig: { temperature: 0.82, responseMimeType: 'application/json', maxOutputTokens: 5000 } })
-                }, 30000);
-                if (!response.ok) throw new Error(`AI 素材設計 HTTP ${response.status}`);
-                raw = (await response.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
-            } else if (articleProvider === 'lmstudio' && lmStudioEndpoint && settings.lmStudioChatModel?.trim()) {
-                raw = await callLmStudioChat({ endpoint: lmStudioEndpoint, apiKey: lmStudioApiKey, model: settings.lmStudioChatModel.trim(), prompt: `${systemText}\n\n使用者要求：${materialUserText}`, temperature: 0.82, format: 'json', timeoutMs: lmStudioTimeoutMs });
-            } else if (articleProvider === 'ollama' && ollamaEndpoint && settings.ollamaChatModel?.trim()) {
-                raw = await callOllamaChat({ endpoint: ollamaEndpoint, model: settings.ollamaChatModel.trim(), prompt: `${systemText}\n\n使用者要求：${materialUserText}`, temperature: 0.82, format: 'json', think: false, numPredict: 5000, timeoutMs: ollamaTimeoutMs });
-            } else {
-                usedFallback = true;
+            const raw = await callMaterialJsonStage({
+                system: systemText,
+                user: `使用者要求：${materialUserText}`,
+                temperature: 0.76,
+                maxTokens: 12000,
+                timeoutMs: 90000
+            });
+            if (!raw) throw new Error(`${articleProviderLabel} 沒有回傳場景設計`);
+            let parsedDesign = parseModelJsonObject(raw);
+            let generatedPalette = ensureGeneratedPaletteContrast({ ...designDefaults.palette, ...(artDirection.palette || {}), ...(parsedDesign.palette || {}) });
+            let sceneIssues = [
+                ...getGeneratedSceneQualityIssues(parsedDesign?.config?.scenes?.wide, '16:9'),
+                ...getGeneratedSceneQualityIssues(parsedDesign?.config?.scenes?.tall, '9:16')
+            ];
+            if (sceneIssues.length) {
+                setAiMaterialStatus(`場景初稿未達標（${sceneIssues.slice(0, 3).join('、')}）；正在自動補畫與修正動態…`);
+                const sceneRepairRaw = await callMaterialJsonStage({
+                    system: `${systemText}\n\n你現在是品質修稿者。請依照檢查問題修正待修場景，保留已經成功的原創構圖與元素，補足缺少的主體輪廓、明暗、景深、覆蓋率與非透明度動態。回傳完整根物件與完整 wide/tall scenes，不能只回傳差異。`,
+                    user: `原始 prompt：${prompt}\n\n檢查問題：${sceneIssues.join('；')}\n\n美術指導：${JSON.stringify(artDirection)}\n\n待修場景：${JSON.stringify(parsedDesign)}`,
+                    temperature: 0.48,
+                    maxTokens: 12000,
+                    timeoutMs: 120000
+                });
+                const repairedDesign = parseModelJsonObject(sceneRepairRaw);
+                parsedDesign = {
+                    ...parsedDesign,
+                    ...repairedDesign,
+                    palette: { ...(parsedDesign.palette || {}), ...(repairedDesign.palette || {}) },
+                    config: {
+                        ...(parsedDesign.config || {}),
+                        ...(repairedDesign.config || {}),
+                        scenes: {
+                            ...(parsedDesign.config?.scenes || {}),
+                            ...(repairedDesign.config?.scenes || {})
+                        }
+                    }
+                };
+                generatedPalette = ensureGeneratedPaletteContrast({ ...designDefaults.palette, ...(artDirection.palette || {}), ...(parsedDesign.palette || {}) });
+                sceneIssues = [
+                    ...getGeneratedSceneQualityIssues(parsedDesign?.config?.scenes?.wide, '16:9'),
+                    ...getGeneratedSceneQualityIssues(parsedDesign?.config?.scenes?.tall, '9:16')
+                ];
             }
-            if (raw) rawDesign = { ...fallback, ...parseModelJsonObject(raw) };
+            if (sceneIssues.length) {
+                throw new Error(`自動修稿後仍未通過：${sceneIssues.slice(0, 5).join('、')}`);
+            }
+            rawDesign = { ...designDefaults, ...parsedDesign, palette: generatedPalette, assetType: 'generated-scene' };
         } catch (error) {
-            console.warn('AI scene generation failed; using blank-canvas procedural draft', error);
-            usedFallback = true;
+            console.warn('AI scene generation failed after web research', error);
+            setAiMaterialStatus(`網路研究已完成，但場景設計失敗，因此沒有加入錯誤素材：${String(error?.message || '無法建立完整場景')}。原始 prompt 已保留。`);
+            setAiMaterialBusy(false);
+            return;
         }
-        const assets = createAiMaterialPair(rawDesign, prompt, aiMaterialRatioMode);
+        const assets = createAiMaterialPair(rawDesign, prompt, aiMaterialRatioMode, webResearch, artDirection);
         setProjectState(prev => {
             const merged = new Map((prev.motionDesign?.generatedAssets || []).map(asset => [asset.id, asset]));
             assets.forEach(asset => merged.set(asset.id, asset));
@@ -3667,10 +4115,7 @@ keyframes 每層 2-6 個：{at:0-1,ease:linear|out-cubic|in-cubic|in-out-cubic|o
             };
         });
         setAiMaterialDraft(assets);
-        setAiMaterialPrompt('');
-        setAiMaterialStatus(usedFallback
-            ? '線上模型未完成；已建立本機程序式空白畫布草稿，沒有套用素材庫模板。'
-            : `已由 ${articleProviderLabel}／${articleModelLabel} 從空白畫布創作 ${assets.length} 個新場景，並加入專案素材庫。`);
+        setAiMaterialStatus(`已先完成 ${webResearch.provider} 研究，再由 ${articleProviderLabel}／${articleModelLabel} 創作 ${assets.length} 個新場景。原始 prompt 已保留。`);
         setAiMaterialBusy(false);
         if (workspaceDirectoryRef.current) {
             void saveAiMaterialAssetsToWorkspace(assets, { promptIfMissing: false });
@@ -15161,7 +15606,7 @@ ${JSON.stringify(subtitlePayload)}
                                 </> : <>
                                     <div className="rounded-xl border border-cyan-300/25 bg-cyan-300/5 p-3">
                                         <div className="flex items-center gap-2 text-sm font-semibold text-cyan-100"><Wand2 size={15} /> 自然語言素材設計器</div>
-                                        <p className="mt-1 text-[10px] leading-4 text-cyan-100/70">請描述用途、動態、文字與顏色。AI 會產生可編輯的動態素材，不是靜態圖片。</p>
+                                        <p className="mt-1 text-[10px] leading-4 text-cyan-100/70">三階段製作：網路研究 → 美術指導 → 分層向量動畫。主體、明暗、細節與景深不足時不會加入素材庫。</p>
                                         <textarea value={aiMaterialPrompt} onChange={(event) => setAiMaterialPrompt(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') void generateAiMaterial(); }} placeholder="例如：設計一個暗藍色的 SaaS 轉換率圖表，數值逐步上升，中間要有掃描線，節奏俐落。" className="mt-3 h-28 w-full resize-y rounded-xl border border-cyan-300/20 bg-slate-950/75 px-3 py-2 text-xs leading-5 text-white outline-none placeholder:text-gray-600 focus:border-cyan-300" />
                                         <label className="mt-3 block text-[10px] text-gray-400">輸出畫布
                                             <select value={aiMaterialRatioMode} onChange={(event) => setAiMaterialRatioMode(event.target.value)} className="mt-1 w-full rounded-lg border border-gray-700 bg-slate-950 px-2 py-2 text-xs text-white outline-none focus:border-cyan-300">
@@ -15170,10 +15615,15 @@ ${JSON.stringify(subtitlePayload)}
                                                 <option value="9:16">只產生 9:16</option>
                                             </select>
                                         </label>
-                                        <button type="button" onClick={() => void generateAiMaterial()} disabled={!aiMaterialPrompt.trim() || aiMaterialBusy} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-300 px-3 py-2.5 text-xs font-black text-gray-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-40">{aiMaterialBusy ? <><span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-900 border-t-transparent" /> AI 設計中…</> : <><Sparkles size={14} /> 生成動態素材</>}</button>
-                                        <div className="mt-2 text-[9px] text-gray-500">使用 {articleProviderLabel}／{articleModelLabel}；未設定時會使用本機動態設計語法。</div>
+                                        <button type="button" onClick={() => void generateAiMaterial()} disabled={!aiMaterialPrompt.trim() || aiMaterialBusy} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-300 px-3 py-2.5 text-xs font-black text-gray-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-40">{aiMaterialBusy ? <><span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-900 border-t-transparent" /> 研究與設計中…</> : <><Sparkles size={14} /> 搜尋資料並生成</>}</button>
+                                        <div className="mt-2 text-[9px] leading-4 text-gray-500">使用 {articleProviderLabel}／{articleModelLabel}。生成後會保留原始 prompt，方便修改後再次生成。</div>
                                     </div>
                                     {aiMaterialStatus && <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-[10px] leading-4 text-gray-300">{aiMaterialStatus}</div>}
+                                    {aiMaterialResearch?.summary && <details className="rounded-xl border border-sky-300/20 bg-sky-300/5 p-3 text-[10px] text-gray-300">
+                                        <summary className="cursor-pointer font-bold text-sky-100">本次網路研究 · {aiMaterialResearch.provider} · {aiMaterialResearch.sources.length} 個來源</summary>
+                                        <p className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap leading-5 text-gray-300">{aiMaterialResearch.summary}</p>
+                                        {aiMaterialResearch.sources.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{aiMaterialResearch.sources.map((source, index) => <a key={`${source.url}-${index}`} href={source.url} target="_blank" rel="noreferrer" className="max-w-full truncate rounded border border-sky-300/20 bg-black/20 px-2 py-1 text-sky-200 hover:bg-sky-300 hover:text-gray-950">{index + 1}. {source.title}</a>)}</div>}
+                                    </details>}
                                     {aiMaterialDraft.length > 0 && <div className="space-y-2 rounded-xl border border-emerald-300/25 bg-emerald-300/5 p-3">
                                         <div className="flex items-center justify-between gap-2"><span className="text-xs font-bold text-emerald-100">剛產生的素材</span><button type="button" onClick={() => void saveAiMaterialAssetsToWorkspace(aiMaterialDraft, { promptIfMissing: true })} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200/30 px-2 py-1 text-[9px] font-bold text-emerald-100 hover:bg-emerald-300 hover:text-gray-950"><Save size={11} /> 存到工作資料夾</button></div>
                                         <div className="grid grid-cols-2 gap-2">{aiMaterialDraft.map(asset => <div key={asset.id} className="overflow-hidden rounded-lg border border-white/10 bg-slate-950/70 p-2"><HyperframeAssetPreview asset={asset} config={asset.config} className="h-28 w-full" /><div className="mt-2 flex items-center justify-between gap-1"><span className="truncate text-[10px] font-semibold text-white">{asset.nameZh}</span><button type="button" onClick={() => addHyperframeAsset(asset)} disabled={asset.aspectRatio !== settings.aspectRatio} className="shrink-0 rounded bg-emerald-300 px-1.5 py-1 text-[9px] font-bold text-gray-950 disabled:bg-gray-700 disabled:text-gray-500">加入</button></div></div>)}</div>
